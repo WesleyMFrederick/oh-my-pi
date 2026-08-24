@@ -24,6 +24,7 @@ describe("buildAvailableSlashCommands", () => {
 				},
 			],
 			mcpPromptCommands: [mcpPrompt],
+			promptTemplates: [],
 			skills: [{ name: "reviewer", description: "Review code", filePath: "/tmp/reviewer/SKILL.md" }],
 			skillsSettings: { enableSkillCommands: true },
 			sessionManager: { getCwd: () => process.cwd() },
@@ -69,6 +70,7 @@ describe("buildAvailableSlashCommands", () => {
 		const commands = await buildAvailableSlashCommands(
 			{
 				customCommands: [],
+				promptTemplates: [],
 				skills: [],
 				sessionManager: { getCwd: () => process.cwd() },
 				setSlashCommands(commands: typeof fileCommands) {
@@ -97,6 +99,7 @@ describe("buildAvailableSlashCommands", () => {
 		const commands = await buildAvailableSlashCommands(
 			{
 				customCommands: [],
+				promptTemplates: [],
 				skills: [],
 				sessionManager: { getCwd: () => process.cwd() },
 				setSlashCommands() {},
@@ -107,6 +110,32 @@ describe("buildAvailableSlashCommands", () => {
 
 		expect(byName["git-sync"].input).toEqual({ hint: "[base-branch]" });
 		expect(byName.notes.input).toBeUndefined();
+	});
+
+	test("advertises prompt templates to RPC clients", async () => {
+		const commands = await buildAvailableSlashCommands(
+			{
+				customCommands: [],
+				promptTemplates: [
+					{
+						name: "navigating-a-board",
+						description: "Navigating a task board (user)",
+						content: "A board is one run cut into task cards.",
+						source: "(user)",
+					},
+				],
+				skills: [],
+				sessionManager: { getCwd: () => process.cwd() },
+				setSlashCommands() {},
+			},
+			async () => [],
+		);
+
+		expect(commands.find(command => command.name === "navigating-a-board")).toEqual({
+			name: "navigating-a-board",
+			description: "Navigating a task board (user)",
+			source: "prompt",
+		});
 	});
 
 	test("classifies MCP prompts by path and bundled custom commands as custom", async () => {
@@ -126,6 +155,7 @@ describe("buildAvailableSlashCommands", () => {
 						command: { name: "green", description: "Bundled custom command" },
 					},
 				],
+				promptTemplates: [],
 				skills: [],
 				sessionManager: { getCwd: () => process.cwd() },
 				setSlashCommands() {},
@@ -142,6 +172,7 @@ describe("buildAvailableSlashCommands", () => {
 		const commands = await buildAvailableSlashCommands(
 			{
 				customCommands: [{ command: { name: "legacy", description: "Legacy fixture" } }],
+				promptTemplates: [],
 				skills: [],
 				sessionManager: { getCwd: () => process.cwd() },
 				setSlashCommands() {},
@@ -160,6 +191,7 @@ describe("buildAvailableSlashCommands", () => {
 		const commands = await buildAvailableSlashCommands(
 			{
 				customCommands: [{ command: { name: "plugin", description: "My plugin helper" } }],
+				promptTemplates: [],
 				skills: [],
 				sessionManager: { getCwd: () => "/tmp" },
 				setSlashCommands: () => {},
