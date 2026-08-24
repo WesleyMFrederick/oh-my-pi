@@ -1,5 +1,6 @@
 import type { AvailableCommand } from "@oh-my-pi/pi-utils/acp";
 import type { EffectiveExtensionRoots } from "../capability/types";
+import type { PromptTemplate } from "../config/prompt-templates";
 import type { SkillsSettings } from "../extensibility/settings";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { ExtensionRunner } from "../extensibility/extensions";
@@ -8,7 +9,14 @@ import { type FileSlashCommand, loadSlashCommands } from "../extensibility/slash
 import { ACP_BUILTIN_RESERVED_NAMES, isAcpBuiltinShadowedName } from "./acp-builtins";
 import { BUILTIN_SLASH_COMMANDS_INTERNAL } from "./builtin-registry";
 
-export type AvailableSlashCommandSource = "builtin" | "skill" | "extension" | "custom" | "mcp_prompt" | "file";
+export type AvailableSlashCommandSource =
+	| "builtin"
+	| "skill"
+	| "extension"
+	| "custom"
+	| "mcp_prompt"
+	| "file"
+	| "prompt";
 
 export interface InternalAvailableSlashCommand {
 	name: string;
@@ -22,6 +30,7 @@ export interface InternalAvailableSlashCommand {
 export interface AvailableCommandsSession {
 	readonly extensionRunner?: ExtensionRunner;
 	readonly customCommands: ReadonlyArray<LoadedCustomCommand>;
+	readonly promptTemplates: ReadonlyArray<PromptTemplate>;
 	readonly mcpPromptCommands?: ReadonlyArray<LoadedCustomCommand>;
 	readonly skills: ReadonlyArray<Skill>;
 	readonly skillsSettings?: SkillsSettings;
@@ -104,6 +113,10 @@ export async function buildAvailableSlashCommands(
 			input: command.argumentHint ? { hint: command.argumentHint } : undefined,
 			source: "file",
 		});
+	}
+
+	for (const template of session.promptTemplates) {
+		appendCommand({ name: template.name, description: template.description, source: "prompt" });
 	}
 
 	return commands;

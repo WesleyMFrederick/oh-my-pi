@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed RPC and ACP command discovery omitting user prompt templates that appear in the interactive slash-command picker.
+
+## [17.2.15] - 2026-08-12
+
 ### Added
 
 - Added global and per-advisor review cadence, including final-yield reviews and intervals that accumulate skipped transcript updates ([#12385](https://github.com/can1357/oh-my-pi/pull/12385) by [@olegpulatov](https://github.com/olegpulatov)).
