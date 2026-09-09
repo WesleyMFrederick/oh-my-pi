@@ -891,6 +891,15 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		this.editor.composerFacts = component;
 	}
 
+	/**
+	 * Render `component` in the status slot without replacing the mounted status
+	 * component's editor facts. Extension footers use this; pass the mounted
+	 * status component back to restore it.
+	 */
+	setStatusSlot(component: Component): void {
+		this.#statusHost.setComponent(component);
+	}
+
 	#disposeStartupStatus(): void {
 		this.#startupStatus?.dispose();
 		this.#startupStatus = undefined;

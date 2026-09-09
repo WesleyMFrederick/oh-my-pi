@@ -34,6 +34,7 @@ function makeHarness() {
 		if (focused && isFocusable(focused)) focused.focused = true;
 	});
 	const addAutocompleteProvider = vi.fn();
+	const setFooterComponent = vi.fn();
 	const fakeHandle = {
 		hide: vi.fn(),
 		setHidden: vi.fn(),
@@ -60,6 +61,7 @@ function makeHarness() {
 			uiContext = context;
 		},
 		addAutocompleteProvider,
+		setFooterComponent,
 		syncComposerShape: vi.fn(),
 		showStatus: vi.fn(),
 	} as unknown as InteractiveModeContext;
@@ -70,6 +72,7 @@ function makeHarness() {
 		editor,
 		requestRender,
 		addAutocompleteProvider,
+		setFooterComponent,
 		editorContainer,
 		getFocused,
 		setFocus,
@@ -243,6 +246,21 @@ describe("ExtensionUiController Ask dialog input", () => {
 			results: [{ id: "answer", selectedOptions: [], customInput: "typed after failure" }],
 		});
 		expect(harness.editor.getText()).toBe("");
+	});
+});
+
+describe("ExtensionUiController footer UI", () => {
+	it("forwards a custom footer factory to interactive mode", async () => {
+		const harness = makeHarness();
+		const ui = await harness.init();
+		const footer = () => ({
+			render: () => ["custom footer"],
+			invalidate: () => {},
+		});
+
+		ui.setFooter(footer);
+
+		expect(harness.setFooterComponent).toHaveBeenCalledWith(footer);
 	});
 });
 

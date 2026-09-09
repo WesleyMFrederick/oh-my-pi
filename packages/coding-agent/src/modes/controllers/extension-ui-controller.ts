@@ -159,7 +159,7 @@ export class ExtensionUiController {
 				// Theme object passed directly - not supported in current implementation
 				return Promise.resolve({ success: false, error: "Direct theme object not supported" });
 			},
-			setFooter: () => {},
+			setFooter: factory => this.ctx.setFooterComponent(factory),
 			setHeader: () => {},
 			setEditorComponent: factory => this.ctx.setEditorComponent(factory),
 			getToolsExpanded: () => this.ctx.toolOutputExpanded,
