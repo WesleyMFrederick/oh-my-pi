@@ -77,6 +77,8 @@ import type {
 	ContextUsage,
 	ExtensionCustomOptions,
 	ExtensionUIContext,
+	ExtensionUiComponent,
+	ExtensionUiComponentFactory,
 	ExtensionUIDialogOptions,
 	ExtensionUISelectItem,
 	ExtensionWidgetContent,
@@ -1034,6 +1036,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#baseAutocompleteProvider: AutocompleteProvider | undefined;
 	/** Extension-registered provider factories, applied in registration order (#4919). */
 	#autocompleteProviderFactories: AutocompleteProviderFactory[] = [];
+	#customFooter: ExtensionUiComponent | undefined;
 	#cleanupUnsubscribe?: () => void;
 	#signalTeardown?: SessionTeardown;
 	readonly #version: string;
@@ -5742,6 +5745,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#agentRegistrySubscriptionTarget = undefined;
 		this.#eventController.dispose();
 		this.#codexResetFireworksController.dispose();
+		this.#customFooter?.dispose?.();
+		this.#customFooter = undefined;
 		this.statusLine.dispose();
 		if (this.#resizeHandler) {
 			process.stdout.removeListener("resize", this.#resizeHandler);
@@ -5980,6 +5985,15 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	initializeHookRunner(uiContext: ExtensionUIContext, hasUI: boolean): void {
 		this.#extensionUiController.initializeHookRunner(uiContext, hasUI);
+	}
+
+	setFooterComponent(factory: ExtensionUiComponentFactory | undefined): void {
+		const nextFooter = factory?.(this.ui, theme);
+		const previousFooter = this.#customFooter;
+		this.#customFooter = nextFooter;
+		this.composer.setStatusComponent(nextFooter ?? this.statusLine);
+		previousFooter?.dispose?.();
+		this.ui.requestRender();
 	}
 
 	setEditorComponent(

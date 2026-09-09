@@ -12,6 +12,7 @@ import type {
 	ExtensionCustomOptions,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	ExtensionUiComponentFactory,
 	ExtensionUISelectItem,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
@@ -286,6 +287,7 @@ export interface InteractiveModeContext {
 	setEditorComponent(
 		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined,
 	): void;
+	setFooterComponent(factory: ExtensionUiComponentFactory | undefined): void;
 
 	// UI helpers
 	/**
