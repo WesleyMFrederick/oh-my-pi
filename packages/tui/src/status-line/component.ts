@@ -447,7 +447,7 @@ interface JjResolveRequest {
 interface WorktreeContext {
 	/** Primary-checkout (project) name shown by the path segment. */
 	projectName: string;
-	/** Worktree directory name — suppressed from the path when it equals the branch. */
+	/** Worktree directory name shown alongside the primary project name. */
 	worktreeName: string;
 }
 

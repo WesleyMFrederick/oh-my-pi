@@ -567,13 +567,12 @@ const pathSegment: StatusLineSegment = {
 		const opts = ctx.options.path ?? {};
 		const stripPrefix = opts.stripWorkPrefix !== false;
 
-		// Linked git worktree: the on-disk path nests the worktree base, the
-		// project, and a worktree dir that usually duplicates the branch (already
-		// shown by the git segment). Collapse to the project name, appending the
-		// worktree dir only when it diverges from the branch.
+		// Linked git worktree: collapse the on-disk base prefix, but retain both
+		// the primary project and worktree names so the active checkout is explicit
+		// even when the git segment already shows the same branch.
 		if (stripPrefix && ctx.worktree) {
 			const { projectName, worktreeName } = ctx.worktree;
-			const label = ctx.git.branch === worktreeName ? projectName : `${projectName}/${worktreeName}`;
+			const label = `${projectName}/${worktreeName}`;
 			const text = fileHyperlink(getProjectDir(), clampPathLength(label, opts.maxLength ?? 40));
 			const content = withIcon(theme.icon.worktree, text);
 			return { content: theme.fg("statusLinePath", content), visible: true };
