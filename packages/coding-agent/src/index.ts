@@ -73,6 +73,10 @@ export type {
 } from "@oh-my-pi/pi-tui/tools/task";
 // Tools (detail types and utilities)
 export * from "./tools";
+// Speech runtime for extensions that need to reuse the session's warm TTS worker.
+export { StreamingAudioPlayer } from "./tts/streaming-player";
+export { type TtsStreamHandle, ttsClient } from "./tts/tts-client";
+export { resolveLocalSpeechModelId } from "./tts/vocalizer";
 export * from "./utils/github";
 // UI components for extensions
 export {
