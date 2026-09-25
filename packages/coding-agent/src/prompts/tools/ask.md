@@ -1,8 +1,16 @@
 Ask the user to fill in one HTML form; blocks until they submit or cancel.
 
-Ask only for materially different tradeoffs the user must decide.
-Default: act using code/config/docs/history and conventions.
-Several viable choices: pick conservative/standard, proceed, state choice.
+Use Ask only when the likely improvement from the user’s answer exceeds the cost of interrupting their work and context. First research the code, configuration, documentation, history, and conventions. If a safe standard choice exists, act and state it.
+
+<decision>
+- Put the highest-consequence decision first. Batch only related decisions.
+- Keep the total decision brief near 150 words.
+- State the decision, what exists now, shared facts, and how earlier decisions limit the options.
+- Translate technical terms at first use. Explain how counterintuitive claims work.
+- Offer 2–5 materially distinct options, each with a short outcome-based label and one line covering outcome, cost, and risk.
+- Recommendations MUST be honest defaults; NEVER hide tradeoffs.
+- After the user answers, act on the decision and show the result.
+</decision>
 
 <instruction>
 - `html`: one <form> of plain semantic HTML, rendered natively in the user's terminal.
