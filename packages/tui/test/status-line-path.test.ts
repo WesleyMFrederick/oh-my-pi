@@ -402,14 +402,13 @@ describe("status line path segment in a linked worktree", () => {
 		return ctx;
 	}
 
-	it("collapses to the project name and drops the worktree dir when it equals the branch", () => {
+	it("keeps the worktree dir when it equals the branch", () => {
 		const rendered = renderSegment("path", worktreeContext({ projectName: "pi", worktreeName: "xx" }, "xx"));
 		const content = Bun.stripANSI(rendered.content);
 		expect(rendered.visible).toBe(true);
-		expect(content).toBe(`${theme.icon.worktree} pi`);
-		// The base prefix, the worktree dir, and the folder icon are all gone.
+		expect(content).toBe(`${theme.icon.worktree} pi/xx`);
+		// The base prefix and folder icon are gone, but the active worktree stays explicit.
 		expect(content).not.toContain(".tree");
-		expect(content).not.toContain("/xx");
 		expect(content).not.toContain(theme.icon.folder);
 	});
 
