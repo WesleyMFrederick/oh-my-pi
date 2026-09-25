@@ -70,6 +70,7 @@ import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
+import { SessionInfoTool } from "./session-info";
 import { supportsExternalThinking, ThinkTool } from "./think";
 import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { TodoTool } from "./todo";
@@ -152,6 +153,7 @@ export type {
 	FindingDetails,
 	SubmitReviewDetails,
 } from "@oh-my-pi/pi-tui/tools/task";
+export * from "./session-info";
 export * from "./security-scan";
 export * from "./think";
 export * from "./todo";
@@ -326,6 +328,8 @@ export interface ToolSession {
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
 	getSessionFile: () => string | null;
+	/** Get the current session name. */
+	getSessionName?: () => string | null;
 	/**
 	 * Owning journal; full SDK managers also supply registered identity and the
 	 * cost ledger (`appendModelUsage`) without changing advisor-local IDs.
@@ -413,6 +417,8 @@ export interface ToolSession {
 	getActiveModelString?: () => string | undefined;
 	/** Get the current session model object (provider/api capabilities), regardless of how it was chosen. */
 	getActiveModel?: () => Model | undefined;
+	/** Get the effective thinking level for the active model. */
+	getThinkingLevel?: () => string | null;
 	/** Get the session's live per-family service tiers (undefined = none). Source of truth for subagent `tier.subagent: inherit`. */
 	getServiceTierByFamily?: () => ServiceTierByFamily | undefined;
 	/**
@@ -461,6 +467,22 @@ export interface ToolSession {
 	getGoalRuntime?: () => GoalRuntime | undefined;
 	/** Get cumulative session usage statistics (input/output tokens, cost). */
 	getUsageStatistics?: () => UsageStatistics;
+	/** Get the current approval mode. */
+	getApprovalMode?: () => "always-ask" | "write" | "yolo" | null;
+	/** Get the current context usage. */
+	getContextUsage?: () => { tokens: number; contextWindow: number; percent: number } | null;
+	/** Get current message counts. */
+	getMessageCounts?: () => {
+		user: number;
+		assistant: number;
+		toolCalls: number;
+		toolResults: number;
+		total: number;
+	} | null;
+	/** Get the current streaming state. */
+	getStreamingState?: () => boolean | null;
+	/** Get the current compaction state. */
+	getCompactionState?: () => { active: boolean; speculation: "idle" | "running" | "armed" } | null;
 	/** Current per-turn token budget {total, spent, hard} for the eval `budget` helper. */
 	getTurnBudget?: () => { total: number | null; spent: number; hard: boolean };
 	/** Record output tokens consumed by an eval-spawned subagent toward the current turn budget. */
@@ -579,6 +601,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
 	context_notes: ContextNotesTool.createIf,
+	session_info: s => new SessionInfoTool(s),
 	new_context: NewContextTool.createIf,
 	task: s => TaskTool.create(s),
 	wait: s => new WaitTool(s),

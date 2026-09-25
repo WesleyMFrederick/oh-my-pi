@@ -302,6 +302,7 @@ import {
 	cfgToolsAbortOnFabricatedResult,
 	cfgToolsIntentTracing,
 	cfgToolsMaxTimeout,
+	cfgToolsApprovalMode,
 	cfgToolsXdev,
 	cfgToolsXdevDocs,
 	cfgToolsXdevInlineDevices,
@@ -2210,6 +2211,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			taskDepth: options.taskDepth ?? 0,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionName: () => sessionManager.getSessionName() ?? null,
 			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			getEvalSessionId: () => session?.getEvalSessionId() ?? defaultEvalSessionId(toolSession),
@@ -2237,6 +2239,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getActiveModel: () => agent?.state.model ?? model,
+			getThinkingLevel: () => session?.thinkingLevel ?? null,
 			getServiceTierByFamily: () => session?.serviceTierByFamily,
 			getImageAttachments: () => session?.getImageAttachments() ?? [],
 			getPlanModeState: () => session?.getPlanModeState(),
@@ -2244,6 +2247,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getGoalModeState: () => session?.getGoalModeState(),
 			getGoalRuntime: () => session?.goalRuntime,
 			getUsageStatistics: () => sessionManager.getUsageStatistics(),
+			getApprovalMode: () => (options.autoApprove ? "yolo" : cfgToolsApprovalMode.get(settings)),
+			getContextUsage: () => session?.getContextUsage() ?? null,
+			getMessageCounts: () => {
+				const stats = session?.getSessionStats();
+				return stats
+					? {
+							user: stats.userMessages,
+							assistant: stats.assistantMessages,
+							toolCalls: stats.toolCalls,
+							toolResults: stats.toolResults,
+							total: stats.totalMessages,
+						}
+					: null;
+			},
+			getStreamingState: () => session?.isStreaming ?? null,
+			getCompactionState: () =>
+				session ? { active: session.isCompacting, speculation: session.compactionSpeculation } : null,
 			getTurnBudget: () => sessionManager.getTurnBudget(),
 			recordEvalSubagentUsage: output => sessionManager.recordEvalSubagentOutput(output),
 			getClientBridge: () => session?.clientBridge,
