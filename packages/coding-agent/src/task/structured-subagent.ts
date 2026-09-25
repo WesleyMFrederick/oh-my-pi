@@ -356,6 +356,7 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 	}
 }
 
+<<<<<<< HEAD
 /** The per-call gate's refusal for `invocationKind` calls, or `undefined` when `task.perCallModel` allows them. */
 function perCallModelDisabledReason(settings: Settings, invocationKind: "task" | "eval"): string | undefined {
 	if (perCallModelEnabled(settings, invocationKind)) return undefined;
@@ -497,6 +498,59 @@ function discoverAgentsShared(cwd: string, extensionRoots?: EffectiveExtensionRo
 	return promise;
 }
 
+/** One agent definition selected by name, with the discovery it came from. */
+export interface CanonicalAgentResolution {
+	discovery: DiscoveryResult;
+	agent: AgentDefinition;
+}
+
+/** Inputs for {@link resolveCanonicalAgent}. */
+export interface CanonicalAgentRequest {
+	agentName: string;
+	cwd: string;
+	settings: Settings;
+	extensionRoots?: EffectiveExtensionRoots;
+	/** Session-scoped agents searched after the discovered definitions. */
+	sessionAgents?: readonly AgentDefinition[];
+}
+
+/**
+ * Discover the agent definitions and select one by name, rejecting an unknown
+ * or a disabled name. This is the canonical name policy for every surface that
+ * starts an agent. It holds no spawn-depth, plan-mode, isolation, or parent
+ * allow-list rule, so a top-level launch can apply it too.
+ */
+export async function resolveCanonicalAgent({
+	agentName,
+	cwd,
+	settings,
+	extensionRoots,
+	sessionAgents,
+}: CanonicalAgentRequest): Promise<CanonicalAgentResolution> {
+	const discovery = await discoverAgentsShared(cwd, extensionRoots);
+	const agents = [...discovery.agents, ...(sessionAgents ?? [])];
+	const agent = getAgent(agents, agentName);
+	if (!agent) {
+		const available = agents.map(candidate => candidate.name).join(", ") || "none";
+		const searched = discovery.searchedDirs?.map(dir => shortenPath(dir)).join(", ") || "none";
+		throw new StructuredSubagentError(
+			"preflight",
+			`Unknown agent "${agentName}". Available: ${available}. Searched: ${searched}`,
+		);
+	}
+	const disabledAgents = cfgTaskDisabledAgents.get(settings);
+	if (disabledAgents.includes(agentName)) {
+		const enabled = agents
+			.filter(candidate => !disabledAgents.includes(candidate.name))
+			.map(candidate => candidate.name);
+		throw new StructuredSubagentError(
+			"preflight",
+			`Agent "${agentName}" is disabled in settings. Enable it via /agents, or use a different agent type.${enabled.length > 0 ? ` Available: ${enabled.join(", ")}` : ""}`,
+		);
+	}
+	return { discovery, agent };
+}
+
 /**
  * Resolve every policy shared by task and eval before allocating artifacts or
  * dispatching work. Callers translate {@link StructuredSubagentError} into
@@ -515,28 +569,14 @@ export async function resolveEffectiveSubagentPolicy(
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
-	const discovery = await discoverAgentsShared(request.session.cwd, request.session.effectiveExtensionRoots?.());
 	const sessionAgents = request.session.getSessionAgents?.() ?? [];
-	const agents = [...discovery.agents, ...sessionAgents];
-	const agent = getAgent(agents, agentName);
-	if (!agent) {
-		const available = agents.map(candidate => candidate.name).join(", ") || "none";
-		const searched = discovery.searchedDirs?.map(dir => shortenPath(dir)).join(", ") || "none";
-		throw new StructuredSubagentError(
-			"preflight",
-			`Unknown agent "${agentName}". Available: ${available}. Searched: ${searched}`,
-		);
-	}
-	const disabledAgents = cfgTaskDisabledAgents.get(request.session.settings);
-	if (disabledAgents.includes(agentName)) {
-		const enabled = agents
-			.filter(candidate => !disabledAgents.includes(candidate.name))
-			.map(candidate => candidate.name);
-		throw new StructuredSubagentError(
-			"preflight",
-			`Agent "${agentName}" is disabled in settings. Enable it via /agents, or use a different agent type.${enabled.length > 0 ? ` Available: ${enabled.join(", ")}` : ""}`,
-		);
-	}
+	const { discovery, agent } = await resolveCanonicalAgent({
+		agentName,
+		cwd: request.session.cwd,
+		settings: request.session.settings,
+		extensionRoots: request.session.effectiveExtensionRoots?.(),
+		sessionAgents,
+	});
 	const effectiveAgent = planMode ? createPlanModeAgent(agent) : agent;
 	// An agent declaring `structured: true` keeps its result contract when the caller opts out (`task.structured` off).
 	const schema = resolveSchema(
