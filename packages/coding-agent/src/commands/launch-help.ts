@@ -15,6 +15,9 @@ export const launchHelp = {
 		}),
 	},
 	flags: {
+		agent: Flags.string({
+			description: 'Launch as a discovered task agent, by its canonical name (e.g. "reviewer")',
+		}),
 		model: Flags.string({
 			description: 'Model to use (fuzzy match: "opus", "gpt-5.2", or "openai/gpt-5.2")',
 		}),

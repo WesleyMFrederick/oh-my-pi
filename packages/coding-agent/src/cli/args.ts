@@ -29,6 +29,8 @@ export interface Args {
 	profile?: string;
 	alias?: string;
 	allowHome?: boolean;
+	/** Canonical name of the task agent to launch as (`--agent`). */
+	agent?: string;
 	provider?: string;
 	model?: string;
 	config?: string[];

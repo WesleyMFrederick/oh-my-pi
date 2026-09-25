@@ -40,6 +40,7 @@ import {
 	disabledProviderIds,
 	expandRoleAlias,
 	getModelMatchPreferences,
+	resolveAgentModelSelection,
 	resolveCliModel,
 	resolveConfiguredModelPatterns,
 	resolveModelRoleValue,
@@ -114,6 +115,7 @@ import {
 	resolvePromptInput,
 } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
+import { resolveCanonicalAgent } from "./task/structured-subagent";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { cfgTelemetryOtlpExportEnabled } from "./telemetry-settings";
 import { registerLocalInferenceApi } from "./tiny/local-inference-api";
@@ -165,7 +167,7 @@ import {
 	cfgPrewalkEnabled,
 } from "./session/settings";
 import { cfgDisabledProviders, cfgEnabledModels } from "./config/model-settings";
-import { cfgTaskAgentIdleTtlMs } from "./task/settings";
+import { cfgTaskAgentIdleTtlMs, cfgTaskAgentModelOverrides } from "./task/settings";
 import { cfgLspEnabled } from "./lsp/settings";
 import { cfgSkillsIncludeSkills } from "./extensibility/settings";
 import { cfgWorkspaceAdditionalDirectories } from "./session/context-settings";
@@ -1283,10 +1285,19 @@ export async function buildSessionOptions(
 	modelRegistry: ModelRegistry,
 	activeSettings: Settings,
 ): Promise<CreateAgentSessionOptions> {
+	const cwd = parsed.cwd ?? getProjectDir();
 	const options: CreateAgentSessionOptions = {
-		cwd: parsed.cwd ?? getProjectDir(),
+		cwd,
 		autoApprove: parsed.autoApprove ?? false,
 	};
+	// `--agent` selects a canonical task-agent definition. Resolve it first, and
+	// through the same policy the spawn path uses, so an unknown or a disabled
+	// name fails here — before `createAgentSession`, and before any protocol mode
+	// can accept a prompt.
+	const requestedAgentName = parsed.agent?.trim();
+	const launchAgent = requestedAgentName
+		? (await resolveCanonicalAgent({ agentName: requestedAgentName, cwd, settings: activeSettings })).agent
+		: undefined;
 	const restoringSession = Boolean(parsed.continue || parsed.resume || isForeignSessionImport(parsed));
 	if (parsed.serviceTier !== undefined) {
 		options.openAIServiceTier = serviceTierSettingToTier(parsed.serviceTier) ?? null;
@@ -1304,7 +1315,6 @@ export async function buildSessionOptions(
 	if (parsed.systemPrompt !== undefined && parsed.systemPromptTemplate !== undefined) {
 		throw new Error("--system-prompt and --system-prompt-template cannot be combined");
 	}
-	const cwd = options.cwd;
 	const discoveredOverride =
 		parsed.systemPrompt === undefined && parsed.systemPromptTemplate === undefined
 			? await discoverSystemPromptOverride(cwd)
@@ -1345,6 +1355,7 @@ export async function buildSessionOptions(
 		const scopedModelOverride = scopedModels.length > 0 && !restoringSession;
 		const forkCacheShapeChanged =
 			scopedModelOverride ||
+			launchAgent !== undefined ||
 			parsed.model !== undefined ||
 			parsed.thinking !== undefined ||
 			parsed.systemPrompt !== undefined ||
@@ -1477,6 +1488,26 @@ export async function buildSessionOptions(
 		options.modelPattern = parsed.models;
 	}
 
+	// A launch agent supplies the model only as a default: an explicit `--model`
+	// above already won, and the settings override for this agent name keeps the
+	// same priority it has for a spawned child. The patterns go through
+	// `modelPattern` so a model an extension provider registers still resolves.
+	if (launchAgent && !parsed.model) {
+		const agentModelOverride = cfgTaskAgentModelOverrides.get(activeSettings)[launchAgent.name];
+		if (agentModelOverride !== undefined || (launchAgent.model?.length ?? 0) > 0) {
+			const { patterns } = resolveAgentModelSelection({
+				settingsOverride: agentModelOverride,
+				agentModel: launchAgent.model,
+				settings: activeSettings,
+			});
+			if (patterns.length > 0) {
+				options.model = undefined;
+				options.rebindModelAfterDiscovery = undefined;
+				options.modelPattern = patterns;
+			}
+		}
+	}
+
 	if (parsed.noPrewalk && (parsed.prewalk || parsed.prewalkInto !== undefined)) {
 		throw new Error("--no-prewalk cannot be combined with --prewalk or --prewalk-into");
 	}
@@ -1568,6 +1599,12 @@ export async function buildSessionOptions(
 		options.thinkingLevel = scopedModels[0].thinkingLevel;
 	}
 
+	// The agent definition sets the thinking default. `--thinking` and a model
+	// selector that carries its own `:level` suffix both already set the level.
+	if (options.thinkingLevel === undefined && launchAgent?.thinkingLevel !== undefined) {
+		options.thinkingLevel = launchAgent.thinkingLevel;
+	}
+
 	// Scoped models for Ctrl+P cycling — fill in default thinking levels when not explicit.
 	if (scopedModels.length > 0) {
 		options.scopedModels = toSessionScopedModels(scopedModels, activeSettings);
@@ -1589,11 +1626,27 @@ export async function buildSessionOptions(
 		options.titleSystemPrompt = titleSystemPrompt;
 	}
 
-	// Tools
-	if (parsed.noTools) {
-		options.toolNames = parsed.tools && parsed.tools.length > 0 ? parsed.tools : [];
-	} else if (parsed.tools) {
-		options.toolNames = parsed.tools;
+	// The agent's canonical instructions go between the stable harness blocks and
+	// the dynamic project block, the same position a spawned child gives them.
+	if (launchAgent) {
+		options.agentName = launchAgent.name;
+		const agentPrompt = launchAgent.systemPrompt;
+		options.systemPrompt = defaultPrompt =>
+			defaultPrompt.length === 0
+				? [agentPrompt]
+				: [...defaultPrompt.slice(0, -1), agentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+	}
+
+	// Tools. An agent's tool list is a maximum: `--tools` and `--no-tools` can
+	// narrow it, and can never add a tool the agent definition withholds.
+	const cliToolNames = parsed.noTools ? (parsed.tools && parsed.tools.length > 0 ? parsed.tools : []) : parsed.tools;
+	const agentToolNames = launchAgent?.tools;
+	if (agentToolNames) {
+		options.toolNames = cliToolNames
+			? cliToolNames.filter(name => agentToolNames.includes(name))
+			: [...agentToolNames];
+	} else if (cliToolNames) {
+		options.toolNames = cliToolNames;
 	}
 
 	if (parsed.noLsp) {
