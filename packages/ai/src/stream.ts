@@ -2144,7 +2144,9 @@ function mapOptionsForApi<TApi extends Api>(
 				codexCompaction: options?.codexCompaction,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				textVerbosity: options?.textVerbosity,
-				forceReasoningOff: options?.forceReasoningOff,
+				// `OpenAICodexResponsesOptions` carries no disableReasoning; fold it so
+				// the server gets effort none instead of its default (medium).
+				forceReasoningOff: options?.disableReasoning || options?.forceReasoningOff,
 			});
 
 		case "google-generative-ai": {

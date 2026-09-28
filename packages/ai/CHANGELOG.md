@@ -64,6 +64,7 @@
 ### Changed
 
 - Reduced per-token CPU and allocations while streaming: the leaked-thinking scanner used for OpenAI-compatible and custom endpoints no longer allocates per character, chat-completions and Bedrock look up a delta's content block in constant time, Google, Gemini CLI, Codex, and chat-completions streams skip raw SSE line capture unless an `onSseEvent` listener is attached, and event streams drain backlogs without `Array#shift` ([#13650](https://github.com/can1357/oh-my-pi/pull/13650) by [@H4vC](https://github.com/H4vC)).
+- Fixed Codex (`openai-codex-responses`) requests that disable reasoning, such as TTSR rule-judge calls, still running at the server's default effort (medium); `disableReasoning` now sends `reasoning.effort: "none"`, matching the OpenAI Responses route.
 
 ## [18.4.2] - 2026-09-28
 
@@ -150,6 +151,7 @@
 
 - Fixed account selection for OpenCode Go and SuperGrok (xai-oauth) so accounts without available funds or included quota are skipped in favor of eligible accounts.
 - Improved visibility into automatically disabled authentication credentials by logging a warning and including the affected account details in credential-disabled events.
+- Fixed multi-account provider selection for OpenCode Go and SuperGrok (xai-oauth), so accounts with insufficient funds or exhausted included quota are skipped in favor of eligible accounts with available billing headroom.
 
 ## [18.3.0] - 2026-09-24
 

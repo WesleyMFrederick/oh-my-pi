@@ -10,7 +10,7 @@ interface CapturedPayload {
 	reasoning_effort?: string;
 }
 
-type RouteApi = "openai-completions" | "openrouter";
+type RouteApi = "openai-completions" | "openrouter" | "openai-codex-responses";
 
 const context: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
@@ -40,6 +40,9 @@ async function capturePayload<TApi extends RouteApi>(
 	options: SimpleStreamOptions,
 ): Promise<CapturedPayload> {
 	let captured: CapturedPayload | undefined;
+	// Only the outgoing body matters; abort once it is built so routes that
+	// retry an empty stream (Codex) do not spin until the test timeout.
+	const controller = new AbortController();
 	const fetchMock: FetchImpl = async () =>
 		new Response("", { status: 200, headers: { "content-type": "text/event-stream" } });
 
@@ -47,8 +50,10 @@ async function capturePayload<TApi extends RouteApi>(
 		...options,
 		apiKey: "test-key",
 		fetch: fetchMock,
+		signal: controller.signal,
 		onPayload: payload => {
 			captured = payload as CapturedPayload;
+			controller.abort();
 		},
 	}).result();
 
@@ -58,6 +63,7 @@ async function capturePayload<TApi extends RouteApi>(
 
 const chatCompletions = fixture("openai-completions", "openai", "https://api.openai.com/v1", "gpt-5.1");
 const openRouter = fixture("openrouter", "openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5.1");
+const codex = fixture("openai-codex-responses", "codex-proxy", "http://127.0.0.1:2455/backend-api/codex", "gpt-5.1");
 
 describe("OpenAI route reasoning disablement", () => {
 	it("drops reasoning effort on a forced-off chat-completions request", async () => {
@@ -77,5 +83,13 @@ describe("OpenAI route reasoning disablement", () => {
 
 		const forcedOff = await capturePayload(openRouter, { reasoning: Effort.Medium, forceReasoningOff: true });
 		expect(forcedOff.reasoning).toEqual({ effort: "none" });
+	});
+
+	it("sends effort none for a disabled-reasoning Codex request", async () => {
+		// Given: a Codex model whose server default effort is not none
+		// When: the caller disables reasoning (judgment/side calls pass no effort)
+		const disabled = await capturePayload(codex, { disableReasoning: true });
+		// Then: the wire body turns reasoning off instead of omitting it
+		expect(disabled.reasoning?.effort).toBe("none");
 	});
 });
