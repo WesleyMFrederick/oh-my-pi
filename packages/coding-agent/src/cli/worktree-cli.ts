@@ -23,6 +23,7 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
+import { runPostCheckoutHook } from "../session/session-worktree";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 
@@ -160,6 +161,10 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	}
 	if (result.cloneError) {
 		console.error(chalk.dim(`warning: worktree clone fell back to plain checkout: ${result.cloneError}`));
+	}
+	const hook = await runPostCheckoutHook(await fs.realpath(worktreePath), commit.sha, "stderr");
+	if (hook.exitCode !== 0) {
+		throw new Error(`post-checkout hook exited ${hook.exitCode}${hook.output ? `: ${hook.output.trim()}` : ""}`);
 	}
 }
 

@@ -6,7 +6,8 @@
  * The worktree is created through the clone-first path (`worktree.clone`,
  * `isolation.backend`) and lands under the agent-managed worktree base
  * (`worktree.base`, default `~/.omp/wt`) next to `github pr_checkout` trees,
- * so `omp worktree list|clear` sees it.
+ * so `omp worktree list|clear` sees it. The repository's `post-checkout` hook
+ * then runs in it, as `git worktree add` would run it.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -28,12 +29,66 @@ export interface SessionWorktree {
 	clonedWith?: IsoBackendKind;
 	/** Why the clone fell back to a plain checkout, when it did. */
 	cloneError?: string;
+	/** Why the repository's `post-checkout` hook failed, when it did. */
+	hookError?: string;
 }
 
 /** Default `/wt` branch name: `wt/<yyyymmdd-hhmmss>`. */
 export function defaultSessionWorktreeBranch(now = new Date()): string {
 	const pad = (n: number) => String(n).padStart(2, "0");
 	return `wt/${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+/** Outcome of {@link runPostCheckoutHook}. `output` is empty when streamed. */
+export interface PostCheckoutHookResult {
+	exitCode: number;
+	output: string;
+}
+
+/**
+ * Run the repository's `post-checkout` hook in a freshly added worktree the way
+ * `git worktree add` does: in the worktree, with `<null-oid> <head> 1`. The
+ * native `worktreeAdd` checks out without git, so repo setup hooks would
+ * otherwise never fire for `/wt` or `omp worktree add`.
+ *
+ * A missing hook is a no-op. `output: "stderr"` streams hook output to stderr
+ * (git sends hook stdout there too); `"capture"` returns it. Never throws: a
+ * spawn failure returns exit code 127 with the error as output.
+ */
+export async function runPostCheckoutHook(
+	worktreePath: string,
+	head: string,
+	output: "capture" | "stderr",
+): Promise<PostCheckoutHookResult> {
+	const nullOid = "0".repeat(head.length);
+	const argv = [
+		"git",
+		"-C",
+		worktreePath,
+		"hook",
+		"run",
+		"--ignore-missing",
+		"post-checkout",
+		"--",
+		nullOid,
+		head,
+		"1",
+	];
+	try {
+		if (output === "stderr") {
+			const child = Bun.spawn(argv, { stdin: "ignore", stdout: 2, stderr: "inherit" });
+			return { exitCode: await child.exited, output: "" };
+		}
+		const child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		return { exitCode, output: stdout + stderr };
+	} catch (err) {
+		return { exitCode: 127, output: err instanceof Error ? err.message : String(err) };
+	}
 }
 
 /** One-line confirmation shown after the session moved into `worktree`. */
@@ -104,10 +159,15 @@ export async function createSessionWorktree(cwd: string, settings: Settings, bra
 		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
 		keepChanges: true,
 	});
+	const resolvedPath = await fs.realpath(worktreePath);
+	const head = (await repository.commitDetails(branch)).sha;
+	const hook = await runPostCheckoutHook(resolvedPath, head, "capture");
+	const hookOutput = hook.output.trim().split("\n").slice(-5).join("\n");
 	return {
-		path: await fs.realpath(worktreePath),
+		path: resolvedPath,
 		branch,
 		clonedWith: result.clonedWith ?? undefined,
 		cloneError: result.cloneError ?? undefined,
+		hookError: hook.exitCode === 0 ? undefined : `post-checkout hook exited ${hook.exitCode}: ${hookOutput}`,
 	};
 }

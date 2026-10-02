@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- Fixed `/wt` and `omp worktree add` skipping the repository's `post-checkout` hook; both now run it in the new worktree with `git worktree add`'s arguments. `omp worktree add` exits with the hook's status, as git does; `/wt` keeps the worktree and warns.
 - Fixed test suite failures on non-FHS hosts and under ambient terminal and Git configuration ([#12358](https://github.com/can1357/oh-my-pi/pull/12358) by [@olegpulatov](https://github.com/olegpulatov)).
 
 ## [18.4.9] - 2026-10-01

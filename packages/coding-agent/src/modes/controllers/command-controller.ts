@@ -1321,6 +1321,9 @@ export class CommandController {
 					error: worktree.cloneError,
 				});
 			}
+			if (worktree.hookError) {
+				this.ctx.showWarning(`Worktree created, but ${worktree.hookError}`);
+			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
 			const cleanup = await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings);
 			if (cleanup.errorMessage !== undefined) {
