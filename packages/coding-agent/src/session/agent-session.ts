@@ -1075,6 +1075,10 @@ export class AgentSession implements SettingsScope {
 	#endInFlight(onSettled?: () => void | Promise<void>): void {
 		if (onSettled) this.#inFlightSettledCallbacks.push(onSettled);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
+		logger.debug("prompt in-flight released", {
+			inFlight: this.#promptInFlightCount,
+			agentEndPending: this.#pendingAgentEndEmit !== undefined,
+		});
 		if (this.#promptInFlightCount !== 0) return;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
@@ -3032,6 +3036,7 @@ export class AgentSession implements SettingsScope {
 		// RPC/ACP consumers may submit again on agent_end, so defer that frame
 		// until the owning prompt unwinds and the session actually becomes idle.
 		if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
+			logger.debug("agent_end deferred until prompt unwinds", { inFlight: this.#promptInFlightCount });
 			this.#pendingAgentEndEmit = event;
 		} else {
 			this.#emit(event);
@@ -4167,7 +4172,9 @@ export class AgentSession implements SettingsScope {
 			if (compactionResult.automaticContinuationBlocked && AIError.isPayloadRejection(msg)) {
 				await this.#recovery.persistTerminalEmptyErrorTurn(msg);
 			}
+			maintenanceRoute("settle-errorRecovery");
 			await this.#recovery.onErrorSettledWithoutRetry(msg, compactionResult);
+			maintenanceRoute("settle-reminders");
 			// Stop-time todo reconciliation only fires at a text-only final stop. A run
 			// that ends still mid-tool-use (deadline hit, context full, etc.) skips the
 			// reminder so we don't pile a follow-up onto an already in-flight turn.
@@ -4217,6 +4224,7 @@ export class AgentSession implements SettingsScope {
 				await emitAgentEndNotification({ willContinue: true, awaitingAsyncWork: true });
 				return;
 			}
+			maintenanceRoute("settle-sessionStop");
 			const sessionStopWillContinue = await this.#emitSessionStopEvent(activeMessages, msg);
 			await emitAgentEndNotification(sessionStopWillContinue ? { willContinue: true } : undefined);
 		}
@@ -4523,18 +4531,24 @@ export class AgentSession implements SettingsScope {
 			// specific prompt turn, stop as soon as that turn has been superseded:
 			// its promise must resolve on the abort, not block on a queued
 			// steer/follow-up that the post-abort drain starts as a fresh turn.
-			if (generation !== undefined && this.#promptGeneration !== generation) return;
+			if (generation !== undefined && this.#promptGeneration !== generation) {
+				logger.debug("post-prompt recovery wait", { gate: "superseded" });
+				return;
+			}
 			const retryPromise = this.#recovery.retryPromise;
 			if (retryPromise) {
+				logger.debug("post-prompt recovery wait", { gate: "retry" });
 				await retryPromise;
 				continue;
 			}
 			const ttsrResumeGate = this.#ttsr.resumeGate;
 			if (ttsrResumeGate) {
+				logger.debug("post-prompt recovery wait", { gate: "ttsr-resume" });
 				await ttsrResumeGate;
 				continue;
 			}
 			if (this.#postPromptTasksPromise) {
+				logger.debug("post-prompt recovery wait", { gate: "post-prompt-tasks" });
 				await this.#postPromptTasksPromise;
 				continue;
 			}
@@ -4542,9 +4556,11 @@ export class AgentSession implements SettingsScope {
 			// event handlers. Keep the streaming fallback for direct agent activity
 			// outside the scheduler.
 			if (this.agent.state.isStreaming) {
+				logger.debug("post-prompt recovery wait", { gate: "agent-streaming" });
 				await this.agent.waitForIdle();
 				continue;
 			}
+			logger.debug("post-prompt recovery wait", { gate: "settled" });
 			break;
 		}
 	}
@@ -4694,6 +4710,10 @@ export class AgentSession implements SettingsScope {
 		// `yielded` alone also covers queued steer/follow-up and IRC continuations,
 		// which `#flushPendingAgentEnd` re-tags non-terminal.
 		const awaitingAsyncWork = options?.willContinue === true && options.awaitingAsyncWork === true;
+		logger.debug("agent_end settle", {
+			willContinue: options?.willContinue === true,
+			inFlight: this.#promptInFlightCount,
+		});
 		await this.#emitSessionEvent({
 			...event,
 			isTerminal: !options?.willContinue,
