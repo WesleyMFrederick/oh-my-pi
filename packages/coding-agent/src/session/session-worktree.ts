@@ -1,4 +1,8 @@
-/** Session relocation and exit policy for worktrees created by `/wt`. */
+/**
+ * Session relocation and exit policy for worktrees created by `/wt`. After
+ * creation the repository's `post-checkout` hook runs in the new worktree, as
+ * `git worktree add` would run it.
+ */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -104,7 +108,7 @@ export async function createSessionWorktree(
 	settings: Settings,
 	branch: string,
 	options: { keepChanges?: boolean } = {},
-): Promise<SessionWorktree> {
+): Promise<SessionWorktree & { hookError?: string }> {
 	const keepChanges = options.keepChanges ?? true;
 	try {
 		await settings.flush();
@@ -126,7 +130,7 @@ export async function createSessionWorktree(
 	if (!baseCommit) {
 		throw new Error(`Cannot create a worktree: ${cwd} has no commits.`);
 	}
-	return creationBackend(settings).create({
+	const worktree = await creationBackend(settings).create({
 		repository,
 		settings,
 		branch,
@@ -134,6 +138,15 @@ export async function createSessionWorktree(
 		baseCommit,
 		keptChanges: keepChanges,
 	});
+	const hook = await vcs.runPostCheckoutHook(worktree.path, baseCommit);
+	if (hook.exitCode === 0) return worktree;
+	const decoder = new TextDecoder();
+	const hookOutput = (decoder.decode(hook.stdout) + decoder.decode(hook.stderr))
+		.trim()
+		.split("\n")
+		.slice(-5)
+		.join("\n");
+	return { ...worktree, hookError: `post-checkout hook exited ${hook.exitCode}: ${hookOutput}` };
 }
 
 /** State of `wt` plus a fingerprint that changes whenever any file, ref, or `HEAD` in it changes. */
