@@ -5618,7 +5618,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (compactionResult.automaticContinuationBlocked && AIError.isPayloadRejection(msg)) {
 				await this.#recovery.persistTerminalEmptyErrorTurn(msg);
 			}
+			maintenanceRoute("settle-errorRecovery");
 			await this.#recovery.onErrorSettledWithoutRetry(msg, compactionResult);
+			maintenanceRoute("settle-reminders");
 			// Stop-time todo reconciliation only fires at a text-only final stop. A run
 			// that ends still mid-tool-use (deadline hit, context full, etc.) skips the
 			// reminder so we don't pile a follow-up onto an already in-flight turn.
@@ -5670,6 +5672,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				endLoop();
 				return;
 			}
+			maintenanceRoute("settle-sessionStop");
 			const sessionStopWillContinue = await this.#emitSessionStopEvent(activeMessages, msg);
 			endLoop(sessionStopWillContinue ? { continuing: true } : undefined);
 		}
@@ -6016,18 +6019,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// specific prompt turn, stop as soon as that turn has been superseded:
 			// its promise must resolve on the abort, not block on a queued
 			// steer/follow-up that the post-abort drain starts as a fresh turn.
-			if (generation !== undefined && this.#promptGeneration !== generation) return;
+			if (generation !== undefined && this.#promptGeneration !== generation) {
+				logger.debug("post-prompt recovery wait", { gate: "superseded" });
+				return;
+			}
 			const retryPromise = this.#recovery.retryPromise;
 			if (retryPromise) {
+				logger.debug("post-prompt recovery wait", { gate: "retry" });
 				await retryPromise;
 				continue;
 			}
 			const ttsrResumeGate = this.#ttsr.resumeGate;
 			if (ttsrResumeGate) {
+				logger.debug("post-prompt recovery wait", { gate: "ttsr-resume" });
 				await ttsrResumeGate;
 				continue;
 			}
 			if (this.#postPromptTasksPromise) {
+				logger.debug("post-prompt recovery wait", { gate: "post-prompt-tasks" });
 				await this.#postPromptTasksPromise;
 				continue;
 			}
@@ -6035,9 +6044,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// event handlers. Keep the streaming fallback for direct agent activity
 			// outside the scheduler.
 			if (this.agent.state.isStreaming) {
+				logger.debug("post-prompt recovery wait", { gate: "agent-streaming" });
 				await this.agent.waitForIdle();
 				continue;
 			}
+			logger.debug("post-prompt recovery wait", { gate: "settled" });
 			break;
 		}
 	}
