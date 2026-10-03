@@ -41,7 +41,12 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { formatModelStringWithRouting, resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
+import {
+	formatModelStringWithRouting,
+	type RoleChainCandidate,
+	resolveModelRoleValue,
+	resolveRoleChain,
+} from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import type { SessionManager } from "../session/session-manager";
@@ -73,6 +78,14 @@ export interface JudgeDeps {
 	sessionModel?: Model;
 	sessionId?: string;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
+	/**
+	 * Model selector (e.g. `typesafe/jev-latest`) that replaces the whole `judge`
+	 * role chain: only that model answers, with no role or session fallback, so a
+	 * caller that names a judge never gets a different model's verdicts. When
+	 * the selector does not resolve to a credentialed judge-capable model, every
+	 * judgment fails with "no judge model available".
+	 */
+	model?: string;
 	/** Why the judgment runs (`find`, `ttsr`, `judge_batch`, …); labels ledger entries and telemetry spans. */
 	purpose: string;
 	/**
@@ -197,14 +210,23 @@ function judgeRoleChain(settings: Settings, registry: ModelRegistry): RoleChainC
 	return chain.filter((candidate, index) => index < firstNative || kindOf(candidate) === "native");
 }
 
+/** The single candidate a {@link JudgeDeps.model} selector names, or none when it does not resolve. */
+function selectedJudgeChain(selector: string, settings: Settings, registry: ModelRegistry): RoleChainCandidate[] {
+	const resolved = resolveModelRoleValue(selector, roleCandidatePool("judge", settings, registry), { settings });
+	if (!resolved.model) return [];
+	const candidate: RoleChainCandidate = { model: resolved.model, explicit: true };
+	if (resolved.thinkingLevel !== undefined) candidate.thinkingLevel = resolved.thinkingLevel;
+	return [candidate];
+}
+
 /**
- * Whether the `judge` role resolves first to a native System One backend
- * (TypeSafe jev, directly or through OpenRouter) rather than a prompted
- * on-device or chat model. Judge-heavy features gate on it, e.g. the `find`
- * tool under `find.enabled: auto`.
+ * Whether the `judge` role — or the `model` selector, when given — resolves
+ * first to a native System One backend (TypeSafe jev, directly or through
+ * OpenRouter) rather than a prompted on-device or chat model. Judge-heavy
+ * features gate on it, e.g. the `find` tool under `find.enabled: auto`.
  */
-export function hasNativeJudge(settings: Settings, registry: ModelRegistry): boolean {
-	const [primary] = judgeRoleChain(settings, registry);
+export function hasNativeJudge(settings: Settings, registry: ModelRegistry, model?: string): boolean {
+	const [primary] = model ? selectedJudgeChain(model, settings, registry) : judgeRoleChain(settings, registry);
 	return primary !== undefined && kindOf(primary) === "native";
 }
 
@@ -316,7 +338,11 @@ export class ChainJudge implements Judge {
 	}
 
 	#resolveCandidates(): RoleChainCandidate[] {
-		const { settings, registry, sessionModel } = this.#deps;
+		const { settings, registry, sessionModel, model } = this.#deps;
+		if (model) {
+			this.#candidates ??= { chain: [], list: selectedJudgeChain(model, settings, registry) };
+			return this.#candidates.list;
+		}
 		const candidates = cachedJudgeRoleChain(settings, registry);
 		if (candidates === this.#candidates?.chain) return this.#candidates.list;
 		const list = withSessionFallback(candidates, sessionModel);

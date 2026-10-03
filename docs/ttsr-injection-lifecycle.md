@@ -285,14 +285,15 @@ During the timer window, state can change. The retry is guarded by retry token, 
 
 ## 10. Judged rules (`question`)
 
-A rule with `question` is judged: its natural-language question goes to the `judge` model role after an output completes, never while it streams, so it cannot interrupt.
+A rule with `question` is judged: its natural-language question goes to the `judge` model role — or to the model its own `judge` frontmatter names — after an output completes, never while it streams, so it cannot interrupt.
 
 ### When judgment runs
 
-- `ttsr.judge`: `auto` (default) judges only when the judge role resolves to a native System One model (TypeSafe jev); `on` judges with whatever the role resolves to, including the session's chat model; `off` never judges. Question rules still register either way.
+- `ttsr.judge`: `auto` (default) judges only when the rule's judge resolves to a native System One model (TypeSafe jev); `on` judges with whatever it resolves to, including the session's chat model; `off` never judges. Question rules still register either way.
+- A rule's `judge` selector (e.g. `typesafe/jev-latest`) replaces the whole judge-role chain for that rule: only that model answers, with no role or session-model fallback. When it does not resolve to a credentialed judge-capable model, that rule's judgment fails and delivers nothing.
 - On `message_end` of an assistant message whose `stopReason` is neither `aborted` nor `error`, `TtsrCoordinator` splits the message into outputs: all text blocks as one `text` output, all thinking blocks as one `thinking` output, and each tool call as a `tool` output. Tools exposing `matcherEntries` yield one output per file, with the `{ path, digest }` digest as content; otherwise the `matcherDigest` or the raw JSON arguments.
 - For each output, `TtsrManager.judgedCandidates()` selects question rules that pass scope, `globs`, the repeat policy, and — when the rule also declares `condition`/`astCondition` — that prefilter against the completed content. No candidates → no request.
-- One judge request per output carries every candidate's question as a `noul` question over a shared state `{ output, content }` (content cut to its longest prefix within 32,000 Jev tokens, counted locally with `Encoding.Jev`, so each branch stays under Jev's ~33k-token limit). Jev bills the state once per request, so rules sharing an output share its cost. Usage is journaled as `model_usage` with purpose `ttsr`.
+- One judge request per output and judge carries every candidate's question that shares that judge as a `noul` question over a shared state `{ output, content }` (content cut to its longest prefix within 32,000 Jev tokens, counted locally with `Encoding.Jev`, so each branch stays under Jev's ~33k-token limit). Jev bills the state once per request, so rules sharing an output and a judge share its cost. Usage is journaled as `model_usage` with purpose `ttsr`.
 
 ### Delivery
 
@@ -300,7 +301,7 @@ A rule with `question` is judged: its natural-language question goes to the `jud
 - Verdicts arriving after a session replacement (`/new`, session switch) are dropped.
 - Survivors emit `ttsr_triggered` and are rendered with `ttsr-warning.md` into a hidden `ttsr-injection` custom message (`details.rules`), sent with `deliverAs: "aside"`: mid-run it joins the next step without interrupting; on an idle session it starts a turn. Its `message_end` persists the `ttsr_injection` entry.
 - The session's `onBeforeYield` hook awaits in-flight judgments (up to 5s) before the agent loop drains asides and stops, so a warning about the final reply or last tool call lands in the same run. Later verdicts still arrive as asides.
-- Judge failures (no credentials, timeouts, parse errors) are logged and deliver nothing.
+- Judge failures (no credentials, timeouts, parse errors) are logged and deliver nothing; with per-rule judges, a failing judge drops only its own rules' verdicts.
 
 ### `/omfg` and CLI
 

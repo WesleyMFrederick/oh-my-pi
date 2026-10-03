@@ -45,6 +45,7 @@ interface Rule {
   condition?: string[];
   astCondition?: string[];
   question?: string;
+  judge?: string;
   scope?: string[];
   agents?: string[];
   interruptMode?: "never" | "prose-only" | "tool-only" | "always";
@@ -272,7 +273,7 @@ After rule discovery in `createAgentSession` (`sdk.ts`), `bucketRules(...)` appl
   agents: main
   ```
 
-### `condition`, `astCondition`, `question`, `scope`, and `interruptMode`
+### `condition`, `astCondition`, `question`, `judge`, `scope`, and `interruptMode`
 
 - `condition` is the regex TTSR trigger field; legacy `ttsr_trigger` / `ttsrTrigger` are accepted as fallback inputs during parsing. A leading `(?i)`, `(?m)`, or `(?s)` inline flag group is translated to the equivalent JavaScript `RegExp` flags.
 - `astCondition` is the ast-grep trigger field: a string or YAML sequence of structural patterns, kept verbatim (no glob inference). It matches finalized source snapshots from tools exposing `matcherEntries` or `matcherDigest` (built-in edit/write do), with language inferred from the file path. It does not run on partial streaming deltas. A rule may set `condition`, `astCondition`, or both.
@@ -281,6 +282,20 @@ After rule discovery in `createAgentSession` (`sdk.ts`), `bucketRules(...)` appl
   ```yaml
   question: "Does the reply claim tests pass without showing they were run?"
   scope: text
+  ```
+- `judge` pins a judged rule to one model selector instead of the `judge` model role. Only that model answers the rule's question — no role or session-model fallback — so a rule tuned for one judge's calibration never gets another model's verdicts. Rules sharing a judge still share one request per output.
+
+  ```yaml
+  question: "Does this reply make a technical build choice while gathering product requirements?"
+  judge: typesafe/jev-latest
+  scope: text
+  ```
+- `whileSkill` / `untilSkill` (judged rules only) tie the question to a workflow phase. Each takes a skill name or list. Before asking, the session branch is scanned newest-first for the last load of any listed skill: `/skill:<name>`, or a `read` of `skill://<name>` (or the skill's `SKILL.md`; reference files under the skill do not count). The rule is asked only when that last load is a `whileSkill` one. With no load yet, a `whileSkill` rule stays off. Out-of-phase rules cost no judge call. The scan reads the persisted branch, so compaction does not lose the phase.
+
+  ```yaml
+  question: "Does this reply choose a specific technology or implementation approach?"
+  whileSkill: ce-brainstorm
+  untilSkill: [ce-plan, ce-work]
   ```
 - `scope` narrows TTSR matching to an allowlist of stream surfaces. It accepts either a comma-separated YAML string or a YAML sequence. Omitting it watches assistant prose (`text`) and all tool arguments (`tool`), but not thinking.
 

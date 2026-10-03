@@ -32,6 +32,12 @@ export interface RuleFrontmatter {
 	astCondition?: string | string[];
 	/** Natural-language yes/no question a judge model answers on each completed in-scope output. */
 	question?: string;
+	/** Model selector (e.g. `typesafe/jev-latest`) that answers this rule's `question` in place of the whole `judge` role chain. */
+	judge?: string;
+	/** Skill name(s) whose load turns this judged rule on; see {@link Rule.whileSkill}. */
+	whileSkill?: string | string[];
+	/** Skill name(s) whose load turns this judged rule off; see {@link Rule.untilSkill}. */
+	untilSkill?: string | string[];
 	/** New key for TTSR stream scope. */
 	scope?: string | string[];
 	/** Agent-name globs this rule applies to; absent = every agent. `main` targets the top-level session. */
@@ -67,6 +73,18 @@ export interface Rule {
 	 * `astCondition`, when also set, only gate whether the question is asked.
 	 */
 	question?: string;
+	/**
+	 * Model selector that answers `question` in place of the whole `judge` role chain
+	 * (e.g. `typesafe/jev-latest`); no fallback — an unresolvable selector fails only this rule's check.
+	 */
+	judge?: string;
+	/**
+	 * Judged rules only: the rule is asked only while the most recent session load of any
+	 * `whileSkill` / `untilSkill` skill is a `whileSkill` one (e.g. on during `ce-brainstorm`).
+	 */
+	whileSkill?: string[];
+	/** Judged rules only: loading one of these skills turns the rule off until a `whileSkill` loads again. */
+	untilSkill?: string[];
 	/** Optional stream scope tokens (for example: text, thinking, tool:edit(*.ts)). */
 	scope?: string[];
 	/** Lowercased agent-name globs this rule applies to (absent = every agent). */
@@ -226,6 +244,17 @@ export function ruleAppliesToAgent(rule: Pick<Rule, "agents">, agentName: string
 		return new Bun.Glob(pattern).match(name);
 	});
 }
+
+/**
+ * Whether a judged rule's skill phase is on, given the most recent session load
+ * among its `whileSkill` and `untilSkill` names. With no such load, a rule with
+ * `whileSkill` stays off and any other rule stays on.
+ */
+export function ruleInSkillPhase(rule: Pick<Rule, "whileSkill">, lastLoaded: string | undefined): boolean {
+	if (lastLoaded !== undefined) return rule.whileSkill?.includes(lastLoaded) === true;
+	return !rule.whileSkill?.length;
+}
+
 /**
  * Heuristic for condition shorthand that looks like a file glob (for example `*.rs`).
  */
@@ -255,11 +284,11 @@ function isLikelyFileGlob(value: string): boolean {
  * - condition tokens that look like file globs become scope shorthands:
  *   `*.rs` => `tool:edit(*.rs)`, `tool:write(*.rs)` and a catch-all condition `.*`
  * - `astCondition` holds ast-grep patterns and is kept verbatim (no glob inference)
- * - `question` accepts a single non-empty string
+ * - `question` and `judge` each accept a single non-empty string
  */
 export function parseRuleConditionAndScope(
 	frontmatter: RuleFrontmatter,
-): Pick<Rule, "condition" | "astCondition" | "question" | "scope"> {
+): Pick<Rule, "condition" | "astCondition" | "question" | "judge" | "scope"> {
 	const rawCondition = frontmatter.condition ?? frontmatter.ttsr_trigger ?? frontmatter.ttsrTrigger;
 	const parsedCondition = normalizeRuleField(rawCondition);
 	const astCondition = normalizeRuleField(frontmatter.astCondition);
@@ -286,6 +315,7 @@ export function parseRuleConditionAndScope(
 		condition: condition.length > 0 ? Array.from(new Set(condition)) : undefined,
 		astCondition,
 		question: typeof frontmatter.question === "string" ? frontmatter.question.trim() || undefined : undefined,
+		judge: typeof frontmatter.judge === "string" ? frontmatter.judge.trim() || undefined : undefined,
 		scope: scope.length > 0 ? Array.from(new Set(scope)) : undefined,
 	};
 }

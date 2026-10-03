@@ -15,7 +15,7 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Judge, ToolCall } from "@oh-my-pi/pi-ai";
 import { logger, prompt, relativePathWithinRoot, withTimeout } from "@oh-my-pi/pi-utils";
-import type { Rule } from "../capability/rule";
+import { type Rule, ruleInSkillPhase } from "../capability/rule";
 import type { Settings } from "../config/settings";
 import { judgeRules, type TtsrManager, type TtsrMatchContext, type TtsrOutput } from "../export/ttsr";
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
@@ -23,6 +23,7 @@ import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" w
 import ttsrWarningTemplate from "../prompts/system/ttsr-warning.md" with { type: "text" };
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { SessionManager } from "./session-manager";
+import { lastSkillLoad } from "./skill-loads";
 import { TtsrToolInspector } from "./ttsr-outputs";
 
 type TtsrContinueSkipReason =
@@ -53,8 +54,11 @@ export interface TtsrCoordinatorHost {
 	schedulePostPromptTask(task: (signal: AbortSignal) => Promise<void>, options?: { delayMs?: number }): void;
 	scheduleAgentContinue(options: TtsrContinueOptions): void;
 	promptGeneration(): number;
-	/** Judge for `question` rules, or `undefined` while judged rules are off (`ttsr.judge`). */
-	ruleJudge(): Judge | undefined;
+	/**
+	 * Judge for `question` rules, or `undefined` while judged rules are off (`ttsr.judge`).
+	 * `model` is a rule's own `judge` selector; omitted uses the `judge` role.
+	 */
+	ruleJudge(model?: string): Judge | undefined;
 	/** Delivers a judged-rule warning without interrupting the run. */
 	deliverRuleWarning(content: string, ruleNames: string[]): Promise<void>;
 	/** Changes when the session is replaced; verdicts from an older generation are dropped. */
@@ -540,15 +544,34 @@ export class TtsrCoordinator {
 		}
 	}
 
-	/** One judge request per output: every eligible rule's question shares the billed state. */
+	/**
+	 * One judge request per output and judge model: rules sharing a judge share
+	 * the billed state. A rule's own `judge` selector routes it to that model; a
+	 * failing judge only drops its own rules' verdicts.
+	 */
 	async #judgeOutput(output: TtsrOutput, generation: number): Promise<void> {
 		const manager = this.#manager;
 		if (!manager) return;
-		const candidates = await manager.judgedCandidates(output.content, output.context);
+		const candidates = this.#inSkillPhase(await manager.judgedCandidates(output.content, output.context));
 		if (candidates.length === 0) return;
-		const judge = this.#host.ruleJudge();
-		if (!judge) return;
-		const flagged = await judgeRules(judge, output, candidates);
+		const byJudge = Map.groupBy(candidates, candidate => candidate.rule.judge);
+		const verdicts = await Promise.all(
+			Array.from(byJudge, async ([model, group]) => {
+				const judge = this.#host.ruleJudge(model);
+				if (!judge) return [];
+				try {
+					return await judgeRules(judge, output, group);
+				} catch (error) {
+					logger.warn("TTSR judged rule check failed", {
+						judge: model ?? "judge role",
+						rules: group.map(candidate => candidate.rule.name),
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return [];
+				}
+			}),
+		);
+		const flagged = verdicts.flat();
 		if (flagged.length === 0 || this.#host.sessionGeneration() !== generation) return;
 		const rules = manager.claim(flagged);
 		if (rules.length === 0) return;
@@ -567,6 +590,16 @@ export class TtsrCoordinator {
 			warning,
 			rules.map(rule => rule.name),
 		);
+	}
+
+	/** Drops candidates whose `whileSkill` / `untilSkill` phase is off; out-of-phase rules cost no judge call. */
+	#inSkillPhase<T extends { rule: Rule }>(candidates: T[]): T[] {
+		if (!candidates.some(({ rule }) => rule.whileSkill?.length || rule.untilSkill?.length)) return candidates;
+		const branch = this.#host.sessionManager.getBranch();
+		return candidates.filter(({ rule }) => {
+			const names = new Set([...(rule.whileSkill ?? []), ...(rule.untilSkill ?? [])]);
+			return names.size === 0 || ruleInSkillPhase(rule, lastSkillLoad(branch, names));
+		});
 	}
 
 	#getStreamingToolCallBlock(message: AgentMessage, contentIndex: number): ToolCall | undefined {

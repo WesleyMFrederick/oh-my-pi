@@ -182,7 +182,7 @@ export class OmfgController {
 			const validated = await validateParsedRuleAgainstAssistantHistory(
 				parsed,
 				historyOutputs(this.ctx.session.messages, this.#inspector),
-				parsed.rule.question !== undefined ? this.ctx.session.ruleJudge() : undefined,
+				parsed.rule.question !== undefined ? this.ctx.session.ruleJudge(parsed.rule.judge) : undefined,
 			);
 			if (this.#shouldStop(request)) return undefined;
 			if (validated.repairedCondition) {
