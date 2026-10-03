@@ -2663,6 +2663,12 @@ class CodexStreamProcessor {
 		if (responseId) {
 			output.responseId = responseId;
 		}
+		// The server names the model that actually served the turn; `output.model`
+		// only echoes the requested id, so this is the one serving-side receipt.
+		const servedModel = response && "model" in response ? response.model : undefined;
+		if (typeof servedModel === "string" && servedModel.length > 0) {
+			output.upstreamModel = servedModel;
+		}
 
 		const incompleteDetails =
 			response &&

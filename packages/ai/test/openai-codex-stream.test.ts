@@ -441,6 +441,50 @@ describe("openai-codex streaming", () => {
 		]);
 	});
 
+	it("records the server-reported model as upstreamModel, separate from the requested id", async () => {
+		// Given a Codex server that serves a different model than the one requested
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sse = createCompletedCodexSse("Hello").replace(
+			'"response":{"status":"completed"',
+			'"response":{"model":"gpt-5.3-codex-served","status":"completed"',
+		);
+		const fetchMock = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+
+		// When the turn completes
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel(), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), fetch: fetchMock as FetchImpl },
+		).result();
+
+		// Then the receipt names the served model and model keeps the requested id
+		expect(result.upstreamModel).toBe("gpt-5.3-codex-served");
+		expect(result.model).toBe("gpt-5.3-codex-spark");
+	});
+
+	it("leaves upstreamModel unset when the server names no model", async () => {
+		// Given a Codex server whose completion event carries no model
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sse = createCompletedCodexSse("Hello");
+		const fetchMock = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+
+		// When the turn completes
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel(), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken(), fetch: fetchMock as FetchImpl },
+		).result();
+
+		// Then no receipt is invented from the requested id
+		expect(result.upstreamModel).toBeUndefined();
+	});
+
 	it("omits chatgpt account headers for opaque custom provider API keys", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
