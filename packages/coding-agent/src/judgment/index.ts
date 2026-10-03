@@ -101,6 +101,14 @@ export interface JudgeDeps {
 	sessionModel?: Model;
 	sessionId?: string;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
+	/**
+	 * Model selector (e.g. `typesafe/jev-latest`) that replaces the whole `judge`
+	 * role chain: only that model answers, with no role or session fallback, so a
+	 * caller that names a judge never gets a different model's verdicts. When
+	 * the selector does not resolve to a credentialed judge-capable model, every
+	 * judgment fails with "no judge model available".
+	 */
+	model?: string;
 	/** Why the judgment runs (`find`, `ttsr`, `judge_batch`, …); labels ledger entries and telemetry spans. */
 	purpose: string;
 	/**
@@ -296,6 +304,15 @@ function textJudgeRoleChain(chain: RoleChainCandidate[]): RoleChainCandidate[] {
 	return chain.filter((candidate, index) => index < firstNative || kindOf(candidate) === "native");
 }
 
+/** The single candidate a {@link JudgeDeps.model} selector names, or none when it does not resolve. */
+function selectedJudgeChain(selector: string, settings: Settings, registry: ModelRegistry): RoleChainCandidate[] {
+	const resolved = resolveModelRoleValue(selector, roleCandidatePool("judge", settings, registry), { settings });
+	if (!resolved.model) return [];
+	const candidate: RoleChainCandidate = { model: resolved.model, explicit: true };
+	if (resolved.thinkingLevel !== undefined) candidate.thinkingLevel = resolved.thinkingLevel;
+	return [candidate];
+}
+
 /**
  * Filter candidates that cannot take `images` before applying the native-only tail policy. A native
  * judge gets each image fitted into its bounds ({@link fitNativeImages}), so only its image support and
@@ -396,14 +413,21 @@ function activeRejection(
 }
 
 /**
- * Whether the `judge` role resolves first to a native judgment backend
- * (TypeSafe jev, OpenRouter or OpenAI Decisions, Workers AI Clef) rather than a
- * prompted on-device or chat model. Candidates under an active rejection
- * ({@link nativeJudgeRejection}) are skipped, as a judgment would skip them.
- * Judge-heavy features gate on it, e.g. the `find` tool under `find.enabled: auto`.
+ * Whether the `judge` role — or `judgeModel`, a rule's pinned judge selector, when
+ * given — resolves first to a native judgment backend (TypeSafe jev, OpenRouter or
+ * OpenAI Decisions, Workers AI Clef) rather than a prompted on-device or chat model.
+ * Candidates under an active rejection ({@link nativeJudgeRejection}) are skipped,
+ * as a judgment would skip them. Judge-heavy features gate on it, e.g. the `find`
+ * tool under `find.enabled: auto`.
  */
-export function hasNativeJudge(settings: Settings, registry: ModelRegistry, sessionModel?: Model): boolean {
-	const primary = allowedJudgeCandidates(judgeRoleChain(settings, registry), settings, sessionModel).find(
+export function hasNativeJudge(
+	settings: Settings,
+	registry: ModelRegistry,
+	sessionModel?: Model,
+	judgeModel?: string,
+): boolean {
+	const chain = judgeModel ? selectedJudgeChain(judgeModel, settings, registry) : judgeRoleChain(settings, registry);
+	const primary = allowedJudgeCandidates(chain, settings, sessionModel).find(
 		candidate => activeRejection(registry, candidate) === undefined,
 	);
 	return primary !== undefined && kindOf(primary) === "native";
@@ -759,7 +783,12 @@ export class ChainJudge implements Judge {
 	}
 
 	#resolveCandidates(request?: JudgmentRequest): RoleChainCandidate[] {
-		const { sessionModel } = this.#deps;
+		const { settings, registry, sessionModel, model } = this.#deps;
+		if (model) {
+			// A pinned judge answers alone: no role chain, lead model, or session fallback.
+			this.#candidates ??= { chain: [], list: selectedJudgeChain(model, settings, registry) };
+			return allowedJudgeCandidates(this.#candidates.list, settings, sessionModel);
+		}
 		const resolved = this.#roleChains();
 		const restricted = cfgNoJudge.get(this.#deps.settings) || cfgOffline.get(this.#deps.settings);
 		if (restricted && !sessionModel?.provider) return [];

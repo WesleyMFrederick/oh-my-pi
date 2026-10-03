@@ -2819,7 +2819,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			schedulePostPromptTask: (task, options) => this.#schedulePostPromptTask(task, options),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			promptGeneration: () => this.#promptGeneration,
-			ruleJudge: () => this.ruleJudge(),
+			ruleJudge: model => this.ruleJudge(model),
 			deliverRuleWarning: (content, ruleNames) => this.#deliverRuleWarning(content, ruleNames),
 			sessionGeneration: () => this.#sessionGeneration,
 		};
@@ -4044,20 +4044,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * Judge for TTSR `question` rules per `ttsr.judge`, used by live judging and
-	 * `/omfg` validation. `auto` requires the judge role to resolve to a native
-	 * System One model, since every completed output may cost a request. Rebuilt
-	 * per call so model, credential, and session switches apply.
+	 * `/omfg` validation. `model` is a rule's own `judge` selector, which answers
+	 * in place of the judge role. `auto` requires the chosen judge to resolve to
+	 * a native System One model, since every completed output may cost a
+	 * request. Rebuilt per call so model, credential, and session switches apply.
 	 */
-	ruleJudge(): Judge | undefined {
+	ruleJudge(model?: string): Judge | undefined {
 		const mode = cfgTtsrJudge.get(this.settings);
-		if (mode === "off" || (mode === "auto" && !hasNativeJudge(this.settings, this.#modelRegistry, this.model)))
+		if (mode === "off" || (mode === "auto" && !hasNativeJudge(this.settings, this.#modelRegistry, this.model, model))) {
 			return undefined;
+		}
 		return resolveJudge({
 			settings: this.settings,
 			registry: this.#modelRegistry,
 			sessionModel: this.model,
 			sessionId: this.sessionId,
 			metadataResolver: provider => this.agent.metadataForProvider(provider),
+			model,
 			purpose: "ttsr",
 			onUsage: journalJudgmentUsage(this.sessionManager),
 			telemetry: this.agent.telemetry,
