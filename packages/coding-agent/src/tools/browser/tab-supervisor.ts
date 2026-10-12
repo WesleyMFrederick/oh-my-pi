@@ -15,6 +15,7 @@ import { expandPath } from "../path-utils";
 import { ToolAbortError, toWorkerErrorPayload } from "../tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { gracefulKillTreeOnce, pickElectronTarget, shouldPreserveConnectedBrowserFocus } from "./attach";
+import { releaseLaunchedBrowser } from "./launch-ledger";
 import { CmuxTab } from "./cmux/cmux-tab";
 import { mapWaitUntil } from "./cmux/rpc";
 import { runInProcessTab } from "./in-process-run";
@@ -881,12 +882,23 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 }
 
 /**
- * Best-effort termination of a spawned app that outlived a joined teardown.
- * Fires only behind a live subprocess handle (kernel-tracked, so no
- * pid-reuse hazard): anything else already died or was never ours to kill.
+ * Terminate a spawned app that outlived a joined teardown. A ledgered browser
+ * goes through the ledger decision (live borrower: transfer, never kill;
+ * already released: noop). Only an unledgered launch (no start times on this
+ * platform) falls back to the subprocess handle, which is kernel-tracked so
+ * there is no pid-reuse hazard.
  */
 async function ensureSpawnedKilled(browser: BrowserHandle): Promise<void> {
 	if (browser.kind.kind !== "spawned" || !("subprocess" in browser)) return;
+	if (browser.ledgerPid !== undefined) {
+		await releaseLaunchedBrowser(browser.ledgerPid, { kill: true, reason: "joined-release" }).catch(error => {
+			logger.warn("Joined release could not terminate the launched browser", {
+				pid: browser.ledgerPid,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		return;
+	}
 	const { pid, subprocess } = browser;
 	if (pid === undefined || !subprocess || subprocess.exitCode !== null) return;
 	await gracefulKillTreeOnce(pid).catch(() => undefined);
