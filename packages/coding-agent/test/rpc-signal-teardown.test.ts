@@ -31,6 +31,15 @@ async function waitFor(check: () => Promise<boolean> | boolean, deadlineMs: numb
 	}
 }
 
+/** True when `pid` is alive and its command line names `fixtureScript` (this test's own temp-dir script). */
+async function isOwnFixture(pid: number, fixtureScript: string): Promise<boolean> {
+	if (!isAlive(pid)) return false;
+	const ps = Bun.spawn(["ps", "-o", "command=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+	const command = await new Response(ps.stdout).text();
+	await ps.exited;
+	return command.includes(fixtureScript);
+}
+
 /**
  * Send `get_available_models` and resolve once its response frame arrives. That command awaits the startup
  * model refresh, so the reply proves the command loop is live AND the refresh (on a cold cache it writes
@@ -39,9 +48,10 @@ async function waitFor(check: () => Promise<boolean> | boolean, deadlineMs: numb
 async function awaitRpcResponse(
 	child: Bun.Subprocess<"pipe", "pipe", "pipe">,
 	id: string,
+	type: "get_available_models",
 	deadlineMs = 30_000,
 ): Promise<void> {
-	child.stdin.write(`${JSON.stringify({ id, type: "get_available_models" })}\n`);
+	child.stdin.write(`${JSON.stringify({ id, type })}\n`);
 	await child.stdin.flush();
 	const reader = child.stdout.getReader();
 	const decoder = new TextDecoder();
@@ -108,16 +118,20 @@ export default function (pi) {
 
 type Trigger = "SIGTERM" | "SIGHUP" | "stdin-EOF" | "stdin-EOF then SIGTERM";
 
-const CASES: Array<{ trigger: Trigger; row: string }> = [
+// `coldRefresh`: signal while the child's startup model refresh (empty cache, so it persists every provider's
+// catalog) is still running; otherwise wait for the refresh to finish first.
+const CASES: Array<{ trigger: Trigger; row: string; coldRefresh?: boolean }> = [
 	{ trigger: "SIGTERM", row: "M5" },
 	{ trigger: "SIGHUP", row: "M6" },
 	{ trigger: "stdin-EOF", row: "M5" },
 	{ trigger: "stdin-EOF then SIGTERM", row: "M5" },
+	{ trigger: "SIGTERM", row: "M5", coldRefresh: true },
+	{ trigger: "stdin-EOF", row: "M5", coldRefresh: true },
 ];
 
 describe("RPC teardown of a launched browser", () => {
-	for (const { trigger, row } of CASES) {
-		it(`given an RPC agent owning a launched browser, when it gets ${trigger}, then the browser is dead within ${TEARDOWN_BUDGET_MS} ms and the ledger entry is gone (${row})`, async () => {
+	for (const { trigger, row, coldRefresh } of CASES) {
+		it(`given an RPC agent owning a launched browser${coldRefresh ? " during its cold-cache model refresh" : ""}, when it gets ${trigger}, then the browser is dead within ${TEARDOWN_BUDGET_MS} ms and the ledger entry is gone (${row})`, async () => {
 			await using temp = await TempDir.create("@rpc-teardown-");
 			const pidFile = temp.join("browser.pid");
 			const fixtureScript = temp.join("fake-browser.sh");
@@ -167,7 +181,9 @@ describe("RPC teardown of a launched browser", () => {
 				// model refresh, command discovery); a signal sent then queues behind that work and the measured
 				// teardown would include it (measured: a 0.6-0.9 s event-loop stall that delayed the browser's
 				// SIGTERM past the 1.5 s budget). Wait for the refresh to finish before timing teardown.
-				await awaitRpcResponse(child, "ready-probe");
+				// Cold cases signal at once: the pid file is written at session_start, after the signal handlers are
+				// installed, while the empty-cache model refresh is still persisting provider catalogs.
+				if (!coldRefresh) await awaitRpcResponse(child, "ready-probe", "get_available_models");
 
 				const sentAt = performance.now();
 				if (trigger === "SIGTERM" || trigger === "SIGHUP") child.kill(trigger);
@@ -187,8 +203,9 @@ describe("RPC teardown of a launched browser", () => {
 				if (browserPid !== undefined && isAlive(browserPid)) process.kill(browserPid, "SIGKILL");
 				child.kill("SIGKILL");
 				// A startup timeout leaves `browserPid` unset while the child may still write the pid file later;
-				// killing the child would then orphan the SIGTERM-ignoring fixture. The pid file lives in this
-				// test's own temp dir, so the process it names is this test's fixture.
+				// killing the child would then orphan the SIGTERM-ignoring fixture. Signal the pid in the file only
+				// while its command line still names this test's own fixture script, so a stale file can never
+				// hit a process that reused the pid.
 				await child.exited;
 				const fixturePid = Number(
 					(
@@ -197,8 +214,9 @@ describe("RPC teardown of a launched browser", () => {
 							.catch(() => "")
 					).trim(),
 				);
-				if (Number.isInteger(fixturePid) && fixturePid > 0 && isAlive(fixturePid))
+				if (Number.isInteger(fixturePid) && fixturePid > 0 && (await isOwnFixture(fixturePid, fixtureScript))) {
 					process.kill(fixturePid, "SIGKILL");
+				}
 			}
 		}, 90_000);
 	}
