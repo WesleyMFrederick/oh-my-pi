@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed browser processes outliving closed agents: launched headless browsers idle-close and are reaped after their owner dies, RPC `SIGTERM`/`SIGHUP` release browser tabs, and the omp daemon no longer dies with the omp process that started it.
 - Fixed RPC and ACP command discovery omitting user prompt templates that appear in the interactive slash-command picker.
 
 ## [17.2.15] - 2026-08-12

@@ -164,7 +164,7 @@ Lifetime:
 
 - Closing releases the managed tab and closes pages omp opened, never borrowed pages or adopted Tern blocks.
 - `browser.close({ all: true })` releases the tabs you opened, not other agents'.
-- `kill: true` terminates only applications spawned by this process, never reused browser processes.
+- `kill: true` terminates only applications spawned by this process, never reused browser processes. Headless browsers omp launched itself also close when idle past the idle-close timeout.
 - Idle tabs auto-freeze at turn settle, unfreeze on next use, and close past the idle-close timeout.
   - `persist: true` on `open` keeps one live across turns (e.g. multi-step login).
 - Relay tabs are never frozen or idle-closed.
