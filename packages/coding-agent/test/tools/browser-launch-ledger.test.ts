@@ -176,7 +176,11 @@ describe("launched-browser ledger", () => {
 			opts,
 		);
 		const terminate = spyOn(Process.prototype, "terminate").mockResolvedValue(false);
-		const waitForExit = spyOn(Process.prototype, "waitForExit").mockResolvedValue(false);
+		// The fixture "ignores" every real signal; liveness probes (signal 0) still reach it.
+		const realKill = process.kill.bind(process);
+		const kill = spyOn(process, "kill").mockImplementation((pid, signal) =>
+			pid === browser.pid && signal !== 0 && signal !== undefined ? true : realKill(pid, signal),
+		);
 		try {
 			await expect(releaseLaunchedBrowser(browser.pid, { kill: true, reason: "test" }, opts)).rejects.toThrow(
 				new RegExp(`pid ${browser.pid}`),
@@ -185,7 +189,7 @@ describe("launched-browser ledger", () => {
 			await expect(assertLaunchAllowed(opts)).rejects.toThrow(new RegExp(`pid ${browser.pid}`));
 		} finally {
 			terminate.mockRestore();
-			waitForExit.mockRestore();
+			kill.mockRestore();
 		}
 	}, 20_000);
 
