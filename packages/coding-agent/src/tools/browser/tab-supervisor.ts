@@ -1891,8 +1891,12 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	}
 	let cleanupError: unknown;
 	let targetCloseFailed = false;
+	// A kill release of the last tab on a ledgered launched browser is about to
+	// terminate the whole browser: asking the worker to close its page first
+	// only burns the supervisor's shutdown window.
+	const browserDiesWithTab = opts.kill === true && tab.browser.ledgerPid !== undefined && tab.browser.refCount <= 1;
 	// A held-out tab's worker was terminated with its failed re-adoption: nothing answers a close.
-	if (wasAlive && !tab.heldOut && !(tab.worker as ExitTrackedWorker)[kWorkerExited]) {
+	if (wasAlive && !browserDiesWithTab && !tab.heldOut && !(tab.worker as ExitTrackedWorker)[kWorkerExited]) {
 		try {
 			tab.worker.send({ type: "close", keepPage: opts.keepPage });
 			await waitForClosed(tab);
@@ -1996,13 +2000,25 @@ export async function dropHeadlessTabs(): Promise<void> {
 export async function releaseTabsForOwner(ownerId: string, opts: ReleaseTabOptions = {}): Promise<number> {
 	if (!ownerId) return 0;
 	const names = [...tabs.values()].filter(tab => tab.ownerSessionId === ownerId).map(tab => tab.name);
+	// Concurrent: a stuck tab must not eat the time another tab's browser needs to die.
+	const results = await Promise.allSettled(
+		names.map(name => {
+			// Read right before `releaseTab` looks the name up, so the choice is made for the tab it releases.
+			const tab = tabs.get(name);
+			const keepPage = tab?.persist === true && tab.kindTag === "relay";
+			return releaseTab(name, { ...opts, keepPage });
+		}),
+	);
 	let count = 0;
-	for (const name of names) {
-		// Read right before `releaseTab` looks the name up, so the choice is made for the tab it releases.
-		const tab = tabs.get(name);
-		const keepPage = tab?.persist === true && tab.kindTag === "relay";
-		if (await releaseTab(name, { ...opts, keepPage })) count++;
+	let firstError: unknown;
+	for (const result of results) {
+		if (result.status === "fulfilled") {
+			if (result.value) count++;
+		} else {
+			firstError ??= result.reason;
+		}
 	}
+	if (firstError !== undefined) throw firstError;
 	return count;
 }
 
