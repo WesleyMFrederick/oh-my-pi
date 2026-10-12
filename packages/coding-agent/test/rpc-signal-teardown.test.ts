@@ -31,13 +31,17 @@ async function waitFor(check: () => Promise<boolean> | boolean, deadlineMs: numb
 	}
 }
 
-/** Send `get_state` and resolve once its response frame arrives: the RPC command loop is live. */
+/**
+ * Send `get_available_models` and resolve once its response frame arrives. That command awaits the startup
+ * model refresh, so the reply proves the command loop is live AND the refresh (on a cold cache it writes
+ * ~7 MB of model rows with synchronous SQLite calls that block the child's event loop for 1 s or more) is done.
+ */
 async function awaitRpcResponse(
 	child: Bun.Subprocess<"pipe", "pipe", "pipe">,
 	id: string,
 	deadlineMs = 30_000,
 ): Promise<void> {
-	child.stdin.write(`${JSON.stringify({ id, type: "get_state" })}\n`);
+	child.stdin.write(`${JSON.stringify({ id, type: "get_available_models" })}\n`);
 	await child.stdin.flush();
 	const reader = child.stdout.getReader();
 	const decoder = new TextDecoder();
@@ -161,7 +165,8 @@ describe("RPC teardown of a launched browser", () => {
 				expect(isAlive(browserPid)).toBe(true);
 				// Startup is still running when the extension's session_start writes the pid file (extension init,
 				// model refresh, command discovery); a signal sent then queues behind that work and the measured
-				// teardown would include it. A `get_state` reply proves the command loop is reading stdin.
+				// teardown would include it (measured: a 0.6-0.9 s event-loop stall that delayed the browser's
+				// SIGTERM past the 1.5 s budget). Wait for the refresh to finish before timing teardown.
 				await awaitRpcResponse(child, "ready-probe");
 
 				const sentAt = performance.now();
