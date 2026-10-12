@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, postmortem, Snowflake } from "@oh-my-pi/pi-utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionAskDialogQuestion,
@@ -1397,6 +1397,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		},
 	);
 
+	// SIGTERM/SIGHUP (Paseo agent close: stdin EOF, then SIGTERM, SIGKILL 2 s later)
+	// must run the same memoized dispose as the stdin-EOF path so owned browser
+	// tabs release before the process dies. session.dispose() is idempotent, so
+	// EOF and signal paths share one promise.
+	const cancelSignalTeardown = postmortem.register("rpc-session-teardown", reason => session.dispose({ reason }));
+
 	/**
 	 * Dispose the session, then end the process. A store failure still latched
 	 * at dispose makes `dispose()` reject, and the `notice` frame it emits is
@@ -1406,6 +1412,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
 	const disposeAndExit = async (): Promise<never> => {
+		// Normal exit paths own teardown from here; the signal registration
+		// below must not fire a second, competing dispose.
+		cancelSignalTeardown();
 		try {
 			await session.dispose();
 		} catch (error) {

@@ -5432,6 +5432,9 @@ export class AgentSession implements SettingsScope {
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
+		// Start the browser release now: Paseo SIGKILLs 2 s after SIGTERM, and the
+		// shutdown event and drains below must not delay tab release past that.
+		const browserRelease = this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId());
 		// Stop cache warming before the drain windows below: an armed tick firing
 		// mid-dispose would issue a paid warm request and persist usage into the
 		// closing session writer.
@@ -5484,7 +5487,7 @@ export class AgentSession implements SettingsScope {
 		const results = await Promise.allSettled([
 			this.#disposeOwnedAsyncJobs(),
 			this.#eval.disposeKernels(),
-			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
+			browserRelease,
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
 			shutdownTinyTitleClient(),
 			this.#disconnectOwnedMcp(),
