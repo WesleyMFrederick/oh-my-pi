@@ -206,6 +206,53 @@ describe("launched-browser ledger", () => {
 		}
 	}, 20_000);
 
+	it("given a transfer, a reap and a refusal, then each writes exactly one lifecycle record naming the browser pid (M25)", async () => {
+		const info = spyOn(logger, "info");
+		const error = spyOn(logger, "error");
+		try {
+			const records = (action: string, pid: number) =>
+				[...info.mock.calls, ...error.mock.calls].filter(
+					([message, fields]) =>
+						message === "browser.lifecycle" &&
+						(fields as Record<string, unknown>).action === action &&
+						String((fields as Record<string, unknown>).resource).endsWith(`pid ${pid}`),
+				);
+
+			const handedOff = await spawnFixture();
+			const borrower = await spawnFixture();
+			await recordLaunchedBrowser(
+				{ browserPid: handedOff.pid, exe: "fixture", cdpPort: 0, headless: true, ownerSessionId: "s" },
+				opts,
+			);
+			const entry = (await readEntry(handedOff.pid))!;
+			entry.borrowers = [{ pid: borrower.pid, startTime: (await processStartTime(borrower.pid))! }];
+			await Bun.write(path.join(opts.dir, `${handedOff.pid}.json`), JSON.stringify(entry));
+			await releaseLaunchedBrowser(handedOff.pid, { kill: true, reason: "test" }, opts);
+			expect(records("transfer", handedOff.pid)).toHaveLength(1);
+
+			const orphan = await spawnFixture();
+			const dead = await spawnFixture();
+			await recordOwnedBy(orphan, dead);
+			await killFixture(dead);
+			await reapOrphanLaunchedBrowsers(opts);
+			expect(records("reap", orphan.pid)).toHaveLength(1);
+
+			const stuck = await spawnFixture();
+			await recordLaunchedBrowser(
+				{ browserPid: stuck.pid, exe: "fixture", cdpPort: 0, headless: true, ownerSessionId: "s" },
+				opts,
+			);
+			const stuckEntry = (await readEntry(stuck.pid))!;
+			stuckEntry.state = "kill-failed";
+			await Bun.write(path.join(opts.dir, `${stuck.pid}.json`), JSON.stringify(stuckEntry));
+			await expect(assertLaunchAllowed(opts)).rejects.toThrow();
+			expect(records("refuse", stuck.pid)).toHaveLength(1);
+		} finally {
+			info.mockRestore();
+			error.mockRestore();
+		}
+	}, 30_000);
+
 	it("given no kill-failed entry, when launching, then the launch is allowed", async () => {
 		await expect(assertLaunchAllowed(opts)).resolves.toBeUndefined();
 	});
