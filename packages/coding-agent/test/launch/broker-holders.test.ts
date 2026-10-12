@@ -7,6 +7,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { runPsCommand } from "../../src/cli/ps-cli";
+import * as clientModule from "../../src/launch/client";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
@@ -224,6 +226,31 @@ describe("daemon broker holders", () => {
 		} finally {
 			terminate.mockRestore();
 			// The fixture is ours: stop it for real so the test leaves nothing behind.
+			process.kill(pid, "SIGKILL");
+		}
+	}, 20_000);
+
+	it("given a daemon that cannot be terminated, when `omp ps stop` runs, then the command reports the pid and exits nonzero (M22)", async () => {
+		const a = h.clients[0]!;
+		const pid = await h.start(a, { idleStopMs: 60_000 });
+		const terminate = spyOn(Process.prototype, "terminate").mockResolvedValue(false);
+		// The CLI resolves its broker from the project scope; hand it this test's isolated broker.
+		const scope = spyOn(clientModule, "daemonClientForProject").mockResolvedValue(a);
+		const stderr = spyOn(console, "error").mockImplementation(() => {});
+		const priorExitCode = process.exitCode;
+		try {
+			await runPsCommand({
+				action: "stop",
+				name: NAME,
+				flags: { all: false, json: false, plain: true, follow: false, head: false, timeout: 0.1 },
+			});
+			expect(process.exitCode).toBe(1);
+			expect(String(stderr.mock.calls[0]?.[0])).toContain(`pid ${pid}`);
+		} finally {
+			process.exitCode = priorExitCode;
+			stderr.mockRestore();
+			scope.mockRestore();
+			terminate.mockRestore();
 			process.kill(pid, "SIGKILL");
 		}
 	}, 20_000);
