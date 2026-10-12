@@ -16,6 +16,13 @@ import {
 	type UserAgentOverride,
 } from "./launch";
 import { reapOrphanSharedTargets } from "./orphan-registry";
+import {
+	addLaunchedBrowserBorrower,
+	assertLaunchAllowed,
+	reapOrphanLaunchedBrowsers,
+	recordLaunchedBrowser,
+	releaseLaunchedBrowser,
+} from "./launch-ledger";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
 import type { RelayKind } from "./relay/kind";
 import { waitForRelayExtension } from "./relay/probe";
@@ -64,6 +71,10 @@ export interface PuppeteerBrowserHandle extends BrowserHandleCommon {
 	/** Broker daemon backing this handle; dispose disconnects instead of closing, kill routes to the broker. */
 	sharedDaemon?: { name: string; projectDir: string };
 	subprocess?: Subprocess;
+	/** Ledger key (browser pid) when omp launched, borrows, or adopted this browser. */
+	ledgerPid?: number;
+	/** The launch args request a headless browser; such browsers idle-close. */
+	headlessLaunch?: boolean;
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
 
@@ -116,6 +127,8 @@ export interface AcquireBrowserOptions {
 	signal?: AbortSignal;
 	/** `browser.idleCloseSec` of the calling session; omitted uses the setting's default. */
 	idleCloseSec?: number;
+	/** Session id recorded in the launched-browser ledger. */
+	ownerSessionId?: string;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
@@ -179,6 +192,13 @@ export function normalizeConnectedCdpUrl(rawCdpUrl: string): string {
 }
 
 async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
+	// Non-launch kinds sweep right away; `app.path` sweeps after its own
+	// adopt decision so the reaper cannot kill a browser about to be adopted.
+	if (kind.kind !== "spawned") {
+		void reapOrphanLaunchedBrowsers().catch(err => {
+			logger.debug("Launched-browser reap failed", { error: err instanceof Error ? err.message : String(err) });
+		});
+	}
 	if (kind.kind === "cmux") {
 		const client = new CmuxSocketClient({ socketPath: kind.socketPath, password: kind.password });
 		await client.connect();
@@ -283,14 +303,20 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		);
 	}
 	const appArgs = kind.args ?? [];
+	await assertLaunchAllowed();
 	const reused = await findReusableCdp(exe, { signal: opts.signal, appArgs });
 	let cdpUrl: string;
 	let pid: number;
 	let subprocess: Subprocess | undefined;
+	let ledgerPid: number | undefined;
 	if (reused) {
 		logger.debug("Reusing existing CDP endpoint for attach", { exe, pid: reused.pid, cdpUrl: reused.cdpUrl });
 		cdpUrl = reused.cdpUrl;
 		pid = reused.pid;
+		// A browser omp launched earlier (live owner: borrow; dead owner: adopt)
+		// stays accountable; one with no ledger entry is the user's, never killed.
+		const role = await addLaunchedBrowserBorrower(reused.pid);
+		if (role !== "unmanaged") ledgerPid = reused.pid;
 	} else {
 		const port = await findFreeCdpPort();
 		const launchArgs = [...appArgs, `--remote-debugging-port=${port}`];
@@ -304,15 +330,34 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		subprocess = child;
 		pid = child.pid;
 		cdpUrl = `http://127.0.0.1:${port}`;
+		// Record immediately: from here on a crash of this process leaves a
+		// ledger entry the next omp process reaps instead of an orphan.
+		const entry = await recordLaunchedBrowser({
+			browserPid: child.pid,
+			exe,
+			cdpPort: port,
+			headless: appArgs.some(arg => arg.startsWith("--headless")),
+			ownerSessionId: opts.ownerSessionId ?? "",
+		}).catch(err => {
+			logger.warn("Failed to record launched browser", { pid: child.pid, error: (err as Error).message });
+			return undefined;
+		});
+		if (entry) ledgerPid = child.pid;
 		try {
 			await waitForCdp(cdpUrl, 30_000, opts.signal);
 		} catch (err) {
 			await gracefulKillTreeOnce(child.pid).catch(() => undefined);
+			if (entry)
+				await releaseLaunchedBrowser(child.pid, { kill: true, reason: "cdp-timeout" }).catch(() => undefined);
 			if (err instanceof ToolAbortError) throw err;
 			if (err instanceof Error && err.name === "AbortError") throw err;
 			throw new ToolError(`Failed to attach to ${path.basename(exe)} on ${cdpUrl}: ${(err as Error).message}`);
 		}
 	}
+	// The reuse/adopt decision is made; sweep browsers whose owner died.
+	void reapOrphanLaunchedBrowsers().catch(err => {
+		logger.debug("Launched-browser reap failed", { error: err instanceof Error ? err.message : String(err) });
+	});
 
 	const puppeteer = await loadPuppeteer();
 	let browser: Browser;
@@ -323,7 +368,10 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
 	} catch (err) {
-		if (subprocess) await gracefulKillTreeOnce(subprocess.pid);
+		if (subprocess) {
+			await gracefulKillTreeOnce(subprocess.pid);
+			await releaseLaunchedBrowser(subprocess.pid, { kill: true, reason: "connect-failed" }).catch(() => undefined);
+		}
 		throw new ToolError(`Connected to ${cdpUrl} but puppeteer.connect failed: ${(err as Error).message}`);
 	}
 	return {
@@ -333,6 +381,8 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		cdpUrl,
 		pid,
 		subprocess,
+		ledgerPid,
+		headlessLaunch: appArgs.some(arg => arg.startsWith("--headless")),
 		refCount: 0,
 		stealth: { browserSession: null, override: null },
 	};
@@ -425,8 +475,13 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 			logger.debug("Failed to disconnect from spawned browser", { error: (err as Error).message });
 		}
 	}
-	// A discovered CDP PID is borrowed, not ours to kill on close or abort.
-	if (opts.kill && handle.subprocess && handle.subprocess.exitCode === null) {
+	// A discovered CDP PID with no ledger entry is borrowed, not ours to kill
+	// on close or abort. A ledgered browser (launched or adopted by omp) is
+	// released by recorded identity: borrowers detach, an owner transfers to a
+	// live borrower or terminates the browser and confirms the exit.
+	if (handle.ledgerPid !== undefined) {
+		await releaseLaunchedBrowser(handle.ledgerPid, { kill: opts.kill, reason: "release" });
+	} else if (opts.kill && handle.subprocess && handle.subprocess.exitCode === null) {
 		await gracefulKillTreeOnce(handle.subprocess.pid);
 	}
 }
