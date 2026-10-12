@@ -15,7 +15,7 @@ import {
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
-import { primeOwnerIdentity, sweepOrphanSharedTargets } from "./orphan-registry";
+import { cancelSweepRetries, primeOwnerIdentity, sweepOrphanSharedTargets } from "./orphan-registry";
 import {
 	addLaunchedBrowserBorrower,
 	assertLaunchAllowed,
@@ -459,6 +459,8 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 			// tabs. The broker stops the daemon `browser.idleCloseSec` after the last
 			// holder leaves (or its socket closes), or on an explicit stop
 			// (`write proc://<name>/kill`).
+			// Last hold gone: a pending survivor retry has no connection left to run on.
+			cancelSweepRetries({ projectDir: handle.sharedDaemon.projectDir, daemonName: handle.sharedDaemon.name });
 			if (handle.browser.connected) {
 				try {
 					handle.browser.disconnect();

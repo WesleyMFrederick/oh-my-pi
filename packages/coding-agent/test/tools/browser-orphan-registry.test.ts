@@ -17,12 +17,14 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { daemonRuntimeDir } from "@oh-my-pi/pi-coding-agent/launch/paths";
 import {
+	cancelSweepRetries,
 	collectOrphanTargets,
 	forgetSharedTarget,
 	reapOrphanSharedTargets,
 	recordSharedTarget,
 	sweepOrphanSharedTargets,
 	resetOrphanRegistryForTest,
+	setSweepRetryDelayForTest,
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
 import { processStartTime } from "@oh-my-pi/pi-coding-agent/tools/browser/launch-ledger";
@@ -341,6 +343,79 @@ describe("orphan-registry — owner identity and survivor sweep", () => {
 		} finally {
 			warn.mockRestore();
 		}
+	});
+
+	/** Browser stub whose first `Target.closeTarget` fails (and the target stays listed); later closes succeed. */
+	function flakyBrowser(closed: string[]): Browser {
+		let failuresLeft = 1;
+		const connection = {
+			send: async (method: string, params?: { targetId: string }) => {
+				if (method === "Target.getTargets") return { targetInfos: [{ targetId: "t-flaky" }] };
+				if (failuresLeft > 0) {
+					failuresLeft--;
+					throw new Error("transient CDP failure");
+				}
+				closed.push(params?.targetId ?? "");
+				return { success: true };
+			},
+		};
+		return { connected: true, _connection: connection } as unknown as Browser;
+	}
+
+	// Real timers: the retry is an in-process timer, and the contract is that it fires with no further open or release.
+	async function waitForRegistryEmpty(scope: SharedTargetScope, timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if ((await fs.readdir(registryDir(scope))).length === 0) return true;
+			await Bun.sleep(10);
+		}
+		return false;
+	}
+
+	it("given a close fails once, when the sweep retained the target, then the retry timer closes it and removes the record without another open or release", async () => {
+		const scope = trackedScope();
+		setSweepRetryDelayForTest(20);
+		const dead = await deadPid();
+		await writeOwnershipFile(scope, { pid: dead, updatedAt: STALE, targets: ["t-flaky"] });
+		const closed: string[] = [];
+		expect(await sweepOrphanSharedTargets(flakyBrowser(closed), scope)).toBe(0);
+		expect(await fs.readdir(registryDir(scope))).toEqual([`${dead}.json`]);
+		expect(await waitForRegistryEmpty(scope, 2_000)).toBe(true);
+		expect(closed).toEqual(["t-flaky"]);
+	});
+
+	it("given a retry is pending, when this process releases its last hold, then the retry never runs and the record stays", async () => {
+		const scope = trackedScope();
+		setSweepRetryDelayForTest(20);
+		const dead = await deadPid();
+		await writeOwnershipFile(scope, { pid: dead, updatedAt: STALE, targets: ["t-flaky"] });
+		const closed: string[] = [];
+		await sweepOrphanSharedTargets(flakyBrowser(closed), scope);
+		cancelSweepRetries(scope);
+		await Bun.sleep(150); // a cancelled timer cannot be observed except by waiting past its delay
+		expect(closed).toEqual([]);
+		expect(await fs.readdir(registryDir(scope))).toEqual([`${dead}.json`]);
+	});
+
+	it("given every close keeps failing, when retries run, then they stop after three attempts", async () => {
+		const scope = trackedScope();
+		setSweepRetryDelayForTest(10);
+		const dead = await deadPid();
+		await writeOwnershipFile(scope, { pid: dead, updatedAt: STALE, targets: ["t-stuck"] });
+		let closeAttempts = 0;
+		const browser = {
+			connected: true,
+			_connection: {
+				send: async (method: string) => {
+					if (method === "Target.closeTarget") closeAttempts++;
+					throw new Error("down");
+				},
+			},
+		} as unknown as Browser;
+		await sweepOrphanSharedTargets(browser, scope);
+		await Bun.sleep(300); // past all retry delays
+		expect(closeAttempts).toBe(4); // the sweep plus three retries
+		expect(await fs.readdir(registryDir(scope))).toEqual([`${dead}.json`]);
 	});
 
 	it("given a client died after this process attached, when a survivor sweep runs, then it closes its targets and is throttled between sweeps", async () => {

@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Fixed orphaned shared-browser tabs that failed to close waiting for the next tab open; the sweep now retries up to three times in the background.
+- Fixed a release or borrow silently skipping a browser launch ledger entry when its directory could not be read.
 - Fixed orphaned shared-browser tabs surviving a sweep when Puppeteer held a stale browser-target id; tabs now close over the browser-level CDP connection.
 - Fixed retained orphaned shared-browser tabs being logged without a cause; the warning now names the failing CDP step and its error.
 - Fixed a launched browser being left unowned when its launch ledger entry cannot be read, and a failed shared-tab ownership write claiming the tab was closed when closing it could not be confirmed.

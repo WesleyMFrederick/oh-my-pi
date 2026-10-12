@@ -331,6 +331,16 @@ async function updateOwnershipFile(owner: OrphanOwner, targetIds: string[]): Pro
  * Failures are logged, never thrown, so cleanup cannot block browser open.
  */
 export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTargetScope): Promise<number> {
+	return (await reapOrphans(browser, scope)).closed;
+}
+
+/** Reap result: targets confirmed closed, and targets kept for retry. */
+interface ReapOutcome {
+	closed: number;
+	retained: number;
+}
+
+async function reapOrphans(browser: Browser, scope: SharedTargetScope): Promise<ReapOutcome> {
 	let scan: OrphanScan;
 	try {
 		scan = await collectOrphanTargets(scope);
@@ -338,17 +348,18 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 		logger.debug("Failed to scan shared-browser target registry", {
 			error: err instanceof Error ? err.message : String(err),
 		});
-		return 0;
+		return { closed: 0, retained: 0 };
 	}
 	let closed = 0;
+	let retained = 0;
 	for (const owner of scan.owners) {
-		const retained: string[] = [];
+		const kept: string[] = [];
 		for (const targetId of owner.targetIds) {
 			const result = await closeCdpTarget(browser, targetId);
 			if (result.closed) {
 				closed++;
 			} else {
-				retained.push(targetId);
+				kept.push(targetId);
 				logger.warn("Retaining orphaned shared-browser target for retry", {
 					targetId,
 					ownerPid: owner.pid,
@@ -356,9 +367,10 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 				});
 			}
 		}
-		if (retained.length === owner.targetIds.length) continue;
+		retained += kept.length;
+		if (kept.length === owner.targetIds.length) continue;
 		try {
-			await updateOwnershipFile(owner, retained);
+			await updateOwnershipFile(owner, kept);
 		} catch (err) {
 			logger.debug("Failed to update shared-browser ownership after reap", {
 				ownerPid: owner.pid,
@@ -367,13 +379,64 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 		}
 	}
 	if (closed > 0) logger.debug("Reaped orphaned shared-browser targets", { count: closed, daemon: scope.daemonName });
-	return closed;
+	return { closed, retained };
 }
 
 /** Minimum gap between survivor-driven sweeps of one registry dir; attach-time sweeps are unthrottled. */
 const SWEEP_MIN_INTERVAL_MS = 10_000;
 const lastSweepAt = new Map<string, number>();
 const sweepsInFlight = new Map<string, Promise<number>>();
+
+/** In-process retries after a sweep retained targets: how many per streak, and how long to wait. */
+const SWEEP_RETRY_MAX_ATTEMPTS = 3;
+let sweepRetryDelayMs = SWEEP_MIN_INTERVAL_MS;
+const sweepRetries = new Map<string, { attempts: number; timer: ReturnType<typeof setTimeout> }>();
+
+/**
+ * Retry a sweep that retained targets without waiting for the next open or release: one unref'd timer
+ * per registry dir, {@link SWEEP_MIN_INTERVAL_MS} after the sweep, at most {@link SWEEP_RETRY_MAX_ATTEMPTS}
+ * attempts in a row. A sweep that retains nothing ends the streak. Each attempt reaps every dead owner's
+ * targets (so a target is tried at most that many extra times) and logs its outcome at warn level.
+ */
+function scheduleSweepRetry(browser: Browser, scope: SharedTargetScope, dir: string, attempts: number): void {
+	if (attempts >= SWEEP_RETRY_MAX_ATTEMPTS) {
+		sweepRetries.delete(dir);
+		return;
+	}
+	const timer = setTimeout(() => {
+		void runSweepRetry(browser, scope, dir, attempts + 1);
+	}, sweepRetryDelayMs);
+	timer.unref();
+	sweepRetries.set(dir, { attempts, timer });
+}
+
+async function runSweepRetry(browser: Browser, scope: SharedTargetScope, dir: string, attempt: number): Promise<void> {
+	if (!browser.connected) {
+		sweepRetries.delete(dir);
+		return;
+	}
+	if (sweepsInFlight.has(dir)) {
+		// A regular sweep is running and will schedule its own retry if it retains targets.
+		sweepRetries.delete(dir);
+		return;
+	}
+	const outcome = reapOrphans(browser, scope).catch(() => ({ closed: 0, retained: 0 }));
+	const sweep = outcome.then(result => result.closed).finally(() => sweepsInFlight.delete(dir));
+	sweepsInFlight.set(dir, sweep);
+	const { closed, retained } = await outcome;
+	logger.warn("Retried retained shared-browser targets", { attempt, closed, retained, daemon: scope.daemonName });
+	if (retained > 0) scheduleSweepRetry(browser, scope, dir, attempt);
+	else sweepRetries.delete(dir);
+}
+
+/** Cancel a pending sweep retry for this scope, e.g. when this process releases its last hold on the browser. */
+export function cancelSweepRetries(scope: SharedTargetScope): void {
+	const dir = registryDir(scope);
+	const pending = sweepRetries.get(dir);
+	if (!pending) return;
+	clearTimeout(pending.timer);
+	sweepRetries.delete(dir);
+}
 
 /**
  * Sweep dead owners' targets from a live shared browser on tab open/release, so orphans of clients
@@ -392,8 +455,13 @@ export function sweepOrphanSharedTargets(
 	const last = lastSweepAt.get(dir);
 	if (last !== undefined && at - last < SWEEP_MIN_INTERVAL_MS) return Promise.resolve(0);
 	lastSweepAt.set(dir, at);
-	const sweep = reapOrphanSharedTargets(browser, scope)
-		.catch(() => 0)
+	cancelSweepRetries(scope);
+	const outcome = reapOrphans(browser, scope).catch(() => ({ closed: 0, retained: 0 }));
+	const sweep = outcome
+		.then(result => {
+			if (result.retained > 0) scheduleSweepRetry(browser, scope, dir, 0);
+			return result.closed;
+		})
 		.finally(() => sweepsInFlight.delete(dir));
 	sweepsInFlight.set(dir, sweep);
 	return sweep;
@@ -401,9 +469,17 @@ export function sweepOrphanSharedTargets(
 
 /** Test-only reset of the in-process ownership state. */
 export function resetOrphanRegistryForTest(): void {
+	for (const { timer } of sweepRetries.values()) clearTimeout(timer);
+	sweepRetries.clear();
+	sweepRetryDelayMs = SWEEP_MIN_INTERVAL_MS;
 	selfStartTime = undefined;
 	lastSweepAt.clear();
 	sweepsInFlight.clear();
 	ownedByDir.clear();
 	writeChains.clear();
+}
+
+/** Test-only: shorten the wait before an in-process sweep retry. */
+export function setSweepRetryDelayForTest(ms: number): void {
+	sweepRetryDelayMs = ms;
 }
