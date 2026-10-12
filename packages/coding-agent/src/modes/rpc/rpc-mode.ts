@@ -1755,6 +1755,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		if (heldFrames) pendingExtensionRequests.rejectAll("RPC client disconnected during startup");
 	};
 	inputRead.then(rejectStartupDialogs, rejectStartupDialogs);
+	// SIGTERM/SIGHUP (Paseo agent close: stdin EOF, then SIGTERM, SIGKILL 2 s later)
+	// must run the same memoized dispose as the stdin-EOF path so owned browser
+	// tabs release before the process dies. session.dispose() is idempotent, so
+	// EOF and signal paths share one promise. Registered before extensions start:
+	// an extension's session_start can open a browser, and a signal landing between
+	// that and a later registration would exit past the release and strand it.
+	postmortem.register("rpc-session-teardown", reason => session.dispose({ reason }));
 
 	// Set up extensions with RPC-based UI context
 	await initializeExtensions(session, {
@@ -1823,12 +1830,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			persistenceFailure = error;
 		},
 	);
-
-	// SIGTERM/SIGHUP (Paseo agent close: stdin EOF, then SIGTERM, SIGKILL 2 s later)
-	// must run the same memoized dispose as the stdin-EOF path so owned browser
-	// tabs release before the process dies. session.dispose() is idempotent, so
-	// EOF and signal paths share one promise.
-	postmortem.register("rpc-session-teardown", reason => session.dispose({ reason }));
 
 	/**
 	 * Dispose the session, then end the process. A store failure still latched
