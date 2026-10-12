@@ -95,7 +95,13 @@ async function flush(dir: string): Promise<void> {
 	const owned = ownedByDir.get(dir);
 	const file = path.join(dir, `${process.pid}.json`);
 	if (!owned || owned.size === 0) {
-		await fs.rm(file, { force: true }).catch(() => undefined);
+		await fs.rm(file, { force: true }).catch(error => {
+			// A stale record is reaped later (its targets are gone), but say why it stayed.
+			logger.warn("Failed to remove shared-browser target ownership file", {
+				file,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
 		return;
 	}
 	const record: OwnershipFile = {
@@ -217,8 +223,16 @@ export async function collectOrphanTargets(
 		let record: OwnershipFile;
 		try {
 			record = (await Bun.file(file).json()) as OwnershipFile;
-		} catch {
-			continue; // torn or malformed file; a live owner will rewrite it
+		} catch (error) {
+			// Torn or malformed file: a live owner will rewrite it. Anything else (EACCES, ...) keeps the
+			// record too, since nothing proves the owner dead, but is worth a warning.
+			if (!(error instanceof SyntaxError) && !isEnoent(error)) {
+				logger.warn("Skipping unreadable shared-browser ownership file", {
+					file,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			continue;
 		}
 		if (typeof record?.pid !== "number" || !Array.isArray(record.targets)) continue;
 		if (record.pid === process.pid) continue; // our own file

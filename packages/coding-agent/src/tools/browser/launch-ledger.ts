@@ -183,6 +183,22 @@ class UnreadableLedgerEntryError extends ToolError {
 	}
 }
 
+/**
+ * Cheap preflight that lets a missing entry skip the lock. Only ENOENT means absent: an unreadable
+ * ledger dir (EACCES, ENOTDIR, ...) says nothing about the browser, so it raises instead of
+ * reading as "nothing to release".
+ */
+async function entryExists(opts: LedgerOptions, browserPid: number): Promise<boolean> {
+	const file = entryPath(opts, browserPid);
+	try {
+		await fs.access(file);
+		return true;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw new UnreadableLedgerEntryError(file, error instanceof Error ? error.message : String(error));
+	}
+}
+
 /** `undefined` only when the entry file is confirmed absent (ENOENT); any other failure throws. */
 async function readEntry(opts: LedgerOptions, browserPid: number): Promise<LedgerEntry | undefined> {
 	const file = entryPath(opts, browserPid);
@@ -269,12 +285,8 @@ export async function recordLaunchedBrowser(
  * process takes over. `borrower`: the owner is alive.
  */
 export async function addLaunchedBrowserBorrower(browserPid: number, opts: LedgerOptions = {}): Promise<BorrowRole> {
-	try {
-		await fs.access(entryPath(opts, browserPid));
-	} catch {
-		// No entry: nothing to lock, and taking the lock would only leave a lock file behind.
-		return "unmanaged";
-	}
+	// No entry: nothing to lock, and taking the lock would only leave a lock file behind.
+	if (!(await entryExists(opts, browserPid))) return "unmanaged";
 	return await withEntryLock(opts, browserPid, async () => {
 		let entry: LedgerEntry | undefined;
 		try {
@@ -367,12 +379,8 @@ export async function releaseLaunchedBrowser(
 	release: { kill: boolean; reason: string },
 	opts: LedgerOptions = {},
 ): Promise<ReleaseOutcome> {
-	try {
-		await fs.access(entryPath(opts, browserPid));
-	} catch {
-		// Already released (or never ledgered): idempotent noop without a lock file.
-		return "noop";
-	}
+	// Already released (or never ledgered): idempotent noop without a lock file.
+	if (!(await entryExists(opts, browserPid))) return "noop";
 	return await withEntryLock(opts, browserPid, async () => {
 		const entry = await readEntry(opts, browserPid);
 		const self = await selfProcessIdentity();
