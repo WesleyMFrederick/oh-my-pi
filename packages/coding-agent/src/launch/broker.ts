@@ -3,6 +3,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLock, Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
+import { type LifecycleResult, logLifecycle } from "./lifecycle-log";
 import { isEnoent, isRecord, logger, postmortem, procmgr, sanitizeText, setProcessName } from "@oh-my-pi/pi-utils";
 import { TerminalQueryResponder } from "@oh-my-pi/pi-utils/vterm";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
@@ -668,7 +669,8 @@ class DaemonBroker {
 				return this.#send(operation);
 			case "stop": {
 				const record = this.#record(operation.name);
-				await this.#stopRecord(record, operation.timeoutMs);
+				const stopped = await this.#stopRecord(record, operation.timeoutMs);
+				if (!stopped.settled) throw new Error(this.#unsettledMessage(record));
 				return { op: "stop", daemon: record.snapshot };
 			}
 			case "restart":
@@ -1260,9 +1262,33 @@ class DaemonBroker {
 		return { op: "send", daemon: record.snapshot };
 	}
 
-	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<void> {
+	#unsettledMessage(record: ManagedDaemon): string {
+		return `Daemon ${record.snapshot.name} (pid ${record.snapshot.pid ?? "unknown"}) did not stop; state is ${record.snapshot.state}`;
+	}
+
+	/**
+	 * Terminate a daemon's process tree and wait for its exit. `settled` is
+	 * false when the process survived: callers must surface that instead of
+	 * assuming it stopped. Logs exactly one `browser.lifecycle` record.
+	 */
+	async #stopRecord(record: ManagedDaemon, timeoutMs: number, reason = "stop"): Promise<{ settled: boolean }> {
+		const started = performance.now();
+		const resource = `daemon ${record.snapshot.name} pid ${record.snapshot.pid ?? "none"}`;
+		const report = (result: LifecycleResult, error?: string): void =>
+			logLifecycle({
+				action: "stop",
+				resource,
+				owner: "broker",
+				reason,
+				result,
+				durationMs: Math.round(performance.now() - started),
+				error,
+			});
 		await this.#refreshDetached(record);
-		if (terminalState(record.snapshot.state)) return;
+		if (terminalState(record.snapshot.state)) {
+			report("noop");
+			return { settled: true };
+		}
 		clearTimeout(record.idleStopTimer);
 		record.idleStopTimer = undefined;
 		record.stopRequested = true;
@@ -1274,7 +1300,8 @@ class DaemonBroker {
 			this.#persist(record);
 			await record.log?.close();
 			record.log = undefined;
-			return;
+			report("ok");
+			return { settled: true };
 		}
 		record.snapshot.state = "stopping";
 		this.#persist(record);
@@ -1283,11 +1310,15 @@ class DaemonBroker {
 		else record.pty?.kill();
 		const settled = await this.#waitUntil(record, () => terminalState(record.snapshot.state), timeoutMs + 1_000);
 		if (!settled && record.pty) record.pty.kill();
+		if (settled) report("ok");
+		else report("failed", this.#unsettledMessage(record));
+		return { settled };
 	}
 
 	async #restart(name: string): Promise<DaemonRpcResult> {
 		const record = this.#record(name);
-		await this.#stopRecord(record, 2_000);
+		const stopped = await this.#stopRecord(record, 2_000, "restart");
+		if (!stopped.settled) throw new Error(this.#unsettledMessage(record));
 		await record.log?.close();
 		record.log = await DaemonLog.open(record.dir);
 		record.stopRequested = false;
@@ -1541,7 +1572,7 @@ class DaemonBroker {
 			if (record.holders.size > 0 || terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 				return;
 			}
-			void this.#stopRecord(record, 2_000).catch(error => {
+			void this.#stopRecord(record, 2_000, "idle-unheld").catch(error => {
 				logger.warn("Idle-unheld daemon stop failed", {
 					name: record.snapshot.name,
 					error: error instanceof Error ? error.message : String(error),
@@ -1551,20 +1582,47 @@ class DaemonBroker {
 	}
 
 	async #hold(operation: Extract<DaemonOperation, { op: "hold" }>, socket: net.Socket): Promise<DaemonRpcResult> {
+		const started = performance.now();
 		const record = this.#record(operation.name);
+		const resource = `daemon ${operation.name}`;
 		await this.#refreshDetached(record);
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
-			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
+			const message = `Daemon ${operation.name} is ${record.snapshot.state}`;
+			logLifecycle({
+				action: "hold",
+				resource,
+				owner: operation.holder,
+				result: "refused",
+				durationMs: Math.round(performance.now() - started),
+				error: message,
+			});
+			throw new Error(message);
 		}
 		record.holders.set(operation.holder, socket);
 		clearTimeout(record.idleStopTimer);
 		record.idleStopTimer = undefined;
+		logLifecycle({
+			action: "hold",
+			resource,
+			owner: operation.holder,
+			result: "ok",
+			durationMs: Math.round(performance.now() - started),
+		});
 		return { op: "hold", daemon: record.snapshot };
 	}
 
 	#unhold(operation: Extract<DaemonOperation, { op: "unhold" }>): DaemonRpcResult {
+		const started = performance.now();
 		const record = this.#record(operation.name);
-		if (record.holders.delete(operation.holder)) this.#armIdleStop(record);
+		const released = record.holders.delete(operation.holder);
+		if (released) this.#armIdleStop(record);
+		logLifecycle({
+			action: "unhold",
+			resource: `daemon ${operation.name}`,
+			owner: operation.holder,
+			result: released ? "ok" : "noop",
+			durationMs: Math.round(performance.now() - started),
+		});
 		return { op: "unhold", daemon: record.snapshot };
 	}
 

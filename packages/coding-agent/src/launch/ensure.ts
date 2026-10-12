@@ -8,6 +8,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { throwIfAborted } from "../tools/tool-errors";
 import type { DaemonBrokerClient } from "./client";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 5_000;
@@ -69,5 +70,33 @@ export async function stopQuietly(
 			name,
 			error: error instanceof Error ? error.message : String(error),
 		});
+	}
+}
+
+/**
+ * Stop a daemon that must be gone before a replacement starts. Unlike
+ * {@link stopQuietly}, a daemon that survives the stop is an error naming its
+ * pid: replacing it anyway would run two processes under one name.
+ */
+export async function stopOrThrow(
+	client: DaemonBrokerClient,
+	name: string,
+	label: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	try {
+		await client.request({ op: "stop", name, timeoutMs: STOP_TIMEOUT_MS }, signal);
+		return;
+	} catch (error) {
+		throwIfAborted(signal);
+		const remaining = await describeQuietly(client, name, label, signal);
+		if (!remaining || remaining.state === "exited" || remaining.state === "failed") {
+			logger.debug(`${label} stop failed but daemon is gone`, { name });
+			return;
+		}
+		const cause = error instanceof Error ? error.message : String(error);
+		throw new ToolError(
+			`${label} (pid ${remaining.pid ?? "unknown"}) could not be stopped and is still ${remaining.state}: ${cause}. Refusing to start a second one under the same name; stop pid ${remaining.pid ?? "?"} manually.`,
+		);
 	}
 }

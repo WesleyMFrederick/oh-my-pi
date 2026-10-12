@@ -14,9 +14,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import { daemonClientForProject } from "../../launch/client";
-import { describeQuietly, stopQuietly, waitReady } from "../../launch/ensure";
+import { describeQuietly, stopOrThrow, waitReady } from "../../launch/ensure";
 import { daemonRuntimeDir } from "../../launch/paths";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { throwIfAborted } from "../tool-errors";
 import { probeCdpStatus } from "./attach";
 import { resolveSharedBrowserLaunchSpec } from "./launch";
@@ -120,7 +121,7 @@ export async function ensureSharedBrowser(opts: {
 			}
 			// Live record but unreachable Chrome (wedged, or readiness never
 			// matched): replace it rather than handing out a dead endpoint.
-			await stopQuietly(client, name, "Shared browser", opts.signal);
+			await stopOrThrow(client, name, "Shared browser", opts.signal);
 			continue;
 		}
 		try {
@@ -148,9 +149,10 @@ export async function ensureSharedBrowser(opts: {
 			if (wsEndpoint && (await probeEndpoint(wsEndpoint))) {
 				return { wsEndpoint, daemonName: name, projectDir: client.projectDir };
 			}
-			await stopQuietly(client, name, "Shared browser", opts.signal);
+			await stopOrThrow(client, name, "Shared browser", opts.signal);
 		} catch (error) {
 			throwIfAborted(opts.signal);
+			if (error instanceof ToolError) throw error;
 			// Lost a cross-process start race ("already starting/ready"); the next
 			// describe round adopts the winner's endpoint.
 			logger.debug("Shared browser start contention", {
