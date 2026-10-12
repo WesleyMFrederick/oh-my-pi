@@ -123,4 +123,50 @@ describe("acquireTab on the shared browser", () => {
 		// Only the test's own hold remains: the failed open released the hold it had taken.
 		expect(handle.refCount).toBe(1);
 	});
+
+	it("given the ownership write fails and CDP cannot confirm the close, when acquireTab runs, then the error names the target and says it may still be open", async () => {
+		const projectDir = path.join("/tmp", `omp-shared-tab-test-${crypto.randomUUID()}`);
+		projectDirs.push(projectDir);
+		setTabWorkerSpawnerForTest(async () => fakeWorker());
+		const closedTargets: string[] = [];
+		const session = {
+			send: async (method: string, params?: { targetId: string }) => {
+				if (method === "Target.closeTarget" && params) closedTargets.push(params.targetId);
+				// Dropped connection: neither the close nor the confirming target listing succeeds.
+				throw new Error("Connection closed");
+			},
+			detach: async () => undefined,
+		};
+		const handle: PuppeteerBrowserHandle = {
+			key: "shared",
+			kind: { kind: "headless", headless: true },
+			browser: {
+				connected: true,
+				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub",
+				target: () => ({ createCDPSession: async () => session }),
+			} as never,
+			sharedDaemon: { name: DAEMON, projectDir },
+			refCount: 0,
+			stealth: { browserSession: null, override: null },
+		};
+		holdBrowser(handle);
+		const write = spyOn(orphanRegistry, "recordSharedTarget").mockRejectedValue(new Error("read-only file system"));
+		try {
+			const error = await acquireTab("shared-tab", handle, { timeoutMs: 5_000 }).then(
+				() => undefined,
+				(err: unknown) => err,
+			);
+			const message = (error as Error).message;
+			expect(message).toContain("read-only file system");
+			expect(message).toContain(TARGET_ID);
+			expect(message).toContain("may still be open");
+			expect(message).not.toContain("so it was closed");
+		} finally {
+			write.mockRestore();
+		}
+		expect(closedTargets).toEqual([TARGET_ID]);
+		expect(getTabsMapForTest().has("shared-tab")).toBe(false);
+		// Only the test's own hold remains: the failed open released the hold it had taken.
+		expect(handle.refCount).toBe(1);
+	});
 });
