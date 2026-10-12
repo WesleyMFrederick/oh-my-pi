@@ -1401,7 +1401,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// must run the same memoized dispose as the stdin-EOF path so owned browser
 	// tabs release before the process dies. session.dispose() is idempotent, so
 	// EOF and signal paths share one promise.
-	const cancelSignalTeardown = postmortem.register("rpc-session-teardown", reason => session.dispose({ reason }));
+	postmortem.register("rpc-session-teardown", reason => session.dispose({ reason }));
 
 	/**
 	 * Dispose the session, then end the process. A store failure still latched
@@ -1412,9 +1412,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
 	const disposeAndExit = async (): Promise<never> => {
-		// Normal exit paths own teardown from here; the signal registration
-		// below must not fire a second, competing dispose.
-		cancelSignalTeardown();
+		// The signal registration stays armed: Paseo sends SIGTERM right after
+		// stdin EOF, and the signal path must wait on this same memoized dispose
+		// (not exit past it) so owned browsers are confirmed dead first.
 		try {
 			await session.dispose();
 		} catch (error) {

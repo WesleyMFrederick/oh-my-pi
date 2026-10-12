@@ -998,7 +998,11 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	}
 	let cleanupError: unknown;
 	let forced = false;
-	if (wasAlive) {
+	// A kill release of the last tab on a ledgered launched browser is about to
+	// terminate the whole browser: asking the worker to close its page first
+	// only burns the supervisor's shutdown window.
+	const browserDiesWithTab = opts.kill === true && tab.browser.ledgerPid !== undefined && tab.browser.refCount <= 1;
+	if (wasAlive && !browserDiesWithTab) {
 		try {
 			tab.worker.send({ type: "close" });
 			await waitForClosed(tab);
@@ -1066,10 +1070,18 @@ export async function dropHeadlessTabs(): Promise<void> {
 export async function releaseTabsForOwner(ownerId: string, opts: ReleaseTabOptions = {}): Promise<number> {
 	if (!ownerId) return 0;
 	const names = [...tabs.values()].filter(tab => tab.ownerSessionId === ownerId).map(tab => tab.name);
+	// Concurrent: a stuck tab must not eat the time another tab's browser needs to die.
+	const results = await Promise.allSettled(names.map(name => releaseTab(name, opts)));
 	let count = 0;
-	for (const name of names) {
-		if (await releaseTab(name, opts)) count++;
+	let firstError: unknown;
+	for (const result of results) {
+		if (result.status === "fulfilled") {
+			if (result.value) count++;
+		} else {
+			firstError ??= result.reason;
+		}
 	}
+	if (firstError !== undefined) throw firstError;
 	return count;
 }
 

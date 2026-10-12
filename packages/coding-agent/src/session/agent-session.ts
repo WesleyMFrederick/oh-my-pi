@@ -172,6 +172,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import { logLifecycle } from "../launch/lifecycle-log";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
@@ -500,6 +501,8 @@ const cfgWorkspacePromptInputs = combine({
 });
 
 const PLAN_MODE_REMINDER_MAX = 3;
+/** Owned browser tabs must be released inside Paseo's 2 s SIGTERM→SIGKILL window, with margin. */
+const BROWSER_RELEASE_BUDGET_MS = 1_500;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
 /** Vision descriptions gate admission; stay under the RPC clients' 30 s request timeout. */
@@ -5335,17 +5338,28 @@ export class AgentSession implements SettingsScope {
 
 	async #releaseOwnedBrowserTabs(ownerId: string | undefined): Promise<void> {
 		if (!ownerId) return;
+		const started = performance.now();
 		try {
+			// Bounded under Paseo's 2 s SIGTERM→SIGKILL window: whatever this has not
+			// finished stays in the launch ledger for the next omp process to reap.
 			const released = await withTimeout(
 				releaseTabsForOwner(ownerId, { kill: true }),
-				3_000,
+				BROWSER_RELEASE_BUDGET_MS,
 				"Timed out releasing owned browser tabs during dispose",
 			);
 			if (released > 0) {
 				logger.debug("Released owned browser tabs during dispose", { ownerId, released });
 			}
 		} catch (error) {
-			logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
+			logLifecycle({
+				action: "release",
+				resource: `browser tabs of session ${ownerId}`,
+				owner: ownerId,
+				reason: "dispose",
+				result: "failed",
+				durationMs: Math.round(performance.now() - started),
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	}
 
