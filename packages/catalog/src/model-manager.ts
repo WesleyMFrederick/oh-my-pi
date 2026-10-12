@@ -372,6 +372,13 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const resolutionAuthoritative = !hasRemoteFetcher || remoteResolutionComplete || shouldUseFreshCacheAsAuthoritative;
 	const remoteUpdatedAt = anyRemoteFetchSucceeded ? now() : undefined;
 	if (shouldFetchFromNetwork) {
+		// Persisting is synchronous SQLite work: on a cold cache every provider's catalog is written in turn,
+		// and microtask-resolved discoveries would chain those writes into one stall of a second or more that
+		// starves signal handlers (a launched browser must still be terminated inside Paseo's 2 s kill window).
+		// Yield one macrotask per provider so each write is its own bounded turn. Safe for readers: every
+		// provider's row is already an independent, atomic transaction, and nothing below depends on state
+		// that could change across this yield (the fallback branch re-reads the cache after it).
+		await Bun.sleep(0);
 		if (anyRemoteFetchSucceeded) {
 			writeModelCache(
 				cacheProviderId,

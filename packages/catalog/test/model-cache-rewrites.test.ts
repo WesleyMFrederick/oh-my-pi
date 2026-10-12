@@ -194,4 +194,42 @@ describe("model cache write churn", () => {
 		expect(payloadWrites()).toBe(before);
 		expect(readModelCache("azure", TTL_MS, Date.now, dbPath)?.models.length).toBe(bundled.length);
 	});
+
+	it("lets other event-loop work (signal handlers, timers) run between providers while a cold cache is persisted", async () => {
+		const providers = Array.from({ length: 12 }, (_, i) => `yield-test-${i}`);
+		let finished = 0;
+		let finishedWhenTimerRan: number | undefined;
+		// A macrotask stands in for a SIGTERM handler: it can only run when the refresh yields the event loop.
+		const timer = new Promise<void>(resolve =>
+			setTimeout(() => {
+				finishedWhenTimerRan = finished;
+				resolve();
+			}, 0),
+		);
+		await Promise.all([
+			timer,
+			...providers.map(async providerId => {
+				await resolveProviderModels(
+					{
+						providerId,
+						staticModels: [spec("static-a", providerId)],
+						cacheDbPath: dbPath,
+						fetchDynamicModels: async () => [spec("dynamic-a", providerId)],
+					},
+					"online",
+				);
+				finished++;
+			}),
+		]);
+		expect(finished).toBe(providers.length);
+		// Every provider persisted in one uninterrupted stretch would give 12 here.
+		expect(finishedWhenTimerRan).toBeLessThan(providers.length);
+		for (const providerId of providers) {
+			expect(
+				readModelCache(providerId, TTL_MS, Date.now, dbPath)
+					?.models.map(m => m.id)
+					.sort(),
+			).toEqual(["dynamic-a", "static-a"]);
+		}
+	});
 });

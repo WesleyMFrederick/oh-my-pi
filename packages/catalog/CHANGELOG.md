@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a cold model cache blocking the process for 1 s or more while every provider catalog was persisted, which delayed signal handlers and browser cleanup on exit.
+
 ## [18.4.9] - 2026-10-01
 
 ### Fixed
