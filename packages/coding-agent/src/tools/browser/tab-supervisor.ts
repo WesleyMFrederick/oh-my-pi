@@ -534,7 +534,10 @@ async function acquireTabImpl(
 	// this process dies abnormally before its own teardown closes the tab. Awaited so the file
 	// exists when the open returns: a client killed right after `acquireTab` still leaves it.
 	// A write failure means no survivor could ever reap this page, so the open fails loudly after
-	// unwinding it: terminate the worker, close the new target, undo this open's browser hold.
+	// unwinding it: terminate the worker, close the new target, undo this open's browser hold. When CDP
+	// cannot confirm the close the page may stay open with no ownership record (the write that would have
+	// let a survivor sweep it just failed), and there is no record to retry from: the error says so and
+	// names the target so it can be closed by hand.
 	const scope = sharedScopeOf(browser);
 	if (scope) {
 		try {
@@ -542,10 +545,13 @@ async function acquireTabImpl(
 		} catch (err) {
 			tabs.delete(name);
 			await worker.terminate().catch(() => undefined);
-			await closeTargetById(browser, info.targetId).catch(() => undefined);
+			const closed = await closeTargetById(browser, info.targetId).catch(() => false);
 			await releaseBrowser(browser, { kill: false }).catch(() => undefined);
+			const cause = err instanceof Error ? err.message : String(err);
 			throw new ToolError(
-				`Could not record ownership of the new shared-browser tab, so it was closed: ${err instanceof Error ? err.message : String(err)}`,
+				closed
+					? `Could not record ownership of the new shared-browser tab, so it was closed: ${cause}`
+					: `Could not record ownership of the new shared-browser tab (${cause}), and closing it could not be confirmed: target ${info.targetId} may still be open in the shared browser and no survivor will clean it up. Close it manually.`,
 			);
 		}
 	}
@@ -1644,13 +1650,14 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 }
 
 /**
- * Best-effort close of a specific page target in the browser. Close through
+ * Best-effort close of a specific page target in the browser; resolves `true` only when CDP confirmed the
+ * close (or that the target is already gone). Close through
  * the browser CDP session rather than `page.close()`: a page whose navigation
  * wedged during initialization can make Puppeteer's page close wait for the
  * protocol timeout, retaining the cleanup hold for tens of seconds.
  */
-async function closeTargetById(browser: PuppeteerBrowserHandle, targetId: string): Promise<void> {
-	await closeCdpTarget(browser.browser, targetId);
+async function closeTargetById(browser: PuppeteerBrowserHandle, targetId: string): Promise<boolean> {
+	return await closeCdpTarget(browser.browser, targetId);
 }
 
 /**
