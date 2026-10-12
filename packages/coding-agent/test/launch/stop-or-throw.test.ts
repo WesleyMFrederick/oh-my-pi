@@ -10,7 +10,7 @@ function snapshot(state: DaemonSnapshot["state"]): DaemonSnapshot {
 	return { name: "browser", pid: 4321, state } as DaemonSnapshot;
 }
 
-function brokerWith(stopError: Error | undefined, stateAfter: DaemonSnapshot["state"]): DaemonBrokerClient {
+function brokerWith(stopError: Error | undefined, stateAfter: DaemonSnapshot["state"] | Error): DaemonBrokerClient {
 	return {
 		projectDir: "/fixture",
 		onCompletion: () => () => undefined,
@@ -21,6 +21,7 @@ function brokerWith(stopError: Error | undefined, stateAfter: DaemonSnapshot["st
 				return { op: "stop", daemon: snapshot("exited") };
 			}
 			if (operation.op === "describe") {
+				if (stateAfter instanceof Error) throw stateAfter;
 				return { op: "describe", daemon: snapshot(stateAfter), spec: {} as never };
 			}
 			throw new Error(`unexpected ${operation.op}`);
@@ -36,6 +37,16 @@ describe("stopOrThrow", () => {
 
 	it("given a stop that fails but the daemon has exited meanwhile, then the replacement may proceed", async () => {
 		const client = brokerWith(new Error("raced"), "exited");
+		await expect(stopOrThrow(client, "browser", "Shared browser")).resolves.toBeUndefined();
+	});
+
+	it("given a stop that fails and a describe that cannot reach the broker, then the stop error is thrown, not treated as gone", async () => {
+		const client = brokerWith(new Error("did not stop"), new Error("broker connection refused"));
+		await expect(stopOrThrow(client, "browser", "Shared browser")).rejects.toThrow("did not stop");
+	});
+
+	it("given a stop that fails and a broker that reports the daemon unknown, then the replacement may proceed", async () => {
+		const client = brokerWith(new Error("raced"), new Error("Unknown daemon browser"));
 		await expect(stopOrThrow(client, "browser", "Shared browser")).resolves.toBeUndefined();
 	});
 });

@@ -89,12 +89,22 @@ export async function stopOrThrow(
 		return;
 	} catch (error) {
 		throwIfAborted(signal);
-		const remaining = await describeQuietly(client, name, label, signal);
+		const cause = error instanceof Error ? error.message : String(error);
+		// Only a positive answer counts as "gone": the broker snapshotting the daemon as
+		// terminal, or naming it unknown. A failed describe (broker unreachable) proves nothing.
+		let remaining: DaemonSnapshot | undefined;
+		try {
+			const result = await client.request({ op: "describe", name }, signal);
+			remaining = result.op === "describe" ? result.daemon : undefined;
+		} catch (describeError) {
+			throwIfAborted(signal);
+			const describeMessage = describeError instanceof Error ? describeError.message : String(describeError);
+			if (!describeMessage.startsWith("Unknown daemon")) throw error;
+		}
 		if (!remaining || remaining.state === "exited" || remaining.state === "failed") {
 			logger.debug(`${label} stop failed but daemon is gone`, { name });
 			return;
 		}
-		const cause = error instanceof Error ? error.message : String(error);
 		throw new ToolError(
 			`${label} (pid ${remaining.pid ?? "unknown"}) could not be stopped and is still ${remaining.state}: ${cause}. Refusing to start a second one under the same name; stop pid ${remaining.pid ?? "?"} manually.`,
 		);
