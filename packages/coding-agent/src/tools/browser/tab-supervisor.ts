@@ -20,7 +20,13 @@ import { CmuxTab } from "./cmux/cmux-tab";
 import { mapWaitUntil } from "./cmux/rpc";
 import { runInProcessTab } from "./in-process-run";
 import { DEFAULT_VIEWPORT } from "./launch";
-import { closeCdpTarget, forgetSharedTarget, recordSharedTarget, type SharedTargetScope } from "./orphan-registry";
+import {
+	closeCdpTarget,
+	forgetSharedTarget,
+	recordSharedTarget,
+	type SharedTargetScope,
+	sweepOrphanSharedTargets,
+} from "./orphan-registry";
 import {
 	type BrowserHandle,
 	type BrowserKindTag,
@@ -528,6 +534,7 @@ async function acquireTabImpl(
 	// this process dies abnormally before its own teardown closes the tab.
 	const scope = sharedScopeOf(browser);
 	if (scope) void recordSharedTarget(scope, info.targetId);
+	sweepSharedOrphans(browser);
 	return { tab, created: true };
 }
 
@@ -1035,6 +1042,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		tabs.delete(name);
 		const scope = sharedScopeOf(tab.browser);
 		if (scope) void forgetSharedTarget(scope, tab.targetId);
+		sweepSharedOrphans(tab.browser);
 	}
 	if (cleanupError) throw cleanupError;
 	return true;
@@ -1628,6 +1636,16 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
  */
 async function closeTargetById(browser: PuppeteerBrowserHandle, targetId: string): Promise<void> {
 	await closeCdpTarget(browser.browser, targetId);
+}
+
+/**
+ * Fire-and-forget sweep of dead clients' targets while this process still holds the shared browser.
+ * Skipped once the handle's connection is gone (last release already disconnected it).
+ */
+function sweepSharedOrphans(handle: BrowserHandle): void {
+	const scope = sharedScopeOf(handle);
+	if (!scope || !("browser" in handle) || !handle.browser.connected) return;
+	void sweepOrphanSharedTargets(handle.browser, scope);
 }
 
 /**

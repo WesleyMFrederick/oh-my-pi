@@ -15,16 +15,19 @@
  * registry and are never scanned.
  *
  * Ownership is authoritative in the safe direction: a target is reaped only
- * when its owner PID reports `ESRCH` (definitively dead). A live PID is never
- * reaped, so a live session's tabs cannot be yanked out from under it; the
- * worst case (recycled PID) leaves an orphan uncollected rather than closing a
- * live page.
+ * when its owner is definitively dead — its PID reports `ESRCH`, or the PID is
+ * now held by a process whose start time differs from the one recorded in the
+ * owner file (PID reuse). Owner files written before start times were recorded
+ * fall back to the PID probe alone. A live owner is never reaped, and an
+ * unreadable start time counts as alive, so a live session's tabs cannot be
+ * yanked out from under it.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import type { Browser } from "puppeteer-core";
 import { daemonRuntimeDir } from "../../launch/paths";
+import { processStartTime } from "./launch-ledger";
 
 /** Identifies one shared-browser daemon's target registry. */
 export interface SharedTargetScope {
@@ -37,6 +40,8 @@ export interface SharedTargetScope {
 /** On-disk ownership record: one file per owning omp process. */
 interface OwnershipFile {
 	pid: number;
+	/** `ps -o lstart=` of `pid` when written; absent in files from older versions (pid-only liveness). */
+	startTime?: string;
 	updatedAt: number;
 	targets: string[];
 }
@@ -69,6 +74,14 @@ function chain(dir: string, task: () => Promise<void>): Promise<void> {
 	return next;
 }
 
+let selfStartTime: Promise<string | undefined> | undefined;
+
+/** This process's start time, resolved once; undefined where unavailable. */
+function ownStartTime(): Promise<string | undefined> {
+	selfStartTime ??= processStartTime(process.pid);
+	return selfStartTime;
+}
+
 /** Persist (or, when empty, remove) this process's ownership file for a registry dir. */
 async function flush(dir: string): Promise<void> {
 	const owned = ownedByDir.get(dir);
@@ -77,7 +90,12 @@ async function flush(dir: string): Promise<void> {
 		await fs.rm(file, { force: true }).catch(() => undefined);
 		return;
 	}
-	const record: OwnershipFile = { pid: process.pid, updatedAt: Date.now(), targets: [...owned] };
+	const record: OwnershipFile = {
+		pid: process.pid,
+		startTime: await ownStartTime(),
+		updatedAt: Date.now(),
+		targets: [...owned],
+	};
 	const tmp = `${file}.${process.pid}.tmp`;
 	await fs.mkdir(dir, { recursive: true });
 	await Bun.write(tmp, JSON.stringify(record));
@@ -122,12 +140,23 @@ function isPidAlive(pid: number): boolean {
 	}
 }
 
+/**
+ * Whether the owner recorded as `(pid, startTime)` is still running. Dead when the pid is gone, or
+ * when it now belongs to a process with a different start time. Every uncertain case is alive.
+ */
+async function isOwnerAlive(pid: number, startTime: string | undefined): Promise<boolean> {
+	if (!isPidAlive(pid)) return false;
+	if (startTime === undefined) return true;
+	const current = await processStartTime(pid);
+	return current === undefined || current === startTime;
+}
+
 /** Options for {@link collectOrphanTargets}; the defaults hit the real registry, the seams are for tests. */
 export interface CollectOrphanOptions {
 	/** Wall clock; injectable for deterministic grace-window tests. */
 	now?: () => number;
-	/** PID liveness probe; injectable so tests need no real subprocesses. */
-	isAlive?: (pid: number) => boolean;
+	/** Owner liveness probe; injectable so tests need no real subprocesses. `startTime` is absent for old owner files. */
+	isAlive?: (pid: number, startTime: string | undefined) => boolean | Promise<boolean>;
 	/** Grace window in ms before a dead owner's records are eligible. */
 	graceMs?: number;
 }
@@ -136,6 +165,7 @@ export interface CollectOrphanOptions {
 export interface OrphanOwner {
 	file: string;
 	pid: number;
+	startTime?: string;
 	updatedAt: number;
 	targetIds: string[];
 }
@@ -156,7 +186,7 @@ export async function collectOrphanTargets(
 	opts: CollectOrphanOptions = {},
 ): Promise<OrphanScan> {
 	const now = opts.now ?? Date.now;
-	const isAlive = opts.isAlive ?? isPidAlive;
+	const isAlive = opts.isAlive ?? isOwnerAlive;
 	const graceMs = opts.graceMs ?? DEFAULT_GRACE_MS;
 	const dir = registryDir(scope);
 	let entries: string[];
@@ -179,11 +209,12 @@ export async function collectOrphanTargets(
 		}
 		if (typeof record?.pid !== "number" || !Array.isArray(record.targets)) continue;
 		if (record.pid === process.pid) continue; // our own file
-		if (isAlive(record.pid)) continue; // owner still running
+		if (await isAlive(record.pid, typeof record.startTime === "string" ? record.startTime : undefined)) continue; // owner still running
 		if (nowMs - (record.updatedAt ?? 0) < graceMs) continue; // conservative grace
 		owners.push({
 			file,
 			pid: record.pid,
+			startTime: typeof record.startTime === "string" ? record.startTime : undefined,
 			updatedAt: record.updatedAt,
 			targetIds: record.targets.filter(id => typeof id === "string"),
 		});
@@ -230,7 +261,12 @@ async function updateOwnershipFile(owner: OrphanOwner, targetIds: string[]): Pro
 	}
 	const tmp = `${owner.file}.${process.pid}.tmp`;
 	try {
-		const record: OwnershipFile = { pid: owner.pid, updatedAt: owner.updatedAt, targets: targetIds };
+		const record: OwnershipFile = {
+			pid: owner.pid,
+			startTime: owner.startTime,
+			updatedAt: owner.updatedAt,
+			targets: targetIds,
+		};
 		await Bun.write(tmp, JSON.stringify(record));
 		await fs.rename(tmp, owner.file);
 	} catch (error) {
@@ -280,8 +316,39 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 	return closed;
 }
 
+/** Minimum gap between survivor-driven sweeps of one registry dir; attach-time sweeps are unthrottled. */
+const SWEEP_MIN_INTERVAL_MS = 10_000;
+const lastSweepAt = new Map<string, number>();
+const sweepsInFlight = new Map<string, Promise<number>>();
+
+/**
+ * Sweep dead owners' targets from a live shared browser on tab open/release, so orphans of clients
+ * that died after this process attached do not wait for the next attach. At most one sweep per
+ * registry dir runs at a time and starts at most every {@link SWEEP_MIN_INTERVAL_MS}. Never throws.
+ */
+export function sweepOrphanSharedTargets(
+	browser: Browser,
+	scope: SharedTargetScope,
+	now: () => number = Date.now,
+): Promise<number> {
+	const dir = registryDir(scope);
+	const running = sweepsInFlight.get(dir);
+	if (running) return running;
+	const at = now();
+	const last = lastSweepAt.get(dir);
+	if (last !== undefined && at - last < SWEEP_MIN_INTERVAL_MS) return Promise.resolve(0);
+	lastSweepAt.set(dir, at);
+	const sweep = reapOrphanSharedTargets(browser, scope)
+		.catch(() => 0)
+		.finally(() => sweepsInFlight.delete(dir));
+	sweepsInFlight.set(dir, sweep);
+	return sweep;
+}
+
 /** Test-only reset of the in-process ownership state. */
 export function resetOrphanRegistryForTest(): void {
+	lastSweepAt.clear();
+	sweepsInFlight.clear();
 	ownedByDir.clear();
 	writeChains.clear();
 }

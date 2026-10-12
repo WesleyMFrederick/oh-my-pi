@@ -21,9 +21,11 @@ import {
 	forgetSharedTarget,
 	reapOrphanSharedTargets,
 	recordSharedTarget,
+	sweepOrphanSharedTargets,
 	resetOrphanRegistryForTest,
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
+import { processStartTime } from "@oh-my-pi/pi-coding-agent/tools/browser/launch-ledger";
 import type { Browser } from "puppeteer-core";
 
 const DAEMON_NAME = "omp.browser.headless";
@@ -40,7 +42,7 @@ function registryDir(scope: SharedTargetScope): string {
 
 async function writeOwnershipFile(
 	scope: SharedTargetScope,
-	record: { pid: number; updatedAt: number; targets: string[] },
+	record: { pid: number; updatedAt: number; targets: string[]; startTime?: string },
 ): Promise<void> {
 	const dir = registryDir(scope);
 	await fs.mkdir(dir, { recursive: true });
@@ -214,5 +216,91 @@ describe("orphan-registry — reap", () => {
 		expect(retryCount).toBe(1);
 		expect(retryClosed).toEqual(["retry-later"]);
 		expect(await Bun.file(path.join(registryDir(scope), `${dead}.json`)).exists()).toBe(false);
+	});
+});
+
+describe("orphan-registry — owner identity and survivor sweep", () => {
+	const STALE = Date.now() - 60_000;
+	const fixtures: Bun.Subprocess[] = [];
+
+	afterEach(() => {
+		// Only fixtures this test spawned are signalled.
+		for (const proc of fixtures.splice(0)) proc.kill("SIGKILL");
+	});
+
+	async function liveFixture(): Promise<{ pid: number; startTime: string }> {
+		const proc = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+			stdout: "ignore",
+			stderr: "ignore",
+			stdin: "ignore",
+		});
+		fixtures.push(proc);
+		let startTime = await processStartTime(proc.pid);
+		while (startTime === undefined) {
+			await Bun.sleep(10);
+			startTime = await processStartTime(proc.pid);
+		}
+		return { pid: proc.pid, startTime };
+	}
+
+	it("given an owner file whose pid is now a different live process, when scanned after grace, then its targets are collected (PID reuse)", async () => {
+		const scope = trackedScope();
+		const impostor = await liveFixture();
+		await writeOwnershipFile(scope, {
+			pid: impostor.pid,
+			startTime: "Thu Jan  1 00:00:00 1970",
+			updatedAt: STALE,
+			targets: ["t-reused"],
+		});
+		const scan = await collectOrphanTargets(scope);
+		expect(scan.owners.map(owner => owner.targetIds)).toEqual([["t-reused"]]);
+	});
+
+	it("given an owner file whose pid and start time still match a live process, then it is left alone", async () => {
+		const scope = trackedScope();
+		const owner = await liveFixture();
+		await writeOwnershipFile(scope, { ...owner, updatedAt: STALE, targets: ["t-live"] });
+		expect((await collectOrphanTargets(scope)).owners).toEqual([]);
+	});
+
+	it("given an old owner file without a start time, then a live pid is kept and a dead pid is collected", async () => {
+		const scope = trackedScope();
+		const live = await liveFixture();
+		const dead = await deadPid();
+		await writeOwnershipFile(scope, { pid: live.pid, updatedAt: STALE, targets: ["t-old-live"] });
+		await writeOwnershipFile(scope, { pid: dead, updatedAt: STALE, targets: ["t-old-dead"] });
+		const scan = await collectOrphanTargets(scope);
+		expect(scan.owners.map(owner => owner.targetIds)).toEqual([["t-old-dead"]]);
+	});
+
+	it("given this process records a target, then its owner file carries this process's start time", async () => {
+		const scope = trackedScope();
+		await recordSharedTarget(scope, "t-mine");
+		const file = path.join(registryDir(scope), `${process.pid}.json`);
+		const record = (await Bun.file(file).json()) as { startTime?: string };
+		expect(record.startTime).toBe(await processStartTime(process.pid));
+	});
+
+	it("given a client died after this process attached, when a survivor sweep runs, then it closes its targets and is throttled between sweeps", async () => {
+		const scope = trackedScope();
+		const first = await deadPid();
+		await writeOwnershipFile(scope, { pid: first, updatedAt: STALE, targets: ["t-a", "t-b"] });
+		const closed: string[] = [];
+		const browser = makeBrowser(closed);
+		let clock = 1_000_000;
+
+		expect(await sweepOrphanSharedTargets(browser, scope, () => clock)).toBe(2);
+		expect(closed.sort()).toEqual(["t-a", "t-b"]);
+		expect(await fs.readdir(registryDir(scope))).toEqual([]);
+
+		const second = await deadPid();
+		await writeOwnershipFile(scope, { pid: second, updatedAt: STALE, targets: ["t-d"] });
+		clock += 1_000;
+		expect(await sweepOrphanSharedTargets(browser, scope, () => clock)).toBe(0);
+		expect(closed).not.toContain("t-d");
+
+		clock += 20_000;
+		expect(await sweepOrphanSharedTargets(browser, scope, () => clock)).toBe(1);
+		expect(closed).toContain("t-d");
 	});
 });
