@@ -137,8 +137,15 @@ describe("daemon broker holders", () => {
 		expect(isAlive(pid)).toBe(false);
 		expect(lifecycleRecords("hold")).toHaveLength(1);
 		expect(lifecycleRecords("unhold")).toHaveLength(1);
-		const stops = lifecycleRecords("stop").filter(record => String(record.resource).endsWith(`pid ${pid}`));
-		expect(stops).toHaveLength(1);
+		// The exit event settles the daemon before the broker's stop action finishes and logs its record.
+		const stopsFor = (): Array<Record<string, unknown>> =>
+			lifecycleRecords("stop").filter(record => String(record.resource).endsWith(`pid ${pid}`));
+		for (const deadline = Date.now() + 5_000; stopsFor().length === 0 && Date.now() < deadline;) {
+			// The record is written by the broker after the exit event; there is no signal to await.
+			await Bun.sleep(10);
+		}
+		expect(stopsFor()).toHaveLength(1);
+		const stops = stopsFor();
 		expect(stops[0]).toMatchObject({ result: "ok", reason: "idle-unheld" });
 		for (const record of [...lifecycleRecords("hold"), ...lifecycleRecords("unhold"), ...stops]) {
 			expect(typeof record.durationMs).toBe("number");
