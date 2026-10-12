@@ -381,6 +381,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	}
 
 	async #republishHolds(): Promise<void> {
+		// oxlint-disable-next-line unicorn/no-useless-spread -- failed holds are deleted while iterating
 		for (const [key, hold] of [...this.#holds]) {
 			if (this.#closed) return;
 			try {

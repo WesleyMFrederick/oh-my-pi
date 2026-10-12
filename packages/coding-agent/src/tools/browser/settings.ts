@@ -114,7 +114,7 @@ export const cfgBrowserIdleCloseSec = register({
 		group: "Grep & Browser",
 		label: "Browser Idle Close Timeout",
 		description:
-			"Close OMP-owned headless browser tabs and Tern browser picture-in-pictures idle longer than this many seconds (0 = never; session dispose still reaps). Never touches relay/CDP/spawned browsers or other sessions' tabs.",
+			"Close OMP-owned headless browser tabs and Tern browser picture-in-pictures idle longer than this many seconds (0 = never; session dispose still reaps). Also closes headless browsers OMP launched itself; the shared browser stops once no OMP process holds it for this long. Never touches relay/CDP browsers or other sessions' tabs.",
 		options: [
 			{ value: "0", label: "Never" },
 			{ value: "900", label: "15 minutes" },
