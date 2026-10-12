@@ -349,9 +349,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		try {
 			await waitForCdp(cdpUrl, 30_000, opts.signal);
 		} catch (err) {
-			await gracefulKillTreeOnce(child.pid).catch(() => undefined);
-			if (entry)
-				await releaseLaunchedBrowser(child.pid, { kill: true, reason: "cdp-timeout" }).catch(() => undefined);
+			await abandonLaunch(child.pid, entry !== undefined, "cdp-timeout");
 			if (err instanceof ToolAbortError) throw err;
 			if (err instanceof Error && err.name === "AbortError") throw err;
 			throw new ToolError(`Failed to attach to ${path.basename(exe)} on ${cdpUrl}: ${(err as Error).message}`);
@@ -371,10 +369,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
 	} catch (err) {
-		if (subprocess) {
-			await gracefulKillTreeOnce(subprocess.pid);
-			await releaseLaunchedBrowser(subprocess.pid, { kill: true, reason: "connect-failed" }).catch(() => undefined);
-		}
+		if (subprocess) await abandonLaunch(subprocess.pid, ledgerPid !== undefined, "connect-failed");
 		throw new ToolError(`Connected to ${cdpUrl} but puppeteer.connect failed: ${(err as Error).message}`);
 	}
 	return {
@@ -389,6 +384,26 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		refCount: 0,
 		stealth: { browserSession: null, override: null },
 	};
+}
+
+/**
+ * Give up on a browser this process launched. Once the launch is ledgered another omp process may have
+ * borrowed it, so the ledger decides (live borrower: ownership transfers and the browser survives;
+ * otherwise it is terminated and the entry removed). Only a launch that never reached the ledger is
+ * killed directly.
+ */
+async function abandonLaunch(browserPid: number, recorded: boolean, reason: string): Promise<void> {
+	if (!recorded) {
+		await gracefulKillTreeOnce(browserPid).catch(() => undefined);
+		return;
+	}
+	await releaseLaunchedBrowser(browserPid, { kill: true, reason }).catch(err => {
+		logger.warn("Could not release abandoned browser launch", {
+			pid: browserPid,
+			reason,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
 }
 
 const UNRECORDED_LAUNCH_EXIT_MS = 2_000;
