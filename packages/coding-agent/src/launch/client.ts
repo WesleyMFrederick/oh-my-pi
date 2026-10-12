@@ -154,6 +154,8 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	#buffer = "";
 	#closed = false;
 	#completionReconnectTimer: NodeJS.Timeout | undefined;
+	readonly #holds = new Map<string, { name: string; holder: string }>();
+	#holdReconnectTimer: NodeJS.Timeout | undefined;
 
 	constructor(projectDir: string, runtimeDir: string, token: string, options: DaemonBrokerClientOptions) {
 		this.projectDir = projectDir;
@@ -206,6 +208,11 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			})}\n`,
 		);
 		const result = await promise;
+		if (operation.op === "hold") {
+			this.#holds.set(`${operation.name}\0${operation.holder}`, { name: operation.name, holder: operation.holder });
+		} else if (operation.op === "unhold") {
+			this.#holds.delete(`${operation.name}\0${operation.holder}`);
+		}
 		for (const owner of completionUnsubscribes) {
 			if (!this.#completionSinks.has(owner)) this.#completionUnsubscribes.delete(owner);
 		}
@@ -220,6 +227,9 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#closed = true;
 		clearTimeout(this.#completionReconnectTimer);
 		this.#completionReconnectTimer = undefined;
+		clearTimeout(this.#holdReconnectTimer);
+		this.#holdReconnectTimer = undefined;
+		this.#holds.clear();
 		this.#socket?.destroy();
 		this.#completionSinks.clear();
 		this.#preservedCompletionOwners.clear();
@@ -349,7 +359,39 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			if (this.#socket === socket) this.#socket = undefined;
 			this.#rejectPending(new Error("Daemon broker connection closed"));
 			this.#scheduleCompletionReconnect();
+			this.#scheduleHoldReconnect();
 		});
+	}
+
+	/** After a lost connection, re-send every hold so a live broker keeps counting this process. */
+	#scheduleHoldReconnect(): void {
+		if (
+			this.#closed ||
+			this.#holds.size === 0 ||
+			this.#holdReconnectTimer !== undefined ||
+			(this.#socket !== undefined && !this.#socket.destroyed)
+		) {
+			return;
+		}
+		this.#holdReconnectTimer = setTimeout(() => {
+			this.#holdReconnectTimer = undefined;
+			void this.#republishHolds();
+		}, CONNECT_RETRY_MS);
+		this.#holdReconnectTimer.unref();
+	}
+
+	async #republishHolds(): Promise<void> {
+		for (const [key, hold] of [...this.#holds]) {
+			if (this.#closed) return;
+			try {
+				await this.request({ op: "hold", name: hold.name, holder: hold.holder });
+			} catch (error) {
+				// The broker answered and refused (daemon gone, stopping): the hold is moot.
+				// Transport failures keep the hold and retry on the next reconnect tick.
+				if (error instanceof DaemonBrokerRejectedError) this.#holds.delete(key);
+				else this.#scheduleHoldReconnect();
+			}
+		}
 	}
 
 	#onData(chunk: string | Buffer): void {

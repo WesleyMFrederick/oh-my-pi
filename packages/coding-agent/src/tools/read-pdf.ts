@@ -2,6 +2,7 @@ import { pathToFileURL } from "node:url";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../sdk";
 import type { BrowserHandle } from "./browser/registry";
+import { cfgBrowserIdleCloseSec } from "./browser/settings";
 import type { ScreenshotResult } from "./browser/tab-protocol";
 import { ToolAbortError } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -100,7 +101,10 @@ export async function renderPdfPageScreenshot(
 	let browser: BrowserHandle | undefined;
 	try {
 		const acquiredBrowser = await untilAborted(renderSignal, () =>
-			acquireBrowser({ kind: "headless", headless: true }, { cwd: session.cwd, signal: renderSignal }),
+			acquireBrowser(
+				{ kind: "headless", headless: true },
+				{ cwd: session.cwd, signal: renderSignal, idleCloseSec: cfgBrowserIdleCloseSec.get(session.settings) },
+			),
 		);
 		browser = acquiredBrowser;
 		holdBrowser(acquiredBrowser);

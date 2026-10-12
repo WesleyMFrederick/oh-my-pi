@@ -4,8 +4,10 @@
  * Instead of every omp process launching (and sometimes orphaning) a private
  * Chromium, the headless browser kind attaches to one broker-supervised Chrome
  * per project directory — sessions and subagents each open their own tabs in
- * it. The broker stops the daemon when the last omp client in the project
- * exits, so Chrome can never outlive omp, and concurrent acquisitions across
+ * it. Each omp process holds the browser while it has a handle open; the broker
+ * stops the daemon once no process has held it for `browser.idleCloseSec`
+ * (even while idle omp clients stay connected) or its holder sockets all
+ * close, so Chrome can never outlive its users. Concurrent acquisitions across
  * processes converge on a single launch instead of a launch storm.
  */
 import * as fs from "node:fs/promises";
@@ -56,6 +58,25 @@ async function probeEndpoint(wsEndpoint: string): Promise<boolean> {
 }
 
 /**
+ * Holder id for this omp process. The broker keys a hold to the authenticated
+ * socket, so the kernel drops it when the process dies; the id only needs to
+ * be unique per process.
+ */
+const HOLDER_ID = `omp-${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
+
+/** Tell the broker this process uses the shared browser; it will not stop it while any holder remains. */
+export async function holdSharedBrowser(projectDir: string, daemonName: string): Promise<void> {
+	const client = await daemonClientForProject(projectDir);
+	await client.request({ op: "hold", name: daemonName, holder: HOLDER_ID });
+}
+
+/** Drop this process's hold; the broker stops the browser after `idleCloseSec` once none remain. */
+export async function unholdSharedBrowser(projectDir: string, daemonName: string): Promise<void> {
+	const client = await daemonClientForProject(projectDir);
+	await client.request({ op: "unhold", name: daemonName, holder: HOLDER_ID });
+}
+
+/**
  * Ensure the project-shared automation Chromium is running and reachable,
  * launching it under the daemon broker when needed. Idempotent across
  * processes: losers of the start race adopt the winner's endpoint on the next
@@ -71,6 +92,8 @@ export async function ensureSharedBrowser(opts: {
 	projectDir: string;
 	headless: boolean;
 	viewport?: { width: number; height: number };
+	/** `browser.idleCloseSec`: stop the browser once no omp process holds it this long (0 = never). */
+	idleCloseSec: number;
 	signal?: AbortSignal;
 }): Promise<SharedBrowserEndpoint | null> {
 	const client = await daemonClientForProject(opts.projectDir);
@@ -114,6 +137,7 @@ export async function ensureSharedBrowser(opts: {
 						ready: { log: READY_LOG_PATTERN, timeoutMs: READY_TIMEOUT_MS },
 						restart: "no",
 						persist: false,
+						idleStopMs: opts.idleCloseSec > 0 ? opts.idleCloseSec * 1000 : undefined,
 						detached: false,
 					},
 				},

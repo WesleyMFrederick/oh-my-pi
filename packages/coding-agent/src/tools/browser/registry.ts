@@ -19,7 +19,8 @@ import { reapOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl } from "./relay/daemon";
 import type { RelayKind } from "./relay/kind";
 import { waitForRelayExtension } from "./relay/probe";
-import { ensureSharedBrowser } from "./shared-daemon";
+import { holdSharedBrowser, ensureSharedBrowser, unholdSharedBrowser } from "./shared-daemon";
+import { cfgBrowserIdleCloseSec } from "./settings";
 import type { TernKind } from "./tern/kind";
 import { TernSocketClient } from "./tern/wire";
 
@@ -113,6 +114,8 @@ export interface AcquireBrowserOptions {
 	cwd: string;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	signal?: AbortSignal;
+	/** `browser.idleCloseSec` of the calling session; omitted uses the setting's default. */
+	idleCloseSec?: number;
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
@@ -362,16 +365,25 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: ReleaseBrowserO
 	if (handle.kind.kind === "headless") {
 		if (handle.sharedDaemon) {
 			// The broker owns the Chromium; this process only drops its CDP
-			// connection. `kill` is scoped to spawned-app browsers — stopping the
-			// shared daemon here would tear down every other session's tabs. The
-			// daemon dies with the last omp client in the project (broker idle
-			// teardown), or via an explicit stop (`write proc://<name>/kill`).
+			// connection and its hold. `kill` is scoped to spawned-app browsers —
+			// stopping the shared daemon here would tear down every other session's
+			// tabs. The broker stops the daemon `browser.idleCloseSec` after the last
+			// holder leaves (or its socket closes), or on an explicit stop
+			// (`write proc://<name>/kill`).
 			if (handle.browser.connected) {
 				try {
 					handle.browser.disconnect();
 				} catch (err) {
 					logger.debug("Failed to disconnect from shared browser", { error: (err as Error).message });
 				}
+			}
+			try {
+				await unholdSharedBrowser(handle.sharedDaemon.projectDir, handle.sharedDaemon.name);
+			} catch (err) {
+				logger.warn("Failed to release shared browser hold", {
+					name: handle.sharedDaemon.name,
+					error: err instanceof Error ? err.message : String(err),
+				});
 			}
 			return;
 		}
@@ -440,6 +452,7 @@ async function openSharedHeadlessHandle(
 			projectDir: opts.cwd,
 			headless: kind.headless,
 			viewport: vp,
+			idleCloseSec: opts.idleCloseSec ?? cfgBrowserIdleCloseSec.default,
 			signal: opts.signal,
 		});
 		if (!shared) {
@@ -459,6 +472,14 @@ async function openSharedHeadlessHandle(
 				: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
+		// Hold before handing the handle out: the broker must never stop the
+		// browser under a live handle. A refused hold fails the open.
+		try {
+			await holdSharedBrowser(shared.projectDir, shared.daemonName);
+		} catch (error) {
+			await browser.disconnect();
+			throw error;
+		}
 		// Attaching to the shared daemon is the natural point to sweep targets
 		// left behind by omp processes that died without teardown — bounds
 		// accumulation without a background timer. Best-effort and detached so a

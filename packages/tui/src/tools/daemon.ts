@@ -25,6 +25,8 @@ export interface DaemonSpec {
 	ready?: DaemonReadySpec;
 	restart: DaemonRestartPolicy;
 	persist: boolean;
+	/** Stop the daemon once no client holds it for this long. Omitted = never stop for lack of holders. */
+	idleStopMs?: number;
 	detached: boolean;
 }
 

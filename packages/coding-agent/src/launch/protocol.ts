@@ -49,6 +49,8 @@ export type DaemonOperation =
 	| { op: "restart"; name: string }
 	| { op: "mode"; name: string; mode: "persist" | "session" | "detached" }
 	| { op: "describe"; name: string }
+	| { op: "hold"; name: string; holder: string }
+	| { op: "unhold"; name: string; holder: string }
 	| { op: "shutdown" };
 
 /** Typed broker result decoded before it reaches tool code. */
@@ -74,6 +76,8 @@ export type DaemonRpcResult =
 	| { op: "restart"; daemon: DaemonSnapshot }
 	| { op: "mode"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
+	| { op: "hold"; daemon: DaemonSnapshot }
+	| { op: "unhold"; daemon: DaemonSnapshot }
 	| { op: "shutdown" };
 
 /** Authenticated request envelope used by socket clients. */
@@ -214,6 +218,7 @@ export function parseDaemonSpec(value: unknown): DaemonSpec {
 		ready: source.ready === undefined ? undefined : readySpec(source.ready),
 		restart: restartPolicy(source.restart),
 		persist: booleanValue(source.persist, "spec.persist") || detached,
+		idleStopMs: optionalNumber(source.idleStopMs, "spec.idleStopMs"),
 		detached,
 	};
 }
@@ -359,6 +364,13 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				throw new Error("operation.mode must be persist, session, or detached");
 			return { op, name: stringValue(source.name, "operation.name"), mode };
 		}
+		case "hold":
+		case "unhold":
+			return {
+				op,
+				name: stringValue(source.name, "operation.name"),
+				holder: stringValue(source.holder, "operation.holder"),
+			};
 		default:
 			throw new Error(`Unknown daemon operation: ${op}`);
 	}
@@ -408,6 +420,10 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 			return { op: "restart", daemon: parseDaemonSnapshot(source.daemon) };
 		case "mode":
 			return { op: "mode", daemon: parseDaemonSnapshot(source.daemon) };
+		case "hold":
+			return { op: "hold", daemon: parseDaemonSnapshot(source.daemon) };
+		case "unhold":
+			return { op: "unhold", daemon: parseDaemonSnapshot(source.daemon) };
 		case "describe":
 			return {
 				op: "describe",

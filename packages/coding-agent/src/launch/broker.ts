@@ -104,6 +104,9 @@ interface ManagedDaemon {
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
 	completionSubscriptionId?: string;
+	/** Holder id to the authenticated socket carrying it; the record stops after `spec.idleStopMs` with none. */
+	holders: Map<string, net.Socket>;
+	idleStopTimer?: NodeJS.Timeout;
 	persistQueue: Promise<void>;
 	/** Serialized spec last written (or recovered); a write is skipped while unchanged. */
 	persistedSpec?: string;
@@ -486,6 +489,7 @@ class DaemonBroker {
 		this.#shuttingDown = true;
 		clearTimeout(this.#idleTimer);
 		this.#idleTimer = undefined;
+		for (const record of this.#records.values()) clearTimeout(record.idleStopTimer);
 		for (const record of this.#records.values()) {
 			const detached = record.spec.detached && !record.stopRequested && record.snapshot.pid !== undefined;
 			if (!detached && !terminalState(record.snapshot.state)) await this.#stopRecord(record, 2_000);
@@ -547,6 +551,7 @@ class DaemonBroker {
 			for (const [owner, registration] of this.#ownerSockets) {
 				if (registration.socket === socket) this.#ownerSockets.delete(owner);
 			}
+			this.#dropHolders(socket);
 		});
 	}
 
@@ -633,7 +638,7 @@ class DaemonBroker {
 					if (registration?.subscriptionId === request.completionSubscriptionId) this.#ownerSockets.delete(owner);
 				}
 			}
-			const result = await this.#dispatch(request.operation);
+			const result = await this.#dispatch(request.operation, socket);
 			socket.write(`${JSON.stringify({ id, ok: true, result })}\n`);
 			if (request.operation.op === "shutdown") setTimeout(() => void this.shutdown(), 10);
 		} catch (error) {
@@ -642,7 +647,7 @@ class DaemonBroker {
 		}
 	}
 
-	async #dispatch(operation: DaemonOperation): Promise<DaemonRpcResult> {
+	async #dispatch(operation: DaemonOperation, socket: net.Socket): Promise<DaemonRpcResult> {
 		switch (operation.op) {
 			case "ping":
 				return { op: "ping", projectDir: this.#projectDir };
@@ -675,6 +680,10 @@ class DaemonBroker {
 				await this.#refreshDetached(record);
 				return { op: "describe", daemon: record.snapshot, spec: record.spec };
 			}
+			case "hold":
+				return this.#hold(operation, socket);
+			case "unhold":
+				return this.#unhold(operation);
 			case "shutdown":
 				return { op: "shutdown" };
 		}
@@ -748,6 +757,7 @@ class DaemonBroker {
 				readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
 				consecutiveFailures: 0,
 				persistQueue: Promise.resolve(),
+				holders: new Map(),
 				completionCapable: owner !== undefined && this.#completionSubscriptions.has(owner),
 				completionSubscriptionId: owner === undefined ? undefined : this.#completionSubscriptions.get(owner),
 				pendingCompletions: replace ? (existing?.pendingCompletions ?? []) : [],
@@ -802,6 +812,7 @@ class DaemonBroker {
 			else this.#launchPipe(record, generation);
 			if (record.spec.ready?.port !== undefined) void this.#pollPort(record, generation, record.spec.ready);
 			this.#markReady(record);
+			this.#armIdleStop(record);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			record.log?.append(`Daemon launch failed: ${message}\n`);
@@ -1052,6 +1063,8 @@ class DaemonBroker {
 		record.input = undefined;
 		record.pty = undefined;
 		record.snapshot.pid = undefined;
+		clearTimeout(record.idleStopTimer);
+		record.idleStopTimer = undefined;
 		record.snapshot.exitedAt = Date.now();
 		record.snapshot.exitCode = exitCode;
 		record.snapshot.exitReason = error;
@@ -1250,6 +1263,8 @@ class DaemonBroker {
 	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<void> {
 		await this.#refreshDetached(record);
 		if (terminalState(record.snapshot.state)) return;
+		clearTimeout(record.idleStopTimer);
+		record.idleStopTimer = undefined;
 		record.stopRequested = true;
 		if (record.restartTimer) {
 			clearTimeout(record.restartTimer);
@@ -1437,6 +1452,7 @@ class DaemonBroker {
 					readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
 					consecutiveFailures: 0,
 					persistQueue: Promise.resolve(),
+					holders: new Map(),
 					// Legacy files are rewritten once into the split layout.
 					persistedSpec: legacyLayout ? undefined : JSON.stringify(storedSpec),
 					persistedMeta: legacyLayout ? undefined : JSON.stringify(decoded),
@@ -1481,6 +1497,7 @@ class DaemonBroker {
 				}
 				syncReadyPending(record);
 				this.#records.set(snapshot.name, record);
+				this.#armIdleStop(record);
 				if (snapshot.owner && record.completionCapable && (detached || record.pendingCompletions.length > 0)) {
 					this.#completionSubscriptions.set(snapshot.owner, record.completionSubscriptionId);
 				}
@@ -1507,6 +1524,60 @@ class DaemonBroker {
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}
+		}
+	}
+
+	/** Arm the no-holder stop for a live record whose spec asks for one. Idempotent; a hold cancels it. */
+	#armIdleStop(record: ManagedDaemon): void {
+		clearTimeout(record.idleStopTimer);
+		record.idleStopTimer = undefined;
+		const idleStopMs = record.spec.idleStopMs;
+		if (idleStopMs === undefined || this.#shuttingDown) return;
+		if (record.holders.size > 0 || terminalState(record.snapshot.state) || record.snapshot.state === "stopping")
+			return;
+		record.idleStopTimer = setTimeout(() => {
+			record.idleStopTimer = undefined;
+			// Re-check: a hold, stop, or exit may have landed while the timer was pending.
+			if (record.holders.size > 0 || terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
+				return;
+			}
+			void this.#stopRecord(record, 2_000).catch(error => {
+				logger.warn("Idle-unheld daemon stop failed", {
+					name: record.snapshot.name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		}, idleStopMs);
+	}
+
+	async #hold(operation: Extract<DaemonOperation, { op: "hold" }>, socket: net.Socket): Promise<DaemonRpcResult> {
+		const record = this.#record(operation.name);
+		await this.#refreshDetached(record);
+		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
+			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
+		}
+		record.holders.set(operation.holder, socket);
+		clearTimeout(record.idleStopTimer);
+		record.idleStopTimer = undefined;
+		return { op: "hold", daemon: record.snapshot };
+	}
+
+	#unhold(operation: Extract<DaemonOperation, { op: "unhold" }>): DaemonRpcResult {
+		const record = this.#record(operation.name);
+		if (record.holders.delete(operation.holder)) this.#armIdleStop(record);
+		return { op: "unhold", daemon: record.snapshot };
+	}
+
+	/** A closed socket releases every hold it carried; the kernel closes it however the process died. */
+	#dropHolders(socket: net.Socket): void {
+		for (const record of this.#records.values()) {
+			let dropped = false;
+			for (const [holder, holderSocket] of record.holders) {
+				if (holderSocket !== socket) continue;
+				record.holders.delete(holder);
+				dropped = true;
+			}
+			if (dropped) this.#armIdleStop(record);
 		}
 	}
 

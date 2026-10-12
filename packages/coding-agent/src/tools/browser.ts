@@ -427,6 +427,7 @@ async function openOnKind(
 						}
 					: undefined,
 				signal: openSignal,
+				idleCloseSec: cfgBrowserIdleCloseSec.get(session.settings),
 			}),
 		);
 
