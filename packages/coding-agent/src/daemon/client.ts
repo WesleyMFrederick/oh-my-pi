@@ -179,7 +179,13 @@ function dial(): Promise<IpcConnection> {
 
 function spawnDaemon(): void {
 	const spawn = resolveWorkerSpawnCmd(DAEMON_WORKER_ARG);
-	const child = Bun.spawn(spawn.cmd, {
+	// POSIX: a one-shot shell backgrounds the daemon and exits at once, so the
+	// daemon re-parents to PID 1 and a `pgrep -P <omp>` tree-kill of this client
+	// (Paseo agent close) no longer reaches the shared daemon or its browsers.
+	// Windows keeps the direct spawn path.
+	const cmd =
+		process.platform === "win32" ? spawn.cmd : ["/bin/sh", "-c", '"$@" &', "omp-daemon-launch", ...spawn.cmd];
+	const child = Bun.spawn(cmd, {
 		cwd: spawn.cwd,
 		env: workerEnvFromParent(),
 		stdin: "ignore",
