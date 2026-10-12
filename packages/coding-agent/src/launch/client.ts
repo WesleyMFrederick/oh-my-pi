@@ -320,7 +320,13 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			[DAEMON_RUNTIME_DIR_ENV]: this.#runtimeDir,
 		};
 		if (this.#idleGraceMs !== undefined) overlay[DAEMON_IDLE_GRACE_ENV] = String(this.#idleGraceMs);
-		const child = Bun.spawn(spawn.cmd, {
+		// POSIX: a one-shot shell backgrounds the broker and exits at once, so the
+		// broker re-parents to PID 1 and a `pgrep -P <omp>` tree-kill of this client
+		// (Paseo agent close) no longer reaches the shared broker or its browsers.
+		// Windows keeps the direct spawn path.
+		const cmd =
+			process.platform === "win32" ? spawn.cmd : ["/bin/sh", "-c", '"$@" &', "omp-broker-launch", ...spawn.cmd];
+		const child = Bun.spawn(cmd, {
 			cwd: spawn.cwd,
 			env: workerEnvFromParent(overlay),
 			stdin: "ignore",
