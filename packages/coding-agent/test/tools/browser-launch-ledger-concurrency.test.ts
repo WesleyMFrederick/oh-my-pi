@@ -2,6 +2,7 @@
 // owner's release either lands before the decision (browser transfers, stays alive) or sees the entry gone
 // (never resurrects it); (2) concurrent releases of one browser terminate it exactly once.
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { processStartTime } from "../../src/tools/browser/launch-ledger";
@@ -103,9 +104,14 @@ describe("launch ledger across processes", () => {
 		const browser = await spawnBrowserFixture();
 		const worker = startWorker("release-twice", dir, browser.pid);
 		try {
-			const result = (await next(worker)) as { outcomes: string[]; releaseRecords: number };
+			const result = (await next(worker)) as {
+				outcomes: string[];
+				releaseRecords: number;
+				leftover: string[];
+			};
 			expect([...result.outcomes].sort()).toEqual(["killed", "noop"]);
 			expect(result.releaseRecords).toBe(1);
+			expect(result.leftover).toEqual([]);
 			await browser.exited;
 			expect(isAlive(browser.pid)).toBe(false);
 		} finally {
@@ -114,4 +120,33 @@ describe("launch ledger across processes", () => {
 			await Promise.all([browser.exited, worker.proc.exited]);
 		}
 	}, 30_000);
+
+	it("given the owner's kill release racing another process's release of the same browser, then the browser dies once and the ledger dir is left empty (M22)", async () => {
+		await using temp = await TempDir.create("@ledger-two-proc-");
+		const dir = path.join(temp.path(), "ledger");
+		for (let round = 0; round < 6; round++) {
+			const browser = await spawnBrowserFixture();
+			const owner = startWorker("own", dir, browser.pid);
+			const other = startWorker("release-only", dir, browser.pid);
+			try {
+				expect(await next(owner)).toBe("ready");
+				expect(await next(other)).toBe("ready");
+				owner.proc.stdin.write("go\n");
+				other.proc.stdin.write("go\n");
+				await owner.proc.stdin.flush();
+				await other.proc.stdin.flush();
+				expect(await next(owner)).toBe("killed");
+				// Entry still present: the other process is not the owner ("dropped"); already gone: "noop".
+				expect(["noop", "dropped"]).toContain((await next(other)) as string);
+				await browser.exited;
+				expect(isAlive(browser.pid)).toBe(false);
+				expect(await fs.readdir(dir)).toEqual([]);
+			} finally {
+				browser.kill("SIGKILL");
+				owner.proc.kill("SIGKILL");
+				other.proc.kill("SIGKILL");
+				await Promise.all([browser.exited, owner.proc.exited, other.proc.exited]);
+			}
+		}
+	}, 60_000);
 });

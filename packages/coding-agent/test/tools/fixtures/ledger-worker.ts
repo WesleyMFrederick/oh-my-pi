@@ -3,9 +3,13 @@
 //                               release with kill, print the outcome as JSON.
 //   borrow <dir> <browserPid>   print "ready", wait for "go", borrow, print the role as JSON, then stay alive
 //                               (as a live borrower) until stdin closes.
+//   release-only <dir> <browserPid>
+//                               print "ready", wait for "go", release with kill WITHOUT recording (another
+//                               process owns the entry), print the outcome as JSON.
 //   release-twice <dir> <browserPid>
 //                               record as owner, release with kill twice concurrently, print outcomes and the
 //                               success lifecycle records emitted.
+import * as fs from "node:fs/promises";
 import { spyOn } from "bun:test";
 import { logger } from "@oh-my-pi/pi-utils";
 import {
@@ -55,6 +59,10 @@ if (mode === "own") {
 	while ((await nextLine()) !== undefined) {
 		// Stay alive as a borrower until the parent closes stdin.
 	}
+} else if (mode === "release-only") {
+	emit("ready");
+	await nextLine();
+	emit(await releaseLaunchedBrowser(browserPid, { kill: true, reason: "concurrent" }, opts));
 } else if (mode === "release-twice") {
 	await recordLaunchedBrowser(ownerRecord, opts);
 	const info = spyOn(logger, "info");
@@ -70,7 +78,7 @@ if (mode === "own") {
 			"action" in fields &&
 			fields.action === "release",
 	).length;
-	emit({ outcomes, releaseRecords });
+	emit({ outcomes, releaseRecords, leftover: await fs.readdir(dir) });
 } else {
 	throw new Error(`unknown mode ${mode}`);
 }
