@@ -92,6 +92,14 @@ function ownStartTime(): Promise<string | undefined> {
 	return selfStartTime;
 }
 
+/**
+ * Start resolving this process's start time now, so the first ownership write does not wait on a
+ * `ps` spawn. A process killed right after its first shared tab opens then still leaves its file.
+ */
+export function primeOwnerIdentity(): void {
+	void ownStartTime();
+}
+
 /** Persist (or, when empty, remove) this process's ownership file for a registry dir. */
 async function flush(dir: string): Promise<void> {
 	const owned = ownedByDir.get(dir);
@@ -523,6 +531,7 @@ export function sweepOrphanSharedTargets(
 
 /** Test-only reset of the in-process ownership state. */
 export function resetOrphanRegistryForTest(): void {
+	selfStartTime = undefined;
 	lastSweepAt.clear();
 	sweepsInFlight.clear();
 	ownedByDir.clear();

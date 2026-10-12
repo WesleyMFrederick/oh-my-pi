@@ -17,7 +17,7 @@ import {
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
-import { type SharedTargetScope, sweepOrphanSharedTargets } from "./orphan-registry";
+import { primeOwnerIdentity, type SharedTargetScope, sweepOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl, restartRelayDaemon } from "./relay/daemon";
 import {
 	addLaunchedBrowserBorrower,
@@ -634,6 +634,8 @@ async function openSharedHeadlessHandle(
 				: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
+		// Resolve this process's start time before the first shared tab is recorded.
+		primeOwnerIdentity();
 		// Attaching to the shared daemon is the natural point to sweep targets
 		// left behind by omp processes that died without teardown — bounds
 		// accumulation without a background timer. Best-effort and detached so a

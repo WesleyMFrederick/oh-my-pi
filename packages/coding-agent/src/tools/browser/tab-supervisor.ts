@@ -78,7 +78,7 @@ import { WebKitUnavailableError } from "./webkit/host";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 
-interface WorkerHandle {
+export interface WorkerHandle {
 	send(msg: WorkerInbound, transferList?: Transferable[]): void;
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
 	onError(handler: (error: Error) => void): () => void;
@@ -795,9 +795,11 @@ async function acquireTabImpl(
 	tabs.set(name, tab);
 	sweepClosedTabUploads();
 	// Durably record ownership so another live omp process can reap this page if
-	// this process dies abnormally before its own teardown closes the tab.
+	// this process dies abnormally before its own teardown closes the tab. Awaited so the file
+	// exists when the open returns: a client killed right after `acquireTab` still leaves it.
+	// `recordSharedTarget` logs and swallows write failures, so this never fails the open.
 	const scope = sharedTargetScopeOf(browser);
-	if (scope) void recordSharedTarget(scope, info.targetId);
+	if (scope) await recordSharedTarget(scope, info.targetId);
 	sweepSharedOrphans(browser);
 	const note = opts.url ? await navigateOpenedTab(name, opts.url, opts, startedAt, tab) : undefined;
 	return { tab, created: true, note };
@@ -3101,7 +3103,15 @@ async function raceWithTimeout<T>(
 	}
 }
 
+let tabWorkerSpawnerForTest: (() => Promise<WorkerHandle>) | undefined;
+
+/** Test seam: replace the tab worker spawner (no Bun Worker, no puppeteer). Pass undefined to restore. */
+export function setTabWorkerSpawnerForTest(spawner: (() => Promise<WorkerHandle>) | undefined): void {
+	tabWorkerSpawnerForTest = spawner;
+}
+
 async function spawnTabWorker(): Promise<WorkerHandle> {
+	if (tabWorkerSpawnerForTest) return tabWorkerSpawnerForTest();
 	try {
 		const hostEntry = workerHostEntry();
 		const worker = hostEntry
