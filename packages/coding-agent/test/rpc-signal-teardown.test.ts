@@ -186,6 +186,19 @@ describe("RPC teardown of a launched browser", () => {
 				// Only processes this test started are signalled.
 				if (browserPid !== undefined && isAlive(browserPid)) process.kill(browserPid, "SIGKILL");
 				child.kill("SIGKILL");
+				// A startup timeout leaves `browserPid` unset while the child may still write the pid file later;
+				// killing the child would then orphan the SIGTERM-ignoring fixture. The pid file lives in this
+				// test's own temp dir, so the process it names is this test's fixture.
+				await child.exited;
+				const fixturePid = Number(
+					(
+						await Bun.file(pidFile)
+							.text()
+							.catch(() => "")
+					).trim(),
+				);
+				if (Number.isInteger(fixturePid) && fixturePid > 0 && isAlive(fixturePid))
+					process.kill(fixturePid, "SIGKILL");
 			}
 		}, 90_000);
 	}
