@@ -19,6 +19,7 @@ import { reapOrphanSharedTargets } from "./orphan-registry";
 import {
 	addLaunchedBrowserBorrower,
 	assertLaunchAllowed,
+	type LedgerEntry,
 	reapOrphanLaunchedBrowsers,
 	recordLaunchedBrowser,
 	releaseLaunchedBrowser,
@@ -332,16 +333,18 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		cdpUrl = `http://127.0.0.1:${port}`;
 		// Record immediately: from here on a crash of this process leaves a
 		// ledger entry the next omp process reaps instead of an orphan.
-		const entry = await recordLaunchedBrowser({
-			browserPid: child.pid,
-			exe,
-			cdpPort: port,
-			headless: appArgs.some(arg => arg.startsWith("--headless")),
-			ownerSessionId: opts.ownerSessionId ?? "",
-		}).catch(err => {
-			logger.warn("Failed to record launched browser", { pid: child.pid, error: (err as Error).message });
-			return undefined;
-		});
+		let entry: LedgerEntry | undefined;
+		try {
+			entry = await recordLaunchedBrowser({
+				browserPid: child.pid,
+				exe,
+				cdpPort: port,
+				headless: appArgs.some(arg => arg.startsWith("--headless")),
+				ownerSessionId: opts.ownerSessionId ?? "",
+			});
+		} catch (err) {
+			throw await failUnrecordedLaunch(child, err);
+		}
 		if (entry) ledgerPid = child.pid;
 		try {
 			await waitForCdp(cdpUrl, 30_000, opts.signal);
@@ -386,6 +389,27 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		refCount: 0,
 		stealth: { browserSession: null, override: null },
 	};
+}
+
+const UNRECORDED_LAUNCH_EXIT_MS = 2_000;
+
+/**
+ * A launched browser that cannot be ledgered must not become a successful but
+ * untracked open: kill it through its own subprocess handle, confirm it
+ * exited, and report the pid and cause.
+ */
+async function failUnrecordedLaunch(child: Subprocess, cause: unknown): Promise<ToolError> {
+	const reason = cause instanceof Error ? cause.message : String(cause);
+	child.kill("SIGKILL");
+	const exited = await Promise.race([
+		child.exited.then(() => true),
+		Bun.sleep(UNRECORDED_LAUNCH_EXIT_MS).then(() => false),
+	]);
+	return new ToolError(
+		exited
+			? `Launched browser (pid ${child.pid}) could not be recorded in the launch ledger and was terminated: ${reason}`
+			: `Launched browser (pid ${child.pid}) could not be recorded in the launch ledger and did not exit after SIGKILL; terminate pid ${child.pid} manually: ${reason}`,
+	);
 }
 
 export function holdBrowser(handle: BrowserHandle): void {
