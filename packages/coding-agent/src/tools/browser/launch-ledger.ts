@@ -168,14 +168,33 @@ function isLedgerEntry(raw: unknown): raw is LedgerEntry {
 	);
 }
 
-async function readEntry(opts: LedgerOptions, browserPid: number): Promise<LedgerEntry | undefined> {
-	try {
-		const raw: unknown = await Bun.file(entryPath(opts, browserPid)).json();
-		return isLedgerEntry(raw) ? raw : undefined;
-	} catch (error) {
-		if (!isEnoent(error)) logger.debug("Unreadable browser launch ledger entry", { browserPid });
-		return undefined;
+/**
+ * An entry file exists but cannot be trusted (permission error, malformed JSON, failed validation).
+ * It is the only durable record that omp owns that browser, so no code path may delete it while the
+ * browser could still be alive: release raises this error, borrow treats the browser as someone
+ * else's (never killed), and the reaper skips it with a warning (it cannot prove the browser dead
+ * or the owner gone). An operator removes the file by hand once the browser is confirmed gone.
+ */
+class UnreadableLedgerEntryError extends ToolError {
+	constructor(file: string, cause: string) {
+		super(
+			`Browser launch ledger entry ${file} exists but is unreadable (${cause}); it was kept because the browser may still be running. Fix or remove the file after confirming that browser is gone.`,
+		);
 	}
+}
+
+/** `undefined` only when the entry file is confirmed absent (ENOENT); any other failure throws. */
+async function readEntry(opts: LedgerOptions, browserPid: number): Promise<LedgerEntry | undefined> {
+	const file = entryPath(opts, browserPid);
+	let raw: unknown;
+	try {
+		raw = await Bun.file(file).json();
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		throw new UnreadableLedgerEntryError(file, error instanceof Error ? error.message : String(error));
+	}
+	if (!isLedgerEntry(raw)) throw new UnreadableLedgerEntryError(file, "unexpected content");
+	return raw;
 }
 
 async function readAllEntries(opts: LedgerOptions): Promise<LedgerEntry[]> {
@@ -191,8 +210,13 @@ async function readAllEntries(opts: LedgerOptions): Promise<LedgerEntry[]> {
 		if (!name.endsWith(".json")) continue;
 		const pid = Number(name.slice(0, -".json".length));
 		if (!Number.isInteger(pid)) continue;
-		const entry = await readEntry(opts, pid);
-		if (entry) entries.push(entry);
+		try {
+			const entry = await readEntry(opts, pid);
+			if (entry) entries.push(entry);
+		} catch (error) {
+			if (!(error instanceof UnreadableLedgerEntryError)) throw error;
+			logger.warn("Skipping unreadable browser launch ledger entry", { pid, error: error.message });
+		}
 	}
 	return entries;
 }
@@ -252,7 +276,15 @@ export async function addLaunchedBrowserBorrower(browserPid: number, opts: Ledge
 		return "unmanaged";
 	}
 	return await withEntryLock(opts, browserPid, async () => {
-		const entry = await readEntry(opts, browserPid);
+		let entry: LedgerEntry | undefined;
+		try {
+			entry = await readEntry(opts, browserPid);
+		} catch (error) {
+			if (!(error instanceof UnreadableLedgerEntryError)) throw error;
+			// Ownership cannot be established: treat the browser as someone else's (never killed), keep the file.
+			logger.warn("Not borrowing a browser with an unreadable ledger entry", { browserPid, error: error.message });
+			return "unmanaged";
+		}
 		if (!entry) return "unmanaged";
 		if (!(await isIdentityAlive({ pid: browserPid, startTime: entry.browserStartTime }))) {
 			await deleteEntry(opts, browserPid);
@@ -406,7 +438,17 @@ export async function reapOrphanLaunchedBrowsers(opts: LedgerOptions = {}): Prom
 	for (const candidate of await readAllEntries(opts)) {
 		const didReap = await withEntryLock(opts, candidate.browserPid, async () => {
 			// Re-read under the lock: a release, transfer or borrow may have run since the scan.
-			const entry = await readEntry(opts, candidate.browserPid);
+			let entry: LedgerEntry | undefined;
+			try {
+				entry = await readEntry(opts, candidate.browserPid);
+			} catch (error) {
+				if (!(error instanceof UnreadableLedgerEntryError)) throw error;
+				logger.warn("Not reaping a browser with an unreadable ledger entry", {
+					pid: candidate.browserPid,
+					error: error.message,
+				});
+				return false;
+			}
 			if (!entry) return false;
 			const browser: ProcessIdentity = { pid: entry.browserPid, startTime: entry.browserStartTime };
 			if (!(await isIdentityAlive(browser))) {
