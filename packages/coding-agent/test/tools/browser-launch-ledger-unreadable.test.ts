@@ -42,6 +42,7 @@ describe("unreadable launch ledger entries", () => {
 		// Only the fixture this test started is signalled.
 		browser.kill("SIGKILL");
 		await browser.exited;
+		await fs.chmod(dir, 0o700).catch(() => undefined);
 		const file = path.join(dir, `${browser.pid}.json`);
 		await fs.chmod(file, 0o600).catch(() => undefined);
 		temp[Symbol.dispose]();
@@ -79,5 +80,29 @@ describe("unreadable launch ledger entries", () => {
 		await fs.rm(entryFile());
 		expect(await releaseLaunchedBrowser(browser.pid, { kill: true, reason: "test" }, { dir })).toBe("noop");
 		expect(isAlive(browser.pid)).toBe(true);
+	});
+
+	it("given the ledger dir is unreadable (mode 000), when its owner releases with kill, then release throws naming the entry path and the entry and browser survive", async () => {
+		await fs.chmod(dir, 0o000);
+		const error = await releaseLaunchedBrowser(browser.pid, { kill: true, reason: "test" }, { dir }).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+		expect((error as Error).message).toContain(entryFile());
+		expect(isAlive(browser.pid)).toBe(true);
+		await fs.chmod(dir, 0o700);
+		await fs.stat(entryFile());
+	});
+
+	it("given the ledger dir is unreadable (mode 000), when a borrower arrives, then it throws naming the entry path and the entry is intact afterwards", async () => {
+		await fs.chmod(dir, 0o000);
+		const error = await addLaunchedBrowserBorrower(browser.pid, { dir }).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+		expect((error as Error).message).toContain(entryFile());
+		expect(isAlive(browser.pid)).toBe(true);
+		await fs.chmod(dir, 0o700);
+		expect((await Bun.file(entryFile()).json()).browserPid).toBe(browser.pid);
 	});
 });
