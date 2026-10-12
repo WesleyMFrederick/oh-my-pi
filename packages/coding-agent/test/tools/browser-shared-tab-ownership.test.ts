@@ -1,11 +1,12 @@
 // Contract: for a tab on the project-shared browser, the ownership file naming the new page target is
 // on disk by the time `acquireTab` resolves, so a client killed right after the open still leaves its
 // page reapable by a surviving client. Stub worker and stub CDP browser: no Chromium is launched.
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { daemonRuntimeDir } from "../../src/launch/paths";
 import { processStartTime } from "../../src/tools/browser/launch-ledger";
+import * as orphanRegistry from "../../src/tools/browser/orphan-registry";
 import { resetOrphanRegistryForTest } from "../../src/tools/browser/orphan-registry";
 import { type PuppeteerBrowserHandle, holdBrowser } from "../../src/tools/browser/registry";
 import type { ReadyInfo, WorkerInbound, WorkerOutbound } from "../../src/tools/browser/tab-protocol";
@@ -80,5 +81,46 @@ describe("acquireTab on the shared browser", () => {
 		const record = (await Bun.file(file).json()) as { targets: string[]; startTime?: string };
 		expect(record.targets).toEqual([TARGET_ID]);
 		expect(record.startTime).toBe(await processStartTime(process.pid));
+	});
+
+	it("given the ownership write fails, when acquireTab runs, then it throws naming the cause, closes the new target and leaves no tab or hold", async () => {
+		const projectDir = path.join("/tmp", `omp-shared-tab-test-${crypto.randomUUID()}`);
+		projectDirs.push(projectDir);
+		setTabWorkerSpawnerForTest(async () => fakeWorker());
+		const closedTargets: string[] = [];
+		const session = {
+			send: async (method: string, params?: { targetId: string }) => {
+				if (method === "Target.closeTarget" && params) closedTargets.push(params.targetId);
+				return { success: true, targetInfos: [] };
+			},
+			detach: async () => undefined,
+		};
+		const handle: PuppeteerBrowserHandle = {
+			key: "shared",
+			kind: { kind: "headless", headless: true },
+			browser: {
+				connected: true,
+				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub",
+				target: () => ({ createCDPSession: async () => session }),
+			} as never,
+			sharedDaemon: { name: DAEMON, projectDir },
+			refCount: 0,
+			stealth: { browserSession: null, override: null },
+		};
+		holdBrowser(handle);
+		const write = spyOn(orphanRegistry, "recordSharedTarget").mockRejectedValue(new Error("read-only file system"));
+		try {
+			const error = await acquireTab("shared-tab", handle, { timeoutMs: 5_000 }).then(
+				() => undefined,
+				(err: unknown) => err,
+			);
+			expect((error as Error).message).toContain("read-only file system");
+		} finally {
+			write.mockRestore();
+		}
+		expect(closedTargets).toEqual([TARGET_ID]);
+		expect(getTabsMapForTest().has("shared-tab")).toBe(false);
+		// Only the test's own hold remains: the failed open released the hold it had taken.
+		expect(handle.refCount).toBe(1);
 	});
 });
