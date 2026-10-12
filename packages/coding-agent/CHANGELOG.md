@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed an aborted or failed browser launch killing a browser another omp process had already borrowed, concurrent releases leaving a stray `.lock` file, and a shared-browser tab opening without a durable ownership record.
 - Fixed a SIGTERM/SIGHUP arriving during RPC startup skipping owned-browser release, and made browser exit confirmation skip `ps` spawns for vanished pids so teardown stays inside Paseo's 2 s window under load.
 - Fixed a shared-browser tab opened just before its client was killed staying open: the ownership record is now written before the open returns.
 - Fixed tabs of dead omp clients lingering in the shared browser while other clients keep it open: opening or releasing a tab now closes their targets, and a recycled pid no longer hides them.
