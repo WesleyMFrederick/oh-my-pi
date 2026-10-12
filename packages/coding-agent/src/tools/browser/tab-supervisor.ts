@@ -2017,7 +2017,25 @@ function isSettleManaged(tab: TabSession): boolean {
 function isIdleManaged(tab: TabSession): boolean {
 	return (
 		isSettleManaged(tab) ||
+		isIdleSpawnedHeadless(tab) ||
 		((tab.backend === "tern" || tab.backend === "webkit") && tab.state === "alive" && !tab.persist)
+	);
+}
+
+/**
+ * OMP-launched headless app browsers (`app.path` with `--headless*`, recorded
+ * in the launch ledger): invisible to the user, so an abandoned one is closed —
+ * and its process killed — like a headless shared tab. Visible apps and
+ * discovered CDP browsers never qualify.
+ */
+function isIdleSpawnedHeadless(tab: TabSession): boolean {
+	return (
+		tab.backend === "worker" &&
+		tab.kindTag === "spawned" &&
+		tab.state === "alive" &&
+		!tab.persist &&
+		tab.browser.headlessLaunch === true &&
+		tab.browser.ledgerPid !== undefined
 	);
 }
 
@@ -2220,7 +2238,7 @@ export async function releaseIdleTabsForOwner(
 			const current = tabs.get(name);
 			if (!current || !isIdleCloseCandidate(current, ownerId, Date.now(), opts.idleMs)) continue;
 			try {
-				if (await releaseTab(name, opts)) count++;
+				if (await releaseTab(name, { ...opts, kill: opts.kill || isIdleSpawnedHeadless(current) })) count++;
 			} catch (error) {
 				// One tab's wedged cleanup must not abandon the remaining
 				// candidates; the tab is already removed from the map, so
