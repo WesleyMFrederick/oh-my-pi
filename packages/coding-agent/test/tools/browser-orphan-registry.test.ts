@@ -317,9 +317,9 @@ describe("orphan-registry — owner identity and survivor sweep", () => {
 		try {
 			expect(await reapOrphanSharedTargets(makeBrowser([], new Set(["t-stuck"])), scope)).toBe(0);
 			const retained = warn.mock.calls.find(([message]) => message.includes("Retaining orphaned"));
-			expect((retained?.[1] as { reason: string }).reason).toBe(
-				"Target.closeTarget failed: transient CDP failure; target still present after close",
-			);
+			expect(retained?.[1]).toMatchObject({
+				reason: "Target.closeTarget failed: transient CDP failure; target still present after close",
+			});
 		} finally {
 			warn.mockRestore();
 		}
