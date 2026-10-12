@@ -93,7 +93,6 @@ describe("acquireTab on the shared browser", () => {
 				if (method === "Target.closeTarget" && params) closedTargets.push(params.targetId);
 				return { success: true, targetInfos: [] };
 			},
-			detach: async () => undefined,
 		};
 		const handle: PuppeteerBrowserHandle = {
 			key: "shared",
@@ -101,7 +100,7 @@ describe("acquireTab on the shared browser", () => {
 			browser: {
 				connected: true,
 				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub",
-				target: () => ({ createCDPSession: async () => session }),
+				_connection: session,
 			} as never,
 			sharedDaemon: { name: DAEMON, projectDir },
 			refCount: 0,
@@ -135,7 +134,6 @@ describe("acquireTab on the shared browser", () => {
 				// Dropped connection: neither the close nor the confirming target listing succeeds.
 				throw new Error("Connection closed");
 			},
-			detach: async () => undefined,
 		};
 		const handle: PuppeteerBrowserHandle = {
 			key: "shared",
@@ -143,7 +141,7 @@ describe("acquireTab on the shared browser", () => {
 			browser: {
 				connected: true,
 				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub",
-				target: () => ({ createCDPSession: async () => session }),
+				_connection: session,
 			} as never,
 			sharedDaemon: { name: DAEMON, projectDir },
 			refCount: 0,

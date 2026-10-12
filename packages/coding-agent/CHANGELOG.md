@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed orphaned shared-browser tabs surviving a sweep when Puppeteer held a stale browser-target id; tabs now close over the browser-level CDP connection.
 - Fixed retained orphaned shared-browser tabs being logged without a cause; the warning now names the failing CDP step and its error.
 - Fixed a launched browser being left unowned when its launch ledger entry cannot be read, and a failed shared-tab ownership write claiming the tab was closed when closing it could not be confirmed.
 - Fixed an aborted or failed browser launch killing a browser another omp process had already borrowed, concurrent releases leaving a stray `.lock` file, and a shared-browser tab opening without a durable ownership record.

@@ -57,9 +57,13 @@ async function deadPid(): Promise<number> {
 	return proc.pid;
 }
 
-/** Minimal puppeteer Browser stub recording closes and optionally failing selected targets. */
+/**
+ * Minimal puppeteer Browser stub recording closes and optionally failing selected targets. Commands travel
+ * over the root connection; attaching to the browser target always fails, as it does when Puppeteer holds
+ * a browser-target id Chrome no longer knows.
+ */
 function makeBrowser(closed: string[], failTargets: ReadonlySet<string> = new Set()): Browser {
-	const session = {
+	const connection = {
 		send: async (method: string, params?: { targetId: string }) => {
 			if (method === "Target.getTargets") {
 				return { targetInfos: [...failTargets].map(targetId => ({ targetId })) };
@@ -69,10 +73,14 @@ function makeBrowser(closed: string[], failTargets: ReadonlySet<string> = new Se
 			closed.push(params.targetId);
 			return { success: true };
 		},
-		detach: async () => undefined,
 	};
 	return {
-		target: () => ({ createCDPSession: async () => session }),
+		_connection: connection,
+		target: () => ({
+			createCDPSession: async () => {
+				throw new Error("Protocol error (Target.attachToTarget): No target with given id found");
+			},
+		}),
 	} as unknown as Browser;
 }
 
@@ -282,16 +290,26 @@ describe("orphan-registry — owner identity and survivor sweep", () => {
 		expect(record.startTime).toBe(await processStartTime(process.pid));
 	});
 
-	it("given the CDP session cannot be created, when a sweep retains the target, then the warning carries the failing step and its error", async () => {
+	it("given the browser-target attach fails but the root connection works, when a sweep runs, then it closes the target", async () => {
+		const scope = trackedScope();
+		const dead = await deadPid();
+		await writeOwnershipFile(scope, { pid: dead, updatedAt: STALE, targets: ["t-a", "t-b"] });
+		const closed: string[] = [];
+		expect(await reapOrphanSharedTargets(makeBrowser(closed), scope)).toBe(2);
+		expect(closed.sort()).toEqual(["t-a", "t-b"]);
+		expect(await fs.readdir(registryDir(scope))).toEqual([]);
+	});
+
+	it("given the root connection is dropped, when a sweep retains the target, then the warning carries the failing steps and the record stays", async () => {
 		const scope = trackedScope();
 		const dead = await deadPid();
 		await writeOwnershipFile(scope, { pid: dead, updatedAt: STALE, targets: ["t-keep"] });
 		const browser = {
-			target: () => ({
-				createCDPSession: async () => {
+			_connection: {
+				send: async () => {
 					throw new Error("Connection closed");
 				},
-			}),
+			},
 		} as unknown as Browser;
 		const warn = spyOn(logger, "warn").mockImplementation(() => undefined);
 		try {
@@ -300,7 +318,7 @@ describe("orphan-registry — owner identity and survivor sweep", () => {
 			expect(retained?.[1]).toMatchObject({
 				targetId: "t-keep",
 				ownerPid: dead,
-				reason: "createCDPSession failed: Connection closed",
+				reason: "Target.closeTarget failed: Connection closed; Target.getTargets failed: Connection closed",
 			});
 		} finally {
 			warn.mockRestore();
