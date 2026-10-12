@@ -142,7 +142,15 @@ async function writeEntry(opts: LedgerOptions, entry: LedgerEntry): Promise<void
 	await fs.rename(tmp, target);
 }
 
-/** Remove an entry and its lock file. Callers hold the entry lock; the pid is dead, so no later mutation can need it. */
+/**
+ * Remove an entry and its lock file. Callers hold the entry lock and have found the entry gone or the
+ * browser dead. Lock reclamation rule: the lock file is unlinked only by a holder, and only when there
+ * is no entry left to serialize (this call, or a release that finds the entry already absent). A
+ * concurrent acquirer that raced onto the unlinked file can then only observe "entry absent" and
+ * return noop, which is also what it would observe on the new file; and that acquirer's own noop path
+ * unlinks whatever it created, so no lock file outlives the last release. An entry that still exists
+ * keeps a stable lock file for as long as it exists.
+ */
 async function deleteEntry(opts: LedgerOptions, browserPid: number): Promise<void> {
 	await fs.rm(entryPath(opts, browserPid), { force: true });
 	await fs.rm(`${entryPath(opts, browserPid)}.lock`, { force: true });
@@ -336,7 +344,11 @@ export async function releaseLaunchedBrowser(
 	return await withEntryLock(opts, browserPid, async () => {
 		const entry = await readEntry(opts, browserPid);
 		const self = await selfProcessIdentity();
-		if (!entry || !self) return "noop";
+		if (!entry) {
+			await deleteEntry(opts, browserPid);
+			return "noop";
+		}
+		if (!self) return "noop";
 		const resource = `browser pid ${browserPid}`;
 		const owner = String(self.pid);
 		const isOwner = entry.ownerPid === self.pid && entry.ownerStartTime === self.startTime;
