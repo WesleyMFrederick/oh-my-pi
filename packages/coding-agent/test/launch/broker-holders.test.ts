@@ -247,7 +247,8 @@ describe("daemon broker holders", () => {
 			expect(process.exitCode).toBe(1);
 			expect(String(stderr.mock.calls[0]?.[0])).toContain(`pid ${pid}`);
 		} finally {
-			process.exitCode = priorExitCode;
+			// Assigning undefined leaves Bun's exit status at 1; restore an unset code as 0.
+			process.exitCode = priorExitCode ?? 0;
 			stderr.mockRestore();
 			scope.mockRestore();
 			terminate.mockRestore();
