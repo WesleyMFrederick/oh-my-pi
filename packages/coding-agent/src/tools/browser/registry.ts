@@ -15,7 +15,7 @@ import {
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
-import { sweepOrphanSharedTargets } from "./orphan-registry";
+import { primeOwnerIdentity, sweepOrphanSharedTargets } from "./orphan-registry";
 import {
 	addLaunchedBrowserBorrower,
 	assertLaunchAllowed,
@@ -551,6 +551,8 @@ async function openSharedHeadlessHandle(
 				: null,
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
+		// Resolve this process's start time before the first shared tab is recorded.
+		primeOwnerIdentity();
 		// Hold before handing the handle out: the broker must never stop the
 		// browser under a live handle. A refused hold fails the open.
 		try {
