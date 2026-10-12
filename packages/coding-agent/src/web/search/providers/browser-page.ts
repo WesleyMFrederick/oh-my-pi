@@ -1,6 +1,8 @@
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { getProjectDir, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Page } from "puppeteer-core";
+import { settings } from "../../../config/settings";
+import { cfgBrowserIdleCloseSec } from "../../../tools/browser/settings";
 import { applyStealthPatches, applyViewport } from "../../../tools/browser/launch";
 import { acquireBrowser, holdBrowser, releaseBrowser } from "../../../tools/browser/registry";
 import { buildBrowserNavigationHeaders } from "./browser-headers";
@@ -68,6 +70,7 @@ async function browseHtmlPage(
 			{
 				cwd: getProjectDir(),
 				signal,
+				idleCloseSec: cfgBrowserIdleCloseSec.get(settings),
 			},
 		),
 	);
