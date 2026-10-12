@@ -48,11 +48,12 @@ export interface LedgerOptions {
 
 export type BorrowRole = "owner" | "borrower" | "adopted" | "unmanaged";
 
-// Worst case a termination takes GRACEFUL + HARD + EXIT_CONFIRM = 1.4 s: it must fit inside the
-// 2 s window a supervisor gives an RPC agent between SIGTERM and SIGKILL, alongside tab teardown.
-const TERMINATE_GRACEFUL_MS = 500;
-const TERMINATE_HARD_MS = 500;
-const EXIT_CONFIRM_MS = 400;
+// Worst case a termination takes TERM_WAIT + KILL_WAIT = 0.9 s: it must fit inside the 2 s window a
+// supervisor gives an RPC agent between SIGTERM and SIGKILL, alongside tab teardown. Exit is confirmed by
+// polling the process identity — never by `waitForExit`, which is unreliable for non-child pids.
+const TERM_WAIT_MS = 500;
+const KILL_WAIT_MS = 400;
+const EXIT_POLL_MS = 40;
 
 // Entry locks are held across a termination (<= 1.4 s), so a waiter must outlast one.
 const ENTRY_LOCK_RETRIES = 400;
@@ -127,8 +128,10 @@ async function writeEntry(opts: LedgerOptions, entry: LedgerEntry): Promise<void
 	await fs.rename(tmp, target);
 }
 
+/** Remove an entry and its lock file. Callers hold the entry lock; the pid is dead, so no later mutation can need it. */
 async function deleteEntry(opts: LedgerOptions, browserPid: number): Promise<void> {
 	await fs.rm(entryPath(opts, browserPid), { force: true });
+	await fs.rm(`${entryPath(opts, browserPid)}.lock`, { force: true });
 }
 
 function isLedgerEntry(raw: unknown): raw is LedgerEntry {
@@ -251,18 +254,41 @@ export async function addLaunchedBrowserBorrower(browserPid: number, opts: Ledge
 	});
 }
 
+async function waitForIdentityGone(identity: ProcessIdentity, budgetMs: number): Promise<boolean> {
+	const deadline = performance.now() + budgetMs;
+	while (performance.now() < deadline) {
+		if (!(await isIdentityAlive(identity))) return true;
+		// Polling a pid we may not be the parent of: there is no exit event to await.
+		await Bun.sleep(EXIT_POLL_MS);
+	}
+	return !(await isIdentityAlive(identity));
+}
+
+/** Signal `identity.pid` only while the start time still matches, so a reused pid is never hit. */
+async function signalIdentity(identity: ProcessIdentity, signal: NodeJS.Signals): Promise<void> {
+	if (!(await isIdentityAlive(identity))) return;
+	try {
+		process.kill(identity.pid, signal);
+	} catch {
+		// Already gone (ESRCH) or not signalable; liveness polling reports the outcome.
+	}
+}
+
 /**
- * SIGTERM→SIGKILL the process tree, but only while `(pid, startTime)` still
- * matches; then confirm the exit by identity, not by the terminate result.
+ * SIGTERM, then SIGKILL if it has not exited in time, confirming each stage by
+ * `(pid, startTime)` liveness polling. The process tree is killed through the
+ * native helper at the SIGKILL stage so renderer children do not outlive a wedged browser.
  */
 async function terminateByIdentity(identity: ProcessIdentity): Promise<boolean> {
 	if (!(await isIdentityAlive(identity))) return true;
-	const proc = Process.fromPid(identity.pid);
-	if (proc) {
-		await proc.terminate({ gracefulMs: TERMINATE_GRACEFUL_MS, timeoutMs: TERMINATE_HARD_MS }).catch(() => false);
-		await proc.waitForExit({ timeoutMs: EXIT_CONFIRM_MS }).catch(() => false);
+	await signalIdentity(identity, "SIGTERM");
+	if (await waitForIdentityGone(identity, TERM_WAIT_MS)) return true;
+	if (await isIdentityAlive(identity)) {
+		const proc = Process.fromPid(identity.pid);
+		if (proc) await proc.terminate({ gracefulMs: 0, timeoutMs: 100 }).catch(() => false);
+		await signalIdentity(identity, "SIGKILL");
 	}
-	return !(await isIdentityAlive(identity));
+	return await waitForIdentityGone(identity, KILL_WAIT_MS);
 }
 
 export type ReleaseOutcome = "killed" | "transferred" | "dropped" | "noop";
