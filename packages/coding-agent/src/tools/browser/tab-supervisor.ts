@@ -34,6 +34,7 @@ import {
 	forgetSharedTargets,
 	recordSharedTarget,
 	type SharedTargetScope,
+	sweepOrphanSharedTargets,
 } from "./orphan-registry";
 import { stopSharedBrowserIfUnreachable } from "./shared-daemon";
 import {
@@ -797,6 +798,7 @@ async function acquireTabImpl(
 	// this process dies abnormally before its own teardown closes the tab.
 	const scope = sharedTargetScopeOf(browser);
 	if (scope) void recordSharedTarget(scope, info.targetId);
+	sweepSharedOrphans(browser);
 	const note = opts.url ? await navigateOpenedTab(name, opts.url, opts, startedAt, tab) : undefined;
 	return { tab, created: true, note };
 }
@@ -1961,6 +1963,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 				targetId: tab.targetId,
 			});
 		}
+		sweepSharedOrphans(tab.browser);
 	}
 	if (cleanupError) throw cleanupError;
 	return wasAlive && tab.ownsPage && !closesPage ? "kept" : "released";
@@ -2876,6 +2879,16 @@ async function closeTargetById(
 ): Promise<boolean> {
 	if (browser.kind.kind === "relay") return await closeRelayTarget(browserConnection(browser.browser), targetId);
 	return await closeCdpTarget(browser.browser, targetId, confirmTimeoutMs);
+}
+
+/**
+ * Fire-and-forget sweep of dead clients' targets while this process still holds the shared browser.
+ * Skipped once the handle's connection is gone (last release already disconnected it).
+ */
+function sweepSharedOrphans(handle: BrowserHandle): void {
+	const scope = sharedTargetScopeOf(handle);
+	if (!scope || !("browser" in handle) || !handle.browser.connected) return;
+	void sweepOrphanSharedTargets(handle.browser, scope);
 }
 
 /**

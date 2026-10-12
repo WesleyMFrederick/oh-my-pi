@@ -17,7 +17,7 @@ import {
 	removeUserDataDir,
 	type UserAgentOverride,
 } from "./launch";
-import { reapOrphanSharedTargets, type SharedTargetScope } from "./orphan-registry";
+import { type SharedTargetScope, sweepOrphanSharedTargets } from "./orphan-registry";
 import { ensureRelayDaemon, isLoopbackRelayUrl, restartRelayDaemon } from "./relay/daemon";
 import {
 	addLaunchedBrowserBorrower,
@@ -638,7 +638,7 @@ async function openSharedHeadlessHandle(
 		// left behind by omp processes that died without teardown — bounds
 		// accumulation without a background timer. Best-effort and detached so a
 		// slow reap never delays the open (issue #10022).
-		void reapOrphanSharedTargets(browser, { projectDir: shared.projectDir, daemonName: shared.daemonName });
+		void sweepOrphanSharedTargets(browser, { projectDir: shared.projectDir, daemonName: shared.daemonName });
 		return {
 			key: browserKey(kind),
 			kind,
