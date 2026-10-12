@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import * as modelCache from "@oh-my-pi/pi-catalog/model-cache";
 import { getModelCacheWriteStats, readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
@@ -195,35 +196,45 @@ describe("model cache write churn", () => {
 		expect(readModelCache("azure", TTL_MS, Date.now, dbPath)?.models.length).toBe(bundled.length);
 	});
 
-	it("lets other event-loop work (signal handlers, timers) run between providers while a cold cache is persisted", async () => {
-		const providers = Array.from({ length: 12 }, (_, i) => `yield-test-${i}`);
-		let finished = 0;
-		let finishedWhenTimerRan: number | undefined;
-		// A macrotask stands in for a SIGTERM handler: it can only run when the refresh yields the event loop.
-		const timer = new Promise<void>(resolve =>
-			setTimeout(() => {
-				finishedWhenTimerRan = finished;
-				resolve();
-			}, 0),
-		);
-		await Promise.all([
-			timer,
-			...providers.map(async providerId => {
-				await resolveProviderModels(
-					{
-						providerId,
-						staticModels: [spec("static-a", providerId)],
-						cacheDbPath: dbPath,
-						fetchDynamicModels: async () => [spec("dynamic-a", providerId)],
-					},
-					"online",
-				);
-				finished++;
-			}),
-		]);
-		expect(finished).toBe(providers.length);
-		// Every provider persisted in one uninterrupted stretch would give 12 here.
-		expect(finishedWhenTimerRan).toBeLessThan(providers.length);
+	it("runs a signal handler between writes while many providers persist a cold cache concurrently", async () => {
+		const providers = Array.from({ length: 24 }, (_, i) => `yield-test-${i}`);
+		let writes = 0;
+		let writesWhenSignalHandled: number | undefined;
+		const handled = Promise.withResolvers<void>();
+		const onSignal = () => {
+			writesWhenSignalHandled = writes;
+			handled.resolve();
+		};
+		process.on("SIGUSR2", onSignal);
+		const realWrite = modelCache.writeModelCache;
+		const spy = spyOn(modelCache, "writeModelCache").mockImplementation((...args) => {
+			realWrite(...args);
+			writes++;
+			// Stand-in for SIGTERM arriving mid-refresh. A real signal, so it only runs when the loop polls.
+			if (writes === 1) process.kill(process.pid, "SIGUSR2");
+		});
+		try {
+			await Promise.all([
+				...providers.map(providerId =>
+					resolveProviderModels(
+						{
+							providerId,
+							staticModels: [spec("static-a", providerId)],
+							cacheDbPath: dbPath,
+							fetchDynamicModels: async () => [spec("dynamic-a", providerId)],
+						},
+						"online",
+					),
+				),
+				handled.promise,
+			]);
+		} finally {
+			spy.mockRestore();
+			process.off("SIGUSR2", onSignal);
+		}
+		expect(writes).toBe(providers.length);
+		// Uninterrupted persistence would deliver the signal only after the last write.
+		expect(writesWhenSignalHandled).toBeLessThan(providers.length);
 		for (const providerId of providers) {
 			expect(
 				readModelCache(providerId, TTL_MS, Date.now, dbPath)

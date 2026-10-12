@@ -216,6 +216,28 @@ function restoreCachedModelHeaders<TApi extends Api>(
 	return { models: restored, unresolvedModelIds };
 }
 
+/** Tail of the module-wide persistence queue; see {@link persistOnePerTurn}. */
+let persistTail: Promise<void> = Promise.resolve();
+
+/**
+ * Run a synchronous cache write on its own event-loop turn, one at a time across every concurrent
+ * resolution. A cold cache persists dozens of multi-MB provider rows with synchronous SQLite calls;
+ * independent per-provider yields do not help because `Promise.all` callers wake together and their
+ * writes run back to back. One queue, with a `setImmediate` before each write, lets the poll phase
+ * (signal handlers, stdin, timers) run between any two writes, so a SIGTERM waits for at most one
+ * write instead of the whole refresh. A failing task never blocks the queue.
+ */
+function persistOnePerTurn(task: () => void): Promise<void> {
+	const run = persistTail.then(async () => {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setImmediate(resolve);
+		await promise;
+		task();
+	});
+	persistTail = run.catch(() => undefined);
+	return run;
+}
+
 /**
  * Resolves provider models with source precedence:
  * static -> cached fallback -> stencil.so -> dynamic.
@@ -372,72 +394,69 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const resolutionAuthoritative = !hasRemoteFetcher || remoteResolutionComplete || shouldUseFreshCacheAsAuthoritative;
 	const remoteUpdatedAt = anyRemoteFetchSucceeded ? now() : undefined;
 	if (shouldFetchFromNetwork) {
-		// Persisting is synchronous SQLite work: on a cold cache every provider's catalog is written in turn,
-		// and microtask-resolved discoveries would chain those writes into one stall of a second or more that
-		// starves signal handlers (a launched browser must still be terminated inside Paseo's 2 s kill window).
-		// Yield one macrotask per provider so each write is its own bounded turn. Safe for readers: every
-		// provider's row is already an independent, atomic transaction, and nothing below depends on state
-		// that could change across this yield (the fallback branch re-reads the cache after it).
-		await Bun.sleep(0);
-		if (anyRemoteFetchSucceeded) {
-			writeModelCache(
-				cacheProviderId,
-				remoteUpdatedAt!,
-				models,
-				cacheAuthoritative,
-				staticFingerprint,
-				dbPath,
-				staticModels,
-				restorableHeaderFallback,
-			);
-		} else {
-			// Remote fetch failed. Re-persist any prior catalog as a
-			// non-authoritative snapshot so stale state stays visible while the
-			// retry backoff applies. When there is no prior cache and nothing to
-			// preserve (a discovery-only provider on its first failed fetch), leave
-			// the row absent rather than writing an empty snapshot: an empty
-			// non-authoritative row reads back as a fresh catalog and suppresses
-			// refetch for NON_AUTHORITATIVE_RETRY_MS, hiding every discovery-only
-			// model until it ages out. Writing nothing lets the next launch retry
-			// immediately (#10964).
-			const latestCache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
-			const latestRestoredCache = restoreCachedModelHeaders(
-				latestCache?.models ?? cache?.models ?? [],
-				staticModels,
-				latestCache?.headerOmittedModelIds ?? cache?.headerOmittedModelIds ?? [],
-				latestCache?.unrestorableHeaderModelIds ?? cache?.unrestorableHeaderModelIds ?? [],
-				latestCache?.legacyHeaderRestoreMarkers ?? cache?.legacyHeaderRestoreMarkers ?? false,
-				restorableHeaderFallback,
-				options.restoreCachedHeaders,
-			);
-			const latestUsableCacheModels = latestRestoredCache.models.filter(
-				model => !latestRestoredCache.unresolvedModelIds.has(model.id),
-			);
-			const preparedLatestCacheModels = prepareCacheModelsForStaticMismatch(
-				latestUsableCacheModels,
-				staticModels,
-				cacheFingerprintMatches,
-				options.dropCachedModelIdsOnStaticMismatch,
-			);
-			const latestCacheModels = additiveStaticModelIds
-				? preparedLatestCacheModels.filter(model => !additiveStaticModelIds.has(model.id))
-				: preparedLatestCacheModels;
-			const fallbackSnapshotModels = collapseBuiltVariants(
-				mergeDynamicModels(mergeDynamicModels(staticModels, latestCacheModels), modelsDevModels),
-			);
-			if (fallbackSnapshotModels.length > 0 || latestCache !== null || cache !== null) {
+		// Safe for readers: each provider's row is an independent, atomic transaction, and the fallback
+		// branch re-reads the cache inside the queued task, right before its write.
+		await persistOnePerTurn(() => {
+			if (anyRemoteFetchSucceeded) {
 				writeModelCache(
 					cacheProviderId,
-					now(),
-					fallbackSnapshotModels,
-					false,
+					remoteUpdatedAt!,
+					models,
+					cacheAuthoritative,
 					staticFingerprint,
 					dbPath,
 					staticModels,
 					restorableHeaderFallback,
 				);
+			} else {
+				// Remote fetch failed. Re-persist any prior catalog as a
+				// non-authoritative snapshot so stale state stays visible while the
+				// retry backoff applies. When there is no prior cache and nothing to
+				// preserve (a discovery-only provider on its first failed fetch), leave
+				// the row absent rather than writing an empty snapshot: an empty
+				// non-authoritative row reads back as a fresh catalog and suppresses
+				// refetch for NON_AUTHORITATIVE_RETRY_MS, hiding every discovery-only
+				// model until it ages out. Writing nothing lets the next launch retry
+				// immediately (#10964).
+				const latestCache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
+				const latestRestoredCache = restoreCachedModelHeaders(
+					latestCache?.models ?? cache?.models ?? [],
+					staticModels,
+					latestCache?.headerOmittedModelIds ?? cache?.headerOmittedModelIds ?? [],
+					latestCache?.unrestorableHeaderModelIds ?? cache?.unrestorableHeaderModelIds ?? [],
+					latestCache?.legacyHeaderRestoreMarkers ?? cache?.legacyHeaderRestoreMarkers ?? false,
+					restorableHeaderFallback,
+					options.restoreCachedHeaders,
+				);
+				const latestUsableCacheModels = latestRestoredCache.models.filter(
+					model => !latestRestoredCache.unresolvedModelIds.has(model.id),
+				);
+				const preparedLatestCacheModels = prepareCacheModelsForStaticMismatch(
+					latestUsableCacheModels,
+					staticModels,
+					cacheFingerprintMatches,
+					options.dropCachedModelIdsOnStaticMismatch,
+				);
+				const latestCacheModels = additiveStaticModelIds
+					? preparedLatestCacheModels.filter(model => !additiveStaticModelIds.has(model.id))
+					: preparedLatestCacheModels;
+				const fallbackSnapshotModels = collapseBuiltVariants(
+					mergeDynamicModels(mergeDynamicModels(staticModels, latestCacheModels), modelsDevModels),
+				);
+				if (fallbackSnapshotModels.length > 0 || latestCache !== null || cache !== null) {
+					writeModelCache(
+						cacheProviderId,
+						now(),
+						fallbackSnapshotModels,
+						false,
+						staticFingerprint,
+						dbPath,
+						staticModels,
+						restorableHeaderFallback,
+					);
+				}
 			}
-		}
+		});
 	}
 	const cacheContributed = cacheModels.length > 0;
 	const source: ModelResolutionSource = dynamicFetchSucceeded
