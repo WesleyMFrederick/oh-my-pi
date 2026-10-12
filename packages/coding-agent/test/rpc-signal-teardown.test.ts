@@ -31,6 +31,31 @@ async function waitFor(check: () => Promise<boolean> | boolean, deadlineMs: numb
 	}
 }
 
+/** Send `get_state` and resolve once its response frame arrives: the RPC command loop is live. */
+async function awaitRpcResponse(
+	child: Bun.Subprocess<"pipe", "pipe", "pipe">,
+	id: string,
+	deadlineMs = 30_000,
+): Promise<void> {
+	child.stdin.write(`${JSON.stringify({ id, type: "get_state" })}\n`);
+	await child.stdin.flush();
+	const reader = child.stdout.getReader();
+	const decoder = new TextDecoder();
+	let buffered = "";
+	const deadline = Date.now() + deadlineMs;
+	try {
+		while (Date.now() < deadline) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffered += decoder.decode(value, { stream: true });
+			if (buffered.includes(`"id":"${id}"`)) return;
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	throw new Error(`timed out waiting for RPC response ${id}`);
+}
+
 function extensionSource(pidFile: string, fixtureScript: string): string {
 	return `import * as fs from "node:fs";
 import { recordLaunchedBrowser } from ${JSON.stringify(path.join(SRC, "tools/browser/launch-ledger"))};
@@ -134,8 +159,10 @@ describe("RPC teardown of a launched browser", () => {
 				await waitFor(() => Bun.file(pidFile).exists(), 30_000, "fixture browser to start");
 				browserPid = Number(await Bun.file(pidFile).text());
 				expect(isAlive(browserPid)).toBe(true);
-				// Let the RPC loop finish startup so the trigger lands on the running session.
-				await Bun.sleep(500);
+				// Startup is still running when the extension's session_start writes the pid file (extension init,
+				// model refresh, command discovery); a signal sent then queues behind that work and the measured
+				// teardown would include it. A `get_state` reply proves the command loop is reading stdin.
+				await awaitRpcResponse(child, "ready-probe");
 
 				const sentAt = performance.now();
 				if (trigger === "SIGTERM" || trigger === "SIGHUP") child.kill(trigger);

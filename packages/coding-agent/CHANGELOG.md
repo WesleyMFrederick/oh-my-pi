@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed a SIGTERM/SIGHUP arriving during RPC startup skipping owned-browser release, and made browser exit confirmation skip `ps` spawns for vanished pids so teardown stays inside Paseo's 2 s window under load.
 - Fixed a shared-browser tab opened just before its client was killed staying open: the ownership record is now written before the open returns.
 - Fixed tabs of dead omp clients lingering in the shared browser while other clients keep it open: opening or releasing a tab now closes their targets, and a recycled pid no longer hides them.
 - Fixed launched-browser cleanup gaps: kill releases always go through the launch ledger so a borrowing process keeps the browser, ledger updates are serialized across processes, a browser that cannot be recorded fails the open and is killed, RPC teardown confirms the browser dead within 1.5 s of `SIGTERM`/`SIGHUP`/stdin EOF, a stop whose status check fails is no longer treated as stopped, and web-search browser fallback honors `browser.idleCloseSec`.

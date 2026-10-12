@@ -54,6 +54,8 @@ export type BorrowRole = "owner" | "borrower" | "adopted" | "unmanaged";
 const TERM_WAIT_MS = 500;
 const KILL_WAIT_MS = 400;
 const EXIT_POLL_MS = 40;
+/** Minimum gap between `ps` identity confirmations while a pid is still alive. */
+const IDENTITY_CHECK_MS = 200;
 
 // Entry locks are held across a termination (<= 1.4 s), so a waiter must outlast one.
 const ENTRY_LOCK_RETRIES = 400;
@@ -107,7 +109,19 @@ export async function processStartTime(pid: number): Promise<string | undefined>
 	}
 }
 
+/** False only when the kernel reports no such pid (ESRCH); any other probe result means the pid exists. */
+function pidExists(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
 async function isIdentityAlive(identity: ProcessIdentity): Promise<boolean> {
+	// A vanished pid needs no `ps` spawn; under load each spawn costs far more than the probe.
+	if (!pidExists(identity.pid)) return false;
 	return (await processStartTime(identity.pid)) === identity.startTime;
 }
 
@@ -256,8 +270,15 @@ export async function addLaunchedBrowserBorrower(browserPid: number, opts: Ledge
 
 async function waitForIdentityGone(identity: ProcessIdentity, budgetMs: number): Promise<boolean> {
 	const deadline = performance.now() + budgetMs;
+	let lastIdentityCheck = Number.NEGATIVE_INFINITY;
 	while (performance.now() < deadline) {
-		if (!(await isIdentityAlive(identity))) return true;
+		if (!pidExists(identity.pid)) return true;
+		// A pid that still exists may have been reused: confirm identity, but only every
+		// IDENTITY_CHECK_MS so a slow-exiting process does not cost a `ps` spawn per poll.
+		if (performance.now() - lastIdentityCheck >= IDENTITY_CHECK_MS) {
+			lastIdentityCheck = performance.now();
+			if (!(await isIdentityAlive(identity))) return true;
+		}
 		// Polling a pid we may not be the parent of: there is no exit event to await.
 		await Bun.sleep(EXIT_POLL_MS);
 	}
