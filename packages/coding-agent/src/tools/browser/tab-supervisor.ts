@@ -1657,7 +1657,7 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
  * protocol timeout, retaining the cleanup hold for tens of seconds.
  */
 async function closeTargetById(browser: PuppeteerBrowserHandle, targetId: string): Promise<boolean> {
-	return await closeCdpTarget(browser.browser, targetId);
+	return (await closeCdpTarget(browser.browser, targetId)).closed;
 }
 
 /**

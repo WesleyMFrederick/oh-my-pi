@@ -12,7 +12,7 @@
  *  - confirmed closures are removed, while transient failures remain durable
  *    and are retried on the next reap.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { daemonRuntimeDir } from "@oh-my-pi/pi-coding-agent/launch/paths";
@@ -26,6 +26,7 @@ import {
 	type SharedTargetScope,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/orphan-registry";
 import { processStartTime } from "@oh-my-pi/pi-coding-agent/tools/browser/launch-ledger";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { Browser } from "puppeteer-core";
 
 const DAEMON_NAME = "omp.browser.headless";
@@ -279,6 +280,49 @@ describe("orphan-registry — owner identity and survivor sweep", () => {
 		const file = path.join(registryDir(scope), `${process.pid}.json`);
 		const record = (await Bun.file(file).json()) as { startTime?: string };
 		expect(record.startTime).toBe(await processStartTime(process.pid));
+	});
+
+	it("given the CDP session cannot be created, when a sweep retains the target, then the warning carries the failing step and its error", async () => {
+		const scope = trackedScope();
+		const dead = await deadPid();
+		await writeOwnershipFile(scope, { pid: dead, updatedAt: STALE, targets: ["t-keep"] });
+		const browser = {
+			target: () => ({
+				createCDPSession: async () => {
+					throw new Error("Connection closed");
+				},
+			}),
+		} as unknown as Browser;
+		const warn = spyOn(logger, "warn").mockImplementation(() => undefined);
+		try {
+			expect(await reapOrphanSharedTargets(browser, scope)).toBe(0);
+			const retained = warn.mock.calls.find(([message]) => message.includes("Retaining orphaned"));
+			expect(retained?.[1]).toMatchObject({
+				targetId: "t-keep",
+				ownerPid: dead,
+				reason: "createCDPSession failed: Connection closed",
+			});
+		} finally {
+			warn.mockRestore();
+		}
+		// Retry path unchanged: the ownership record is still on disk.
+		expect(await fs.readdir(registryDir(scope))).toEqual([`${dead}.json`]);
+	});
+
+	it("given the target survives a failed close, when a sweep retains it, then the reason says it is still present", async () => {
+		const scope = trackedScope();
+		const dead = await deadPid();
+		await writeOwnershipFile(scope, { pid: dead, updatedAt: STALE, targets: ["t-stuck"] });
+		const warn = spyOn(logger, "warn").mockImplementation(() => undefined);
+		try {
+			expect(await reapOrphanSharedTargets(makeBrowser([], new Set(["t-stuck"])), scope)).toBe(0);
+			const retained = warn.mock.calls.find(([message]) => message.includes("Retaining orphaned"));
+			expect((retained?.[1] as { reason: string }).reason).toBe(
+				"Target.closeTarget failed: transient CDP failure; target still present after close",
+			);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("given a client died after this process attached, when a survivor sweep runs, then it closes its targets and is throttled between sweeps", async () => {

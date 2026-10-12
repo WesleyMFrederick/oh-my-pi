@@ -25,7 +25,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
-import type { Browser } from "puppeteer-core";
+import type { Browser, CDPSession } from "puppeteer-core";
 import { daemonRuntimeDir } from "../../launch/paths";
 import { processStartTime } from "./launch-ledger";
 
@@ -235,31 +235,43 @@ export async function collectOrphanTargets(
 	return { owners };
 }
 
+/** Outcome of {@link closeCdpTarget}: confirmed closed, or why it could not be confirmed. */
+export type CdpCloseResult = { closed: true } | { closed: false; reason: string };
+
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
 /**
- * Close a page target by id through a fresh CDP session. Returns true only
- * when CDP confirms the close or confirms the target no longer exists; a
- * dropped connection or transient protocol failure returns false so durable
- * ownership remains available for a later retry.
+ * Close a page target by id through a fresh CDP session. Resolves `closed: true`
+ * only when CDP confirms the close or confirms the target no longer exists; a
+ * dropped connection or transient protocol failure resolves `closed: false` with
+ * the failing step and its error message, so durable ownership remains available
+ * for a later retry and the cause is visible in the log.
  */
-export async function closeCdpTarget(browser: Browser, targetId: string): Promise<boolean> {
-	const session = await browser
-		.target()
-		.createCDPSession()
-		.catch(() => null);
-	if (!session) return false;
+export async function closeCdpTarget(browser: Browser, targetId: string): Promise<CdpCloseResult> {
+	let session: CDPSession;
 	try {
+		session = await browser.target().createCDPSession();
+	} catch (err) {
+		return { closed: false, reason: `createCDPSession failed: ${errorMessage(err)}` };
+	}
+	try {
+		let closeFailure = "Target.closeTarget reported success=false";
 		try {
 			const result = await session.send("Target.closeTarget", { targetId });
-			if (result.success) return true;
-		} catch {
+			if (result.success) return { closed: true };
+		} catch (err) {
 			// A concurrent reaper or the page itself may already have closed the
 			// target. Confirm absence before treating the cleanup as complete.
+			closeFailure = `Target.closeTarget failed: ${errorMessage(err)}`;
 		}
 		try {
 			const { targetInfos } = await session.send("Target.getTargets");
-			return !targetInfos.some(info => info.targetId === targetId);
-		} catch {
-			return false;
+			if (!targetInfos.some(info => info.targetId === targetId)) return { closed: true };
+			return { closed: false, reason: `${closeFailure}; target still present after close` };
+		} catch (err) {
+			return { closed: false, reason: `${closeFailure}; Target.getTargets failed: ${errorMessage(err)}` };
 		}
 	} finally {
 		await session.detach().catch(() => undefined);
@@ -308,11 +320,16 @@ export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTar
 	for (const owner of scan.owners) {
 		const retained: string[] = [];
 		for (const targetId of owner.targetIds) {
-			if (await closeCdpTarget(browser, targetId)) {
+			const result = await closeCdpTarget(browser, targetId);
+			if (result.closed) {
 				closed++;
 			} else {
 				retained.push(targetId);
-				logger.debug("Retaining orphaned shared-browser target for retry", { targetId, ownerPid: owner.pid });
+				logger.warn("Retaining orphaned shared-browser target for retry", {
+					targetId,
+					ownerPid: owner.pid,
+					reason: result.reason,
+				});
 			}
 		}
 		if (retained.length === owner.targetIds.length) continue;
