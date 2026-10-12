@@ -110,7 +110,11 @@ async function flush(dir: string): Promise<void> {
 	await fs.rename(tmp, file);
 }
 
-/** Record that this process created `targetId` in the given shared browser. */
+/**
+ * Record that this process created `targetId` in the given shared browser. Rejects when the ownership
+ * file cannot be written, after dropping the id from memory: a target no survivor can discover must
+ * not be reported as durably owned.
+ */
 export async function recordSharedTarget(scope: SharedTargetScope, targetId: string): Promise<void> {
 	const dir = registryDir(scope);
 	let owned = ownedByDir.get(dir);
@@ -119,11 +123,12 @@ export async function recordSharedTarget(scope: SharedTargetScope, targetId: str
 		ownedByDir.set(dir, owned);
 	}
 	owned.add(targetId);
-	await chain(dir, () => flush(dir)).catch(err =>
-		logger.debug("Failed to record shared-browser target ownership", {
-			error: err instanceof Error ? err.message : String(err),
-		}),
-	);
+	try {
+		await chain(dir, () => flush(dir));
+	} catch (err) {
+		owned.delete(targetId);
+		throw err;
+	}
 }
 
 /** Drop `targetId` from this process's ownership file (closed the normal way). */

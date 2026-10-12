@@ -533,9 +533,22 @@ async function acquireTabImpl(
 	// Durably record ownership so another live omp process can reap this page if
 	// this process dies abnormally before its own teardown closes the tab. Awaited so the file
 	// exists when the open returns: a client killed right after `acquireTab` still leaves it.
-	// `recordSharedTarget` logs and swallows write failures, so this never fails the open.
+	// A write failure means no survivor could ever reap this page, so the open fails loudly after
+	// unwinding it: terminate the worker, close the new target, undo this open's browser hold.
 	const scope = sharedScopeOf(browser);
-	if (scope) await recordSharedTarget(scope, info.targetId);
+	if (scope) {
+		try {
+			await recordSharedTarget(scope, info.targetId);
+		} catch (err) {
+			tabs.delete(name);
+			await worker.terminate().catch(() => undefined);
+			await closeTargetById(browser, info.targetId).catch(() => undefined);
+			await releaseBrowser(browser, { kill: false }).catch(() => undefined);
+			throw new ToolError(
+				`Could not record ownership of the new shared-browser tab, so it was closed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
 	sweepSharedOrphans(browser);
 	return { tab, created: true };
 }
