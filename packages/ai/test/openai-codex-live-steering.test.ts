@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { setImmediate as nextEventLoopTurn } from "node:timers/promises";
+import { type } from "@oh-my-pi/omptype";
+import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { planSteeredRequest } from "@oh-my-pi/pi-ai/providers/openai-codex/live-steering";
 import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
@@ -13,6 +16,7 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as piUtils from "@oh-my-pi/pi-utils";
 
 const { getAgentDir, setAgentDir, TempDir } = piUtils;
@@ -92,6 +96,8 @@ function createGpt6Model(): Model<"openai-codex-responses"> {
 		baseUrl: "https://chatgpt.com/backend-api",
 		reasoning: true,
 		preferWebsockets: true,
+		// These fixtures explicitly emulate a deployment that supports response.steer.
+		compat: { supportsSteering: true },
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 272000,
@@ -160,6 +166,231 @@ function options(providerSessionState: Map<string, ProviderSessionState>, liveSt
 const SYSTEM = ["You are a helpful assistant."];
 const creates = () => ScriptedWebSocket.sent.filter(frame => frame.type === "response.create");
 const steers = () => ScriptedWebSocket.sent.filter(frame => frame.type === "response.steer");
+
+/**
+ * Real agent queue and provider, with the first response held after visible output.
+ * The synthetic native lane rejects stateful input; it never interrupts/replaces work.
+ */
+async function startNativeNoticeRun(
+	model: Model<"openai-codex-responses">,
+	onContinuation: (frame: Frame, socket: ScriptedWebSocket) => void,
+	tools: AgentTool[] = [],
+) {
+	const active = Promise.withResolvers<void>();
+	let firstSocket: ScriptedWebSocket | undefined;
+	installSocket((frame, socket) => {
+		if (frame.type === "response.steer") {
+			socket.emit({
+				type: "response.steer.failed",
+				steer: { previous_response_id: "resp_native", input: frame.input },
+				error: {
+					type: "invalid_request_error",
+					code: "unsupported_native_inflight_message",
+					message: "Native work cannot accept stateful in-flight messages",
+				},
+			});
+			return;
+		}
+		if (frame.type === "response.create" && creates().length === 1) {
+			firstSocket = socket;
+			socket.emit(
+				{ type: "response.created", response: { id: "resp_native" } },
+				...messageFrames("msg_native", "Original work finished"),
+			);
+			return;
+		}
+		onContinuation(frame, socket);
+	});
+	const state = new Map<string, ProviderSessionState>();
+	const signals: AbortSignal[] = [];
+	const agent = new Agent({
+		initialState: { model, systemPrompt: SYSTEM, tools },
+		steeringMode: "all",
+		sessionId: "ws-native-notice-session",
+		streamFn: (_model, context, streamOptions) => {
+			if (streamOptions?.signal) signals.push(streamOptions.signal);
+			return streamOpenAICodexResponses(model, context, {
+				...streamOptions,
+				...options(state, streamOptions?.liveSteering),
+			});
+		},
+	});
+	agent.subscribe(event => {
+		if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") active.resolve();
+	});
+	const running = agent.prompt("Finish the original work, then total completed workers' fruit counts.");
+	await active.promise;
+	if (!firstSocket) throw new Error("Expected the first native request");
+	const socket = firstSocket;
+	return {
+		agent,
+		running,
+		signals,
+		completeOriginal: () =>
+			socket.emit({
+				type: "response.completed",
+				response: { id: "resp_native", status: "completed", usage: USAGE },
+			}),
+	};
+}
+
+describe("native completion notice queue", () => {
+	const noticeTexts = ["[paseo] source finished: pears=2", "[paseo] count finished: apples=1"];
+	const modelSources = [
+		{
+			name: "bundled catalog",
+			model: () => getBundledModel<"openai-codex-responses">("openai-codex", "gpt-6-sol"),
+		},
+		{
+			name: "discovered catalog",
+			model: () =>
+				buildModel({
+					id: "gpt-6.1-sol",
+					name: "GPT-6.1 Sol",
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+					baseUrl: "https://chatgpt.com/backend-api",
+					reasoning: true,
+					preferWebsockets: true,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 272000,
+					maxTokens: 128000,
+				}),
+		},
+	];
+
+	for (const source of modelSources) {
+		it(`Given active native work with the ${source.name}, when completions are admitted, then they reach the next request once in order without stateful steering`, async () => {
+			// Given a real catalog model, real queue, and a transport holding the original response.
+			const schema = type({ counts: "number[]" });
+			const total: AgentTool<typeof schema> = {
+				name: "total",
+				label: "Total fruit",
+				description: "Sum completed workers' fruit counts",
+				parameters: schema,
+				async execute(_id, args) {
+					return {
+						content: [{ type: "text", text: String(args.counts.reduce((sum, count) => sum + count, 0)) }],
+						details: {},
+					};
+				},
+			};
+			const run = await startNativeNoticeRun(
+				source.model(),
+				(frame, socket) => {
+					const input = frame.input as Frame[];
+					if (creates().length === 2) {
+						const texts = input.flatMap(item => {
+							if (item.role !== "user") return [];
+							return (item.content as Frame[]).map(part => String(part.text));
+						});
+						const counts = texts.map(text => Number(text.split("=").at(-1)));
+						const call = {
+							type: "function_call",
+							id: "fc_total",
+							call_id: "call_total",
+							name: "total",
+							arguments: JSON.stringify({ counts }),
+						};
+						socket.emit(
+							{ type: "response.created", response: { id: "resp_total" } },
+							{ type: "response.output_item.added", output_index: 0, item: { ...call, arguments: "" } },
+							{ type: "response.output_item.done", output_index: 0, item: { ...call, status: "completed" } },
+							{ type: "response.completed", response: { id: "resp_total", status: "completed", usage: USAGE } },
+						);
+						return;
+					}
+					const output = input.find(item => item.type === "function_call_output");
+					socket.emit(
+						{ type: "response.created", response: { id: "resp_final" } },
+						...messageFrames("msg_final", `Total fruit: ${output?.output}`),
+						{ type: "response.completed", response: { id: "resp_final", status: "completed", usage: USAGE } },
+					);
+				},
+				[total],
+			);
+			try {
+				// When two independently identified completions are admitted during active native work.
+				expect(run.agent.state.isStreaming).toBe(true);
+				for (const text of noticeTexts) {
+					run.agent.steer({ role: "user", content: text, steering: true, attribution: "agent", timestamp: 1 });
+				}
+				expect(run.agent.peekSteeringQueue()).toMatchObject(
+					noticeTexts.map(content => ({ role: "user", content })),
+				);
+				// An event-loop boundary drains ready promise work, not a guessed wall-clock delay.
+				await nextEventLoopTurn();
+				const activeFrames = [...ScriptedWebSocket.sent];
+				const originalAborted = run.signals[0]?.aborted;
+				run.completeOriginal();
+				await run.running;
+
+				// Then work was neither interrupted nor replaced; only the original request ran while active.
+				expect(originalAborted).toBe(false);
+				expect(creates()).toHaveLength(3);
+				expect(creates()[1]?.previous_response_id).toBe("resp_native");
+				expect(creates()[1]?.input).toEqual(
+					noticeTexts.map(text => ({
+						role: "user",
+						content: [{ type: "input_text", text }],
+					})),
+				);
+				expect(creates()[2]?.input).toEqual([
+					expect.objectContaining({ type: "function_call_output", call_id: "call_total", output: "3" }),
+				]);
+				const assistants = run.agent.state.messages.filter(message => message.role === "assistant");
+				expect(assistants.map(message => message.stopReason)).toEqual(["stop", "toolUse", "stop"]);
+				expect(assistants[0]?.content).toEqual([
+					expect.objectContaining({ type: "text", text: "Original work finished" }),
+				]);
+				expect(assistants[2]?.content).toEqual([expect.objectContaining({ type: "text", text: "Total fruit: 3" })]);
+				expect(
+					run.agent.state.messages
+						.filter(message => message.role === "user")
+						.map(message => message.content)
+						.slice(1),
+				).toEqual(noticeTexts);
+				expect(run.agent.hasQueuedMessages()).toBe(false);
+				expect(activeFrames.map(frame => frame.type)).toEqual(["response.create"]);
+			} finally {
+				run.agent.abort();
+				await run.running;
+			}
+		});
+	}
+
+	it("Given an admitted native completion, when the active run is stopped, then no queued continuation starts", async () => {
+		// Given a completion accepted into the real queue while the original native response is open.
+		const run = await startNativeNoticeRun(modelSources[0]!.model(), () => {
+			throw new Error("Stopped native work must not start a continuation");
+		});
+		try {
+			run.agent.steer({
+				role: "user",
+				content: noticeTexts[0]!,
+				steering: true,
+				attribution: "agent",
+				timestamp: 1,
+			});
+			expect(run.agent.peekSteeringQueue()).toMatchObject([{ role: "user", content: noticeTexts[0] }]);
+			// When stop wins before the normal request boundary.
+			run.agent.abort();
+			await run.running;
+			run.completeOriginal();
+			await nextEventLoopTurn();
+			// Then neither a stateful send nor an independent continuation escaped cancellation.
+			expect(ScriptedWebSocket.sent.map(frame => frame.type)).toEqual(["response.create"]);
+			expect(run.agent.state.isStreaming).toBe(false);
+			expect(
+				run.agent.state.messages.filter(message => message.role === "assistant").map(message => message.stopReason),
+			).toEqual(["aborted"]);
+		} finally {
+			run.agent.abort();
+			await run.running;
+		}
+	});
+});
 
 describe("codex live steering", () => {
 	it("steers the streaming response and reads the server's automatic continuation without sending a request", async () => {

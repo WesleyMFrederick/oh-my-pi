@@ -115,6 +115,12 @@ provider "openai-codex" {
 		}
 	}
 	class "openai" {
+		// Codex can select a native lane that rejects stateful in-flight
+		// messages without advertising it. Keep input queued for the next
+		// request until this deployment can establish steering support.
+		revision ">=6" {
+			supports-steering #false
+		}
 		revision ">=5.3 <5.7" {
 			thinking-mode "effort"
 		}

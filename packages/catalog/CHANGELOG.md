@@ -6,6 +6,7 @@
 
 - Fixed a cold model cache still blocking signal handlers for hundreds of milliseconds: provider cache writes now run one per event-loop turn through a single queue.
 - Fixed a cold model cache blocking the process for 1 s or more while every provider catalog was persisted, which delayed signal handlers and browser cleanup on exit.
+- Disabled optimistic live steering for GPT-6-family Codex models so accepted messages use the existing queued-request path.
 
 ## [18.4.9] - 2026-10-01
 
