@@ -12,10 +12,11 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import * as path from "node:path";
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { AgentBusyError, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, logger, postmortem, Snowflake } from "@oh-my-pi/pi-utils";
+import { GoalModeController } from "../../goals/mode-controller";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionAskDialogQuestion,
@@ -1097,6 +1098,42 @@ export interface RpcModeOptions {
 }
 
 /**
+ * Goal mode for RPC: one controller whose host auto-continues an active goal with hidden
+ * `goal-continuation` turns while no client request is in flight. Exported so tests drive the
+ * production host rather than a copy.
+ */
+export function createRpcGoalMode(session: AgentSession): GoalModeController {
+	const goalMode: GoalModeController = new GoalModeController(session, {
+		runMode: "rpc",
+		// `schedule` runs inside agent_end, where the session may still report itself busy, so it
+		// only refuses when queued client messages will start the next turn on their own.
+		canAutoSubmit: phase => {
+			if (session.queuedMessageCount > 0) return false;
+			if (phase === "schedule") return true;
+			// A prompt request still being admitted (image normalization, compaction wait) is about
+			// to start a turn; its own agent_end reschedules the continuation.
+			return !session.isStreaming && !session.hasAdmittedSubmission;
+		},
+		submitContinuation: async prompt => {
+			try {
+				await session.promptCustomMessage({
+					customType: "goal-continuation",
+					content: prompt,
+					display: false,
+					attribution: "agent",
+				});
+			} catch (submitError) {
+				if (!(submitError instanceof AgentBusyError)) throw submitError;
+				// Lost the race for the idle window; the next agent_end reschedules.
+				goalMode.noteContinuationCancelled();
+				logger.debug("Goal continuation dropped: session became busy");
+			}
+		},
+	});
+	return goalMode;
+}
+
+/**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
@@ -1388,12 +1425,24 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		uiContext: headless ? undefined : rpcUiContext,
 	});
 
+	const goalMode = createRpcGoalMode(session);
+
 	// Output all agent events as JSON; prompt results follow the frame that settled them.
 	session.subscribe(event => {
 		sessionEvents.forward(event);
 		promptResults.observe(event);
 		settleWatcher.observe(event);
+		goalMode.handleSessionEvent(event).catch((goalError: unknown) => {
+			logger.error("Goal mode event handling failed", { eventType: event.type, error: String(goalError) });
+		});
 	});
+
+	/** Re-derive goal mode from the (possibly different) active session after new/switch/branch/open. */
+	const reconcileGoalMode = async (): Promise<void> => {
+		await goalMode.clearTransient();
+		await goalMode.restoreFromSession(session.sessionManager.buildSessionContext());
+	};
+	await reconcileGoalMode();
 
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
@@ -1418,6 +1467,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		// stdin EOF, and the signal path must wait on this same memoized dispose
 		// (not exit past it) so owned browsers are confirmed dead first.
 		try {
+			goalMode.dispose();
 			await session.dispose();
 		} catch (error) {
 			if (!persistenceFailure || error !== persistenceFailure) throw error;
@@ -1486,6 +1536,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// Taken before any dispatch so a builtin that schedules a turn (e.g. `/retry`)
 				// cannot start its run ahead of the prompt's event-stream position.
 				const ticket = promptResults.begin(id);
+				goalMode.noteSubmission(undefined);
 				try {
 					const skillResult = await dispatchRpcSkillPrompt({
 						ticket,
@@ -1508,6 +1559,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						refreshCommands: emitAvailableCommandsUpdate,
 						reloadPlugins: reloadPluginState,
 						runCommandInBackground: task => shutdownCoordinator.track(task()),
+						goalMode,
 						notifyTitleChanged: async () => {
 							output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 						},
@@ -1632,6 +1684,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					promptResults.abortOpen();
 					// The detached run publishes no terminal agent_end to settle on.
 					void settleWatcher.check();
+					await reconcileGoalMode();
 					await emitAvailableCommandsUpdate();
 				}
 				return success(id, result.type, result.data);
@@ -1642,6 +1695,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				if (!result.cancelled) {
 					promptResults.abortOpen();
 					void settleWatcher.check();
+					await reconcileGoalMode();
 					await emitAvailableCommandsUpdate();
 				}
 				return success(id, "open_session", result);
@@ -2219,6 +2273,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 	// stdin closed — RPC client is gone. Fail pending side-channel requests
 	// first so active/queued commands can settle, then drain accepted work.
+	goalMode.dispose();
 	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");

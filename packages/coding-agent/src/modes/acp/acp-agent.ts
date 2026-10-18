@@ -68,6 +68,7 @@ import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
+import { GoalModeController } from "../../goals/mode-controller";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
 import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
@@ -182,6 +183,9 @@ type ManagedSessionRecord = {
 	closedError: PromptLifecycleError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
+	/** Goal mode state for this session; no host, so `/goal` works but never auto-continues in ACP. */
+	goalMode: GoalModeController;
+	goalModeUnsubscribe: () => void;
 };
 
 type ReplayableMessage = {
@@ -954,6 +958,7 @@ export class AcpAgent implements Agent {
 		const builtinResult = await executeAcpBuiltinSlashCommand(text, {
 			session: record.session,
 			sessionManager: record.session.sessionManager,
+			goalMode: record.goalMode,
 			settings: record.session.settings,
 			cwd: record.session.sessionManager.getCwd(),
 			signal: promptTurn?.abortController.signal,
@@ -1314,6 +1319,7 @@ export class AcpAgent implements Agent {
 		// so it shares the bootstrap race guard — see that comment for why.
 		try {
 			await this.#configureExtensions(record);
+			await record.goalMode.restoreFromSession(session.sessionManager.buildSessionContext());
 			await this.#configureMcpServers(record, mcpServers);
 			this.#sessions.set(session.sessionId, record);
 			return record;
@@ -1327,9 +1333,17 @@ export class AcpAgent implements Agent {
 		session: AgentSession,
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined = undefined,
 	): ManagedSessionRecord {
+		const goalMode = new GoalModeController(session);
+		const goalModeUnsubscribe = session.subscribe(event => {
+			goalMode.handleSessionEvent(event).catch((error: unknown) => {
+				logger.warn("ACP goal mode event handling failed", { eventType: event.type, error: String(error) });
+			});
+		});
 		return {
 			session,
 			setToolUIContext,
+			goalMode,
+			goalModeUnsubscribe,
 			mcpManager: undefined,
 			mcpRefreshChain: undefined,
 			promptTurn: undefined,
@@ -2753,6 +2767,8 @@ export class AcpAgent implements Agent {
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
+		record.goalModeUnsubscribe();
+		record.goalMode.dispose();
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();

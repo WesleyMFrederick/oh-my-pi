@@ -1,5 +1,6 @@
 import type { Settings } from "../config/settings";
 import type { SlashCommandIconName } from "@oh-my-pi/pi-tui/theme/symbols";
+import type { GoalModeController } from "../goals/mode-controller";
 import type { InteractiveModeContext, SubmittedUserInput } from "../modes/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
@@ -99,6 +100,11 @@ export interface SlashCommandRuntime {
 	runCommandInBackground?: (task: () => Promise<void>) => void;
 	notifyTitleChanged?: () => Promise<void> | void;
 	notifyConfigChanged?: () => Promise<void> | void;
+	/**
+	 * Goal-mode controller owned by the host (RPC, ACP). Absent in hosts that do not own one;
+	 * `/goal` then reports that goal mode is unavailable instead of silently doing nothing.
+	 */
+	goalMode?: GoalModeController;
 }
 
 /**

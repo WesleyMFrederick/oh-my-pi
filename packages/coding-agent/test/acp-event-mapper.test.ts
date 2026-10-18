@@ -100,6 +100,9 @@ class ReplayTestSession {
 
 	setClientBridge(_bridge: unknown): void {}
 
+	/** ACP restores goal mode on session registration; a non-goal session only clears accounting. */
+	readonly goalRuntime = { clearAccounting(): void {} };
+
 	subscribe(_listener: (event: AgentSessionEvent) => void): () => void {
 		return () => {};
 	}

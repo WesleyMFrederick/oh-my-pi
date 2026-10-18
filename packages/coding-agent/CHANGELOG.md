@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `/goal` over RPC and ACP, with goal auto-continuation between turns in RPC mode (controlled by `goal.continuationModes`, now defaulting to `["interactive", "rpc"]`).
+
 ### Fixed
 
 - Fixed orphaned shared-browser tabs that failed to close waiting for the next tab open; the sweep now retries up to three times in the background.

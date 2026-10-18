@@ -316,6 +316,8 @@ A failed provider turn is not a failed command: the prompt response is still `su
 
 Local-only slash commands may emit `command_output` frames before completing. They do not emit `agent_end`.
 
+`/goal <objective>` (plus `pause`, `resume`, `drop`, `show`, `budget <n|off>`) is available through `prompt`; `/goal <objective>` starts the first turn like a normal prompt. While a goal is active and unpaused, the server auto-continues it between turns with hidden `goal-continuation` turns, each streaming normal `agent_start` … `agent_end` frames, until the model completes the goal, the token budget is exhausted, the goal is paused or dropped, or the loop guard sees no new evidence. Continuations start about 0.8 seconds after a yield, so `session_settled` can precede them; keep the transport open while a goal is active. Auto-continue is enabled when `rpc` is listed in the `goal.continuationModes` setting (default `["interactive", "rpc"]`); when it is not, `/goal` reports that on `command_output`. ACP supports the `/goal` commands but never auto-continues.
+
 ### Yield vs settled
 
 For agent-invoking work, a prompt's `prompt_result` reports the **agent yield**: it finished its turn (`agent_end` with `yielded: true`), or the prompt was aborted before dispatch or by a session transition. Local-only results and pre-dispatch errors do not require an `agent_end`. The **session is done** only when nothing can wake it again — no run is live or admitted, no steer/follow-up is queued, and no background job (auto-backgrounded `bash`, async `task`, `eval`) or pending delivery will inject its result and start a follow-up turn.

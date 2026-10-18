@@ -338,6 +338,9 @@ class FakeAgentSession {
 
 	setClientBridge(_bridge: unknown): void {}
 
+	/** ACP restores goal mode on session registration; a non-goal session only clears accounting. */
+	readonly goalRuntime = { clearAccounting(): void {} };
+
 	getPlanModeState(): PlanModeState | undefined {
 		return this.planModeState;
 	}
