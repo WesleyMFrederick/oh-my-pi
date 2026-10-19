@@ -57,7 +57,7 @@ Registration is skipped when:
 - a rule with the same `rule.name` was already registered in this manager
 - the parsed rule scope excludes all monitored streams
 
-Invalid regex conditions and unreachable scopes are logged as warnings and ignored; session startup continues. AST parse/match failures are logged when matching is attempted and count as no match. If a TTSR rule defines `globs`, those globs are compiled as a global file-path gate for matching.
+Invalid regex conditions and unreachable scopes are logged as warnings and ignored; session startup continues. AST parse/match failures are logged when matching is attempted and count as no match. If a TTSR rule defines `globs`, those globs are compiled as a global file-path gate for matching. Tool contexts are gated by the call's own paths; text and thinking contexts by the run's working set (§2), so a `globs` text rule fires only while the agent is working under those paths.
 
 With no explicit `scope`, a rule monitors assistant text and all tool arguments, but not thinking. Explicit scope tokens can enable `text`, `thinking`, any tool (`tool`/`toolcall`), a named tool, and optional per-tool path globs.
 
@@ -108,10 +108,18 @@ When assistant updates arrive and rules exist:
 - `checkDelta` skips buffering entirely for text/thinking sources when no registered rule allows that source (`canMatchText`/`canMatchThinking`), so unmatched prose/thinking deltas pay no buffering cost
 - matching is incremental: a condition that cannot cross a newline (no `s` flag, nothing in it matches `\n`) is re-tested only from the start of the line holding the previous buffer end, so it gives the full-scan result on every delta; a condition that can span lines is re-scanned over the whole buffer only while it is ≤4 KB or once it has grown 25% since the last full scan
 - `text_end`, `thinking_end`, and `toolcall_end` run a final whole-buffer check (`TtsrCheckOptions.final`), so a cross-line match deferred by the growth throttle is still caught before the block closes; `checkDelta` defaults to `final: false`, `checkSnapshot` to `final: true` (one-shot callers such as the CLI stay exact)
+- text and thinking contexts carry the run's **working set** as `filePaths`: the normalized candidate paths of every tool call that reached `beforeToolCall` or `beforeBridgedToolCall` since the USER prompt that started the run. An empty set adds no paths, so `globs` text rules stay silent until the run touches a matching path. Tool calls in the message being streamed join only once they execute, so its own text is gated by earlier calls
 
 AST matching does not run in the streaming listener. The awaited `beforeToolCall` hook checks the finalized, validated execution arguments using the same per-file or combined source snapshot. An interrupt blocks the tool before its side effects, marks the assistant turn aborted, and follows the existing TTSR injection/retry path; `never` mode allows execution and attaches its reminder to the result. Streaming regex matching remains synchronous.
 
 `checkDelta()`/`checkSnapshot()` iterate registered rules and return all matching rules that pass scope, global path-glob, regex condition, and repeat policy checks. `checkAstSnapshot()` applies the same scope/path/repeat gates, infers language from the candidate file path, then tests each candidate rule's AST patterns. Regex and AST match arrays feed the same trigger-decision handler.
+
+### Working-set boundaries
+
+- `agent_start` opens the run's input window; a non-synthetic `user` message started in that window (before the first assistant `message_start`) clears the set. Continuations — TTSR retries, auto-continue, synthetic prompts — keep it, and so do steering messages that arrive mid-run.
+- A new or switched session (`newSession`/`switchSession` bump the session generation) clears it; compaction does not, since the same run continues.
+- The set lives in memory only: after resume or reload it starts empty until the next tool call.
+- `/omfg` history validation replays the same boundaries over the transcript: each non-synthetic, non-steering USER message resets it, and tool calls of non-aborted, non-error assistant messages extend it.
 
 ## 3. Trigger decision and immediate abort path
 
@@ -294,7 +302,7 @@ During the timer window, state can change. The retry is guarded by retry token, 
 - Duplicate names at manager layer: second registration is ignored.
 - `ttsr.disabledRules`: listed names are dropped before TTSR registration and are not surfaced through always-apply/rulebook buckets.
 - `ttsr.builtinRules: false`: embedded `builtin-defaults` rules are dropped before TTSR registration; user/project rules still load.
-- `globs` on a TTSR rule require at least one candidate file path matching either its normalized path or basename; for hashline/apply_patch edit streams those paths come from the tool's `matcherPaths` hook, not top-level arguments.
+- `globs` on a TTSR rule require at least one candidate file path matching either its normalized path or basename; for hashline/apply_patch edit streams those paths come from the tool's `matcherPaths` hook, not top-level arguments. Text and thinking candidates are the run's working set (§2), so a `globs` prose rule never fires on a reply before the run's first tool call.
 - Tools without `matcherPaths`/`matcherEntries` keep the generic top-level path scan and combined `matcherDigest` behavior — the per-file hooks are additive.
 - Default scope monitors text and tools, not thinking.
 - `contextMode: "keep"`: partial violating output can remain in context before reminder retry.
@@ -311,7 +319,7 @@ A rule with `question` is judged: its natural-language question goes to the `jud
 
 - `ttsr.judge`: `auto` (default) judges only when the rule's judge resolves to a native System One model (TypeSafe jev); `on` judges with whatever it resolves to, including the session's chat model; `off` never judges. Question rules still register either way.
 - A rule's `judge` selector (e.g. `typesafe/jev-latest`) replaces the whole judge-role chain for that rule: only that model answers, with no role or session-model fallback. When it does not resolve to a credentialed judge-capable model, that rule's judgment fails and delivers nothing.
-- On `message_end` of an assistant message whose `stopReason` is neither `aborted` nor `error`, `TtsrCoordinator` splits the message into outputs: all text blocks as one `text` output, all thinking blocks as one `thinking` output, and each tool call as a `tool` output. Tools exposing `matcherEntries` yield one output per file, with the `{ path, digest }` digest as content; otherwise the `matcherDigest` or the raw JSON arguments.
+- On `message_end` of an assistant message whose `stopReason` is neither `aborted` nor `error`, `TtsrCoordinator` splits the message into outputs: all text blocks as one `text` output, all thinking blocks as one `thinking` output, and each tool call as a `tool` output. Tools exposing `matcherEntries` yield one output per file, with the `{ path, digest }` digest as content; otherwise the `matcherDigest` or the raw JSON arguments. The `text` and `thinking` outputs carry the run's working set (§2) as file paths.
 - For each output, `TtsrManager.judgedCandidates()` selects question rules that pass scope, `globs`, the repeat policy, and — when the rule also declares `condition`/`astCondition` — that prefilter against the completed content. No candidates → no request.
 - One judge request per output and judge carries every candidate's question that shares that judge as a `noul` question over a shared state `{ output, content }` (content cut to its longest prefix within 32,000 Jev tokens, counted locally with `Encoding.Jev`, so each branch stays under Jev's ~33k-token limit). Jev bills the state once per request, so rules sharing an output and a judge share its cost. Usage is journaled as `model_usage` with purpose `ttsr`.
 

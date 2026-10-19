@@ -95,6 +95,19 @@ export class TtsrCoordinator {
 	#emittedTriggerRules = new Map<string, Set<string>>();
 	/** In-flight judged-rule checks, each already guarded against rejection. */
 	#pendingJudgments = new Set<Promise<void>>();
+	/**
+	 * Normalized candidate paths of every tool call executed since the USER
+	 * prompt that started the current run. Text and thinking contexts carry
+	 * them as `filePaths`, so a rule's `globs` gate on prose means "the agent
+	 * is working there".
+	 */
+	#workingSet = new Set<string>();
+	/** `#workingSet` as match-context paths; rebuilt after the set changes. */
+	#workingSetPaths: string[] | undefined;
+	/** Session generation the working set belongs to; a replaced session starts empty. */
+	#workingSetGeneration: number | undefined;
+	/** Between `agent_start` and the run's first response, while its input messages arrive. */
+	#runInputOpen = false;
 
 	constructor(host: TtsrCoordinatorHost, manager: TtsrManager | undefined) {
 		this.#host = host;
@@ -120,6 +133,20 @@ export class TtsrCoordinator {
 		return this.#resumePromise;
 	}
 
+	/** Opens the input window of a new agent run (prompt or continuation). */
+	onAgentStart(): void {
+		this.#runInputOpen = true;
+	}
+
+	/**
+	 * A non-synthetic USER message among a run's input messages means a USER
+	 * prompt started this run, so its working set starts empty. Continuations
+	 * (TTSR retries, synthetic or developer prompts) and mid-run steers keep it.
+	 */
+	onInputMessageStart(message: AgentMessage): void {
+		if (this.#runInputOpen && message.role === "user" && !message.synthetic) this.#clearWorkingSet();
+	}
+
 	/** Resets stream buffers at turn start. */
 	onTurnStart(): void {
 		this.#manager?.resetBuffer();
@@ -131,8 +158,10 @@ export class TtsrCoordinator {
 	 * so this is the boundary between two responses inside one turn (an aborted
 	 * response and its retry, or a continuation after an interruption); without
 	 * it, text from the earlier response would combine with the later one.
+	 * The first response also closes the run's input window.
 	 */
 	onAssistantMessageStart(): void {
+		this.#runInputOpen = false;
 		this.#manager?.resetBuffer();
 	}
 
@@ -156,10 +185,10 @@ export class TtsrCoordinator {
 		let delta: string | undefined;
 		let isFinal = false;
 		if (assistantEvent.type === "text_delta") {
-			matchContext = { source: "text" };
+			matchContext = this.#proseContext("text");
 			delta = assistantEvent.delta;
 		} else if (assistantEvent.type === "thinking_delta") {
-			matchContext = { source: "thinking" };
+			matchContext = this.#proseContext("thinking");
 			delta = assistantEvent.delta;
 		} else if (assistantEvent.type === "toolcall_delta") {
 			streamingToolCall = this.#getStreamingToolCallBlock(event.message, assistantEvent.contentIndex);
@@ -190,9 +219,11 @@ export class TtsrCoordinator {
 	/** AST parsing runs once on finalized arguments, before execution, not in
 	 * fire-and-forget stream listeners or on partial deltas. */
 	async beforeToolCall(ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> {
-		if (!this.#manager?.hasAstRules()) return undefined;
+		if (!this.#manager) return undefined;
 		const toolCall = { ...ctx.toolCall, arguments: ctx.args };
 		const matchContext = this.#inspector.matchContext(toolCall, 0);
+		this.#addToWorkingSet(matchContext);
+		if (!this.#manager.hasAstRules()) return undefined;
 		const matches = await this.#checkAstStream(matchContext, toolCall);
 		if (matches.length > 0 && this.#handleMatches(matches, matchContext, ctx.assistantMessage.timestamp)) {
 			// Generation already ended: stop the tool turn before TTSR recovery retries it.
@@ -210,9 +241,11 @@ export class TtsrCoordinator {
 		tool: AgentTool,
 		args: unknown,
 	): Promise<{ block?: boolean; reason?: string } | undefined> {
-		if (!this.#manager?.hasRules()) return undefined;
+		if (!this.#manager) return undefined;
 		const toolCall = { type: "toolCall", id: toolCallId, name: tool.name, arguments: args } as ToolCall;
 		const matchContext = this.#inspector.matchContext(toolCall, 0);
+		this.#addToWorkingSet(matchContext);
+		if (!this.#manager.hasRules()) return undefined;
 		let matches: Rule[];
 		let matched: Record<string, string>;
 		try {
@@ -586,7 +619,7 @@ export class TtsrCoordinator {
 			return;
 		}
 		const generation = this.#host.sessionGeneration();
-		for (const output of this.#inspector.outputs(message)) {
+		for (const output of this.#inspector.outputs(message, this.#currentWorkingSet())) {
 			const pending: Promise<void> = this.#judgeOutput(output, generation)
 				.catch(error => {
 					logger.warn("TTSR judged rule check failed", {
@@ -597,6 +630,40 @@ export class TtsrCoordinator {
 				.finally(() => this.#pendingJudgments.delete(pending));
 			this.#pendingJudgments.add(pending);
 		}
+	}
+
+	/** Text or thinking match context, gated by the run's working set when it has paths. */
+	#proseContext(source: "text" | "thinking"): TtsrMatchContext {
+		const filePaths = this.#currentWorkingSet();
+		return filePaths ? { source, filePaths } : { source };
+	}
+
+	#addToWorkingSet(matchContext: TtsrMatchContext): void {
+		if (!matchContext.filePaths) return;
+		this.#syncWorkingSetGeneration();
+		const size = this.#workingSet.size;
+		for (const filePath of matchContext.filePaths) this.#workingSet.add(filePath);
+		if (this.#workingSet.size !== size) this.#workingSetPaths = undefined;
+	}
+
+	#currentWorkingSet(): string[] | undefined {
+		if (this.#workingSet.size === 0) return undefined;
+		this.#syncWorkingSetGeneration();
+		if (this.#workingSet.size === 0) return undefined;
+		this.#workingSetPaths ??= Array.from(this.#workingSet);
+		return this.#workingSetPaths;
+	}
+
+	#syncWorkingSetGeneration(): void {
+		const generation = this.#host.sessionGeneration();
+		if (generation === this.#workingSetGeneration) return;
+		this.#workingSetGeneration = generation;
+		this.#clearWorkingSet();
+	}
+
+	#clearWorkingSet(): void {
+		this.#workingSet.clear();
+		this.#workingSetPaths = undefined;
 	}
 
 	/**

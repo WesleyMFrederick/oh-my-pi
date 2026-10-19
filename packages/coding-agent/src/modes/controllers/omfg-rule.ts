@@ -62,9 +62,26 @@ export function buildOmfgRuleForPath(
 	});
 }
 
-/** Completed assistant outputs in `messages`, as TTSR rules see them. */
+/**
+ * Completed assistant outputs in `messages`, as TTSR rules see them. Replies
+ * and reasoning carry the paths of tool calls made since the last USER prompt,
+ * mirroring the live run's working set.
+ */
 export function historyOutputs(messages: readonly AgentMessage[], inspector: TtsrToolInspector): TtsrOutput[] {
-	return messages.filter(isAssistantMessage).flatMap(message => inspector.outputs(message));
+	const outputs: TtsrOutput[] = [];
+	const workingSet = new Set<string>();
+	for (const message of messages) {
+		if (message.role === "user" && !message.synthetic && !message.steering) workingSet.clear();
+		if (!isAssistantMessage(message)) continue;
+		const messageOutputs = inspector.outputs(message, Array.from(workingSet));
+		outputs.push(...messageOutputs);
+		if (message.stopReason === "aborted" || message.stopReason === "error") continue;
+		for (const output of messageOutputs) {
+			if (output.context.source !== "tool") continue;
+			for (const filePath of output.context.filePaths ?? []) workingSet.add(filePath);
+		}
+	}
+	return outputs;
 }
 
 function normalizeConditionRegexes(conditions: readonly string[]): { condition: string[] } | { error: string } {
