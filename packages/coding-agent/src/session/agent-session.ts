@@ -3651,9 +3651,15 @@ export class AgentSession implements SettingsScope {
 
 		// Both buffer resets run before the awaited fan-out: event handlers run
 		// concurrently and message_update skips the await, so a reset placed after
-		// it could land behind the new message's first deltas and clear them.
+		// it could land behind the new message's first deltas and clear them. The
+		// run-start hooks stay synchronous for the same reason: the working set a
+		// USER prompt clears must be empty before the run's first tool call.
+		if (event.type === "agent_start") this.#ttsr.onAgentStart();
 		if (event.type === "turn_start") this.#ttsr.onTurnStart();
-		if (event.type === "message_start" && event.message.role === "assistant") this.#ttsr.onAssistantMessageStart();
+		if (event.type === "message_start") {
+			if (event.message.role === "assistant") this.#ttsr.onAssistantMessageStart();
+			else this.#ttsr.onInputMessageStart(event.message);
+		}
 
 		// Meter generation per session: each session tracks its own stream, so a
 		// background subagent holds a live reading by the time it is focused and

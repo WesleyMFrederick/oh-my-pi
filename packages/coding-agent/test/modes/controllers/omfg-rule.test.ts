@@ -205,6 +205,25 @@ describe("validateRuleAgainstAssistantHistory", () => {
 		expect(await ruleMatchesAssistantHistory(rule, messages)).toBe(false);
 	});
 
+	it("gates folder-scoped prose by the tool calls since the last USER prompt", async () => {
+		// Given a text rule limited to one folder
+		const { rule } = mustParse(ruleJson({ name: "glossary-detail", condition: "detail", scope: "text" }));
+		const scoped: Rule = { ...rule, globs: ["scratch/x/**"] };
+		const readIn = createAssistantMessage([
+			{ type: "toolCall", id: "read-in", name: "read", arguments: { path: "scratch/x/a.ts" } },
+		]);
+		const reply = createAssistantMessage([{ type: "text", text: "the split detail step" }]);
+		const prompt = (text: string): AgentMessage => ({ role: "user", content: text, timestamp: Date.now() });
+
+		// When the reply follows an in-folder read in the same run, or a new USER prompt
+		const sameRun = await ruleMatchesAssistantHistory(scoped, [prompt("tidy facts"), readIn, reply]);
+		const nextRun = await ruleMatchesAssistantHistory(scoped, [prompt("tidy facts"), readIn, prompt("other"), reply]);
+
+		// Then only the same-run reply matches
+		expect(sameRun).toBe(true);
+		expect(nextRun).toBe(false);
+	});
+
 	it("returns false when the rule cannot be registered", async () => {
 		const { rule } = mustParse(ruleJson({ name: "base", condition: "needle", scope: "text" }));
 		const invalidRule: Rule = { ...rule, name: "no-condition", condition: undefined };

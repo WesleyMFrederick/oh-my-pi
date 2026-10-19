@@ -5,6 +5,7 @@
 ### Added
 
 - Added `/goal` over RPC and ACP, with goal auto-continuation between turns in RPC mode (controlled by `goal.continuationModes`, now defaulting to `["interactive", "rpc"]`).
+- Added folder gating for TTSR rules on assistant text and thinking: a rule with `globs` now matches prose against the run's working set (paths of every tool call since the current USER prompt), so it fires only while the agent works under those paths. Before, a `globs` text rule never fired.
 
 ### Fixed
 

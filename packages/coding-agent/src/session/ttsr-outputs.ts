@@ -57,9 +57,11 @@ export class TtsrToolInspector {
 	/**
 	 * Completed outputs of one assistant message: all text as one reply, all
 	 * thinking as one reasoning output, and each tool call — split per file when
-	 * the tool reports entries, else its digest or serialized arguments.
+	 * the tool reports entries, else its digest or serialized arguments. The
+	 * reply and reasoning carry `workingSet` (paths of the tool calls the run
+	 * executed before this message) as their file paths, so `globs` gate them.
 	 */
-	outputs(message: AssistantMessage): TtsrOutput[] {
+	outputs(message: AssistantMessage, workingSet?: string[]): TtsrOutput[] {
 		const outputs: TtsrOutput[] = [];
 		const text: string[] = [];
 		const thinking: string[] = [];
@@ -68,11 +70,12 @@ export class TtsrToolInspector {
 			else if (block.type === "thinking") thinking.push(block.thinking);
 			else if (block.type === "toolCall") outputs.push(...this.#toolCallOutputs(block, index));
 		}
+		const gate = workingSet && workingSet.length > 0 ? { filePaths: workingSet } : {};
 		const reply = text.join("\n\n");
-		if (/\S/.test(reply)) outputs.push({ content: reply, context: { source: "text" }, subject: "reply" });
+		if (/\S/.test(reply)) outputs.push({ content: reply, context: { source: "text", ...gate }, subject: "reply" });
 		const reasoning = thinking.join("\n\n");
 		if (/\S/.test(reasoning)) {
-			outputs.push({ content: reasoning, context: { source: "thinking" }, subject: "reasoning" });
+			outputs.push({ content: reasoning, context: { source: "thinking", ...gate }, subject: "reasoning" });
 		}
 		return outputs;
 	}
