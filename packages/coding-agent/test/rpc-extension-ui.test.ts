@@ -90,6 +90,77 @@ export default function (pi) {
 `;
 
 describe("RPC extension UI", () => {
+	it("serializes opaque notification details without interpreting their kind or losing JSON values", async () => {
+		await using temp = await TempDir.create("@rpc-notification-details-");
+		const fixturePath = temp.join("runtime.ts");
+		const sourceDir = path.resolve(import.meta.dir, "../src");
+		const details = {
+			kind: "future_report",
+			version: 71,
+			payload: {
+				label: '</script><img src=x onerror="throw 1"> | \\\nsecond line',
+				values: [0, false, null, { nested: ["雪", 0.5077, 813082] }],
+			},
+		};
+		await Bun.write(
+			fixturePath,
+			`
+import { createAgentSession, Settings } from ${JSON.stringify(path.join(sourceDir, "sdk.ts"))};
+import { runRpcMode } from ${JSON.stringify(path.join(sourceDir, "modes/rpc/rpc-mode.ts"))};
+globalThis.fetch = async () => { throw new Error("Offline notification fixture refuses network"); };
+const { session } = await createAgentSession({
+  cwd: process.cwd(),
+  toolNames: [],
+  enableMCP: false,
+  enableLsp: false,
+  disableExtensionDiscovery: true,
+  settings: Settings.isolated({ "compaction.enabled": false }),
+  extensions: [pi => {
+    pi.on("session_start", (_event, ctx) => {
+      ctx.ui.notify("Structured notice", "info", { details: ${JSON.stringify(details)} });
+      ctx.ui.notify("Legacy notice", "warning");
+    });
+  }],
+});
+await runRpcMode(session);
+`,
+		);
+		const child = Bun.spawn([process.execPath, fixturePath], {
+			cwd: temp.path(),
+			env: {
+				PATH: Bun.env.PATH,
+				HOME: temp.join("home"),
+				PI_CODING_AGENT_DIR: temp.join("agent"),
+				XDG_CONFIG_HOME: temp.join("config"),
+				XDG_DATA_HOME: temp.join("data"),
+				XDG_CACHE_HOME: temp.join("cache"),
+				CI: "true",
+				PI_NO_TITLE: "1",
+			},
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 20_000,
+		});
+		const stderr = new Response(child.stderr).text();
+		const notices: Record<string, unknown>[] = [];
+		try {
+			for await (const frame of readJsonl<unknown>(child.stdout)) {
+				if (!isRecord(frame) || frame.type !== "extension_ui_request" || frame.method !== "notify") continue;
+				notices.push(frame);
+				if (notices.length === 2) break;
+			}
+		} finally {
+			child.stdin.end();
+			await child.exited;
+		}
+
+		expect(notices.map(({ id: _id, ...notice }) => notice), await stderr).toEqual([
+			{ type: "extension_ui_request", method: "notify", message: "Structured notice", notifyType: "info", details },
+			{ type: "extension_ui_request", method: "notify", message: "Legacy notice", notifyType: "warning" },
+		]);
+	}, 30_000);
+
 	it("keeps extension dialogs headless while tool selections round-trip", async () => {
 		await using temp = await TempDir.create("@rpc-headless-tool-ui-");
 		const fixturePath = temp.join("runtime.ts");
