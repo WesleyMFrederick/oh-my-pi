@@ -457,7 +457,11 @@ describe("terminal notifications", () => {
 			});
 
 			// When
-			getTerminalInfo("iterm2").sendNotification({ title: "Decision needed", body: "Choose an option", type: "ask" });
+			getTerminalInfo("iterm2").sendNotification({
+				title: "Decision needed",
+				body: "Choose an option",
+				type: "ask",
+			});
 
 			// Then
 			expect(writes).toEqual([
@@ -499,10 +503,16 @@ describe("terminal notifications", () => {
 			if (gate === "off") Bun.env.PI_NOTIFICATIONS = "off";
 			else setTerminalHeadless(true);
 			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-			const spawn = vi.spyOn(Bun, "spawn").mockImplementation((..._args: unknown[]) => ({ unref: vi.fn() }) as never);
+			const spawn = vi
+				.spyOn(Bun, "spawn")
+				.mockImplementation((..._args: unknown[]) => ({ unref: vi.fn() }) as never);
 
 			// When
-			getTerminalInfo("iterm2").sendNotification({ title: "Decision needed", body: "Choose an option", type: "ask" });
+			getTerminalInfo("iterm2").sendNotification({
+				title: "Decision needed",
+				body: "Choose an option",
+				type: "ask",
+			});
 
 			// Then
 			expect(stdout).not.toHaveBeenCalled();
@@ -517,10 +527,16 @@ describe("terminal notifications", () => {
 			if (mux === "cmux") Bun.env.CMUX_SURFACE_ID = "123e4567-e89b-12d3-a456-426614174000";
 			else Bun.env.HERDR_PANE_ID = "w6:p1";
 			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-			const spawn = vi.spyOn(Bun, "spawn").mockImplementation((..._args: unknown[]) => ({ unref: vi.fn() }) as never);
+			const spawn = vi
+				.spyOn(Bun, "spawn")
+				.mockImplementation((..._args: unknown[]) => ({ unref: vi.fn() }) as never);
 
 			// When
-			getTerminalInfo("iterm2").sendNotification({ title: "Decision needed", body: "Choose an option", type: "ask" });
+			getTerminalInfo("iterm2").sendNotification({
+				title: "Decision needed",
+				body: "Choose an option",
+				type: "ask",
+			});
 
 			// Then
 			expect(spawn).toHaveBeenCalledTimes(1);
@@ -537,7 +553,16 @@ describe("terminal notifications", () => {
 								"--body",
 								"Choose an option",
 							]
-						: ["herdr", "notification", "show", "Decision needed", "--body", "Choose an option", "--sound", "request"],
+						: [
+								"herdr",
+								"notification",
+								"show",
+								"Decision needed",
+								"--body",
+								"Choose an option",
+								"--sound",
+								"request",
+							],
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "ignore",
