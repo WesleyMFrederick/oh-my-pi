@@ -1201,7 +1201,7 @@
 - Removed the internal `autolinkSchemeScanIndex` export ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
 ### Changed
 
-- iTerm2 notifications now ring the profile's selected bell sound instead of requesting Notification Center's default sound. Completion and question notifications follow the existing notification settings.
+- iTerm2 Bell notifications now send an OSC 9 text banner terminated with `ESC \`, followed by one separate BEL for the profile's selected sound, in a single write. tmux wraps only the OSC; Zellij receives one BEL. OSC 9 title/body/string controls are sanitized, existing suppression and multiplexer routing remain in place, and no iTerm settings are changed.
 
 ## [18.4.9] - 2026-10-01
 

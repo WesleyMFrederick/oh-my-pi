@@ -159,30 +159,33 @@ export class TerminalInfo {
 	}
 
 	formatNotification(message: string | TerminalNotification): string {
-		if (this.notifyProtocol === NotifyProtocol.Bell) {
-			return NotifyProtocol.Bell;
-		}
+		const itermBell = this.id === "iterm2" && this.notifyProtocol === NotifyProtocol.Bell;
+		if (this.notifyProtocol === NotifyProtocol.Bell && !itermBell) return NotifyProtocol.Bell;
 		// Structured notifications use OSC 99's rich metadata only once the
-		// terminal confirms support; otherwise collapse to a single message line
-		// (basic OSC 99 / OSC 9 still work).
-		if (typeof message !== "string") {
-			if (this.notifyProtocol === NotifyProtocol.Osc99 && osc99CapabilitiesConfirmed) {
-				return formatOsc99Notification(message);
-			}
-			return `${this.notifyProtocol}${notificationToLine(message)}\x1b\\`;
+		// terminal confirms support; otherwise collapse to a single message line.
+		if (typeof message !== "string" && this.notifyProtocol === NotifyProtocol.Osc99 && osc99CapabilitiesConfirmed) {
+			return formatOsc99Notification(message);
 		}
-		return `${this.notifyProtocol}${message}\x1b\\`;
+		const protocol = itermBell ? NotifyProtocol.Osc9 : this.notifyProtocol;
+		const line = typeof message === "string" ? message : notificationToLine(message);
+		// OSC 9 has no encoded payload: neither title nor body may terminate the
+		// notification or inject terminal controls (including an extra bell).
+		const payload = protocol === NotifyProtocol.Osc9 ? line.replace(/[\x00-\x1f\x7f-\x9f]/gu, " ") : line;
+		return `${protocol}${payload}\x1b\\${itermBell ? NotifyProtocol.Bell : ""}`;
 	}
 
 	sendNotification(message: string | TerminalNotification): void {
 		if (isNotificationSuppressed() || isTerminalHeadless()) return;
 		const formatted = this.formatNotification(message);
+		const itermBell = this.id === "iterm2" && this.notifyProtocol === NotifyProtocol.Bell;
 		// Multiplexers that swallow or rewrite the terminal's notification get it
 		// first, innermost target first; the terminal sequence is the fallback.
+		// iTerm's Bell path includes OSC 9 too; hand over only the OSC so the
+		// multiplexer's own trailing BEL stays the single bell.
 		const routed = routeTerminalMultiplexerNotification({
 			message,
 			env: Bun.env,
-			sequence: this.notifyProtocol === NotifyProtocol.Bell ? null : formatted,
+			sequence: itermBell ? formatted.slice(0, -1) : this.notifyProtocol === NotifyProtocol.Bell ? null : formatted,
 			write: writeTerminalSequence,
 		});
 		if (routed) return;
@@ -596,7 +599,7 @@ const KNOWN_TERMINALS = Object.freeze({
 	kitty: new TerminalInfo("kitty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc99, true, true, true),
 	ghostty: new TerminalInfo("ghostty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9, false, false, false, 2),
 	wezterm: new TerminalInfo("wezterm", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9),
-	// Use the profile's selected bell sound instead of Notification Center's default sound.
+	// Bell formatting pairs an OSC 9 banner with the profile's selected bell sound.
 	iterm2: new TerminalInfo("iterm2", ImageProtocol.Iterm2, true, true, NotifyProtocol.Bell),
 	vscode: new TerminalInfo("vscode", null, true, true, NotifyProtocol.Bell),
 	alacritty: new TerminalInfo("alacritty", null, true, true, NotifyProtocol.Bell),
