@@ -847,6 +847,8 @@ For durable extension state:
 2. Rebuild state from `ctx.sessionManager.getBranch()` on `session_start`, `session_branch`, `session_tree`.
 3. Keep tool result `details` structured when state should be visible/reconstructible from tool result history.
 
+To replace the final interactive completion notification with an attention request, publish the shared [`completion-notification` custom entry](./session.md#Completion%20notification%20override) from awaited `session_stop`. Match the last assistant's timestamp and its text parts joined with `"\n"` exactly. Do not send a separate notification or publish from detached `agent_end` hooks; the completion controller sends at most one notification for the settled turn and applies `ask.notify` to a matching override.
+
 Example reconstruction pattern:
 
 ```ts
