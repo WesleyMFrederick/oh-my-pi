@@ -69,7 +69,7 @@ or (flat, without the `servers` wrapper):
 Top-level keys:
 
 - `servers` — map of server name to `ServerConfig` (optional wrapper; flat form is equivalent)
-- `idleTimeoutMs` — shut down idle language servers after this many milliseconds; omitted, zero, and negative values leave idle shutdown disabled
+- `idleTimeoutMs` — disconnect idle language-server clients after this many milliseconds; omitted, zero, and negative values leave idle shutdown disabled. The idle sweep runs once a minute and does not disconnect clients with requests in progress.
 
 Do not mix wrapped and flat server entries: when `servers` is an object, sibling keys other than `idleTimeoutMs` are not treated as servers.
 
@@ -87,7 +87,7 @@ Do not mix wrapped and flat server entries: when `servers` is an object, sibling
 | `disabled`              | `boolean`  |                        no | Set `true` to disable this server                                                                        |
 | `warmupTimeoutMs`       | `number`   |                        no | Warmup initialize timeout in milliseconds (default 5000; built-in marksman uses 2000) |
 | `isLinter`              | `boolean`  |                        no | Marks a dedicated linter/formatter server: excluded from type-intelligence, but preferred over type-checkers when choosing the `formatOnWrite` formatter |
-| `capabilities`          | `object`   |                        no | Opt-in server-specific features; see [Capabilities](#capabilities)                                       |
+| `capabilities`          | `object`   |                        no | Opt-in server-specific features; see [Capabilities](#Capabilities)                                       |
 | `workspaceReadyTimings` | `object`   |                        no | Advanced rust-analyzer workspace-readiness timing overrides; see below                                   |
 
 The required fields may be omitted from an override of a built-in server because they are inherited before validation. A genuinely new server normally needs all three. `resolvedCommand` and `createClient` are runtime-owned fields and must not be configured.
@@ -196,6 +196,12 @@ Shut down language servers that have been inactive for more than five minutes:
   "idleTimeoutMs": 300000
 }
 ```
+
+In shared-server mode, disconnecting an idle client does not immediately stop the language server. The server remains available while another session is connected, then shuts down 30 seconds after its last session leaves. A session that reconnects during that wait reuses the server and cancels shutdown.
+
+For example, `idleTimeoutMs: 120000` gives roughly 2.5–3.5 minutes from the final request completing to shared-server shutdown, provided all connected clients become idle. Later requests start a server again if it has stopped. The separate 15-minute no-session timeout only stops the shared coordinator; it does not add to the server's 30-second wait.
+
+The 30-second shared-server wait is an internal constant, not an LSP configuration field. Already-running clients cache configuration, and existing coordinator processes retain the code they loaded: reload client configuration or start a new OMP session for a changed inactivity timeout, and restart the project coordinator for a changed server wait. Do not stop a coordinator while other sessions are using it.
 
 ### Disable a server for one project, keep it globally
 

@@ -16,7 +16,7 @@ import {
 	muxServerKey,
 } from "./protocol";
 
-const SERVER_LINGER_MS = 5 * 60 * 1_000;
+const SERVER_LINGER_MS = 30 * 1_000;
 const MUX_IDLE_MS = 15 * 60 * 1_000;
 const SHUTDOWN_BUDGET_MS = 2_000;
 

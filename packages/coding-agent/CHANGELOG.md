@@ -7,6 +7,10 @@
 - Added `/goal` over RPC and ACP, with goal auto-continuation between turns in RPC mode (controlled by `goal.continuationModes`, now defaulting to `["interactive", "rpc"]`).
 - Added folder gating for TTSR rules on assistant text and thinking: a rule with `globs` now matches prose against the run's working set (paths of every tool call since the current USER prompt), so it fires only while the agent works under those paths. Before, a `globs` text rule never fired.
 
+### Changed
+
+- Shared language servers now stop 30 seconds after their last session disconnects, down from five minutes, while reconnecting sessions still cancel shutdown.
+
 ### Fixed
 
 - Fixed orphaned shared-browser tabs that failed to close waiting for the next tab open; the sweep now retries up to three times in the background.
