@@ -426,7 +426,7 @@ describe("terminal notifications", () => {
 	});
 
 	it.each(["completion", "ask"] as const)(
-		"Given iTerm, when a %s notification is delivered, then it rings the selected bell exactly once",
+		"Given iTerm, when a %s notification is delivered, then it sends one banner and one separate selected bell",
 		type => {
 			// Given
 			const terminal = getTerminalInfo("iterm2");
@@ -437,10 +437,112 @@ describe("terminal notifications", () => {
 			});
 
 			// When
-			terminal.sendNotification({ title: "omp", body: "Your attention is needed", type });
+			const title = type === "ask" ? "Decision needed" : "omp";
+			terminal.sendNotification({ title, body: "Your attention is needed", type });
 
 			// Then
-			expect(writes).toEqual(["\x07"]);
+			expect(writes).toEqual([`\x1b]9;${title}: Your attention is needed\x1b\\\x07`]);
+		},
+	);
+
+	it.each(["tmux", "zellij"] as const)(
+		"Given iTerm inside %s, when a decision notification is delivered, then only its OSC is wrapped and one BEL remains outside",
+		mux => {
+			// Given
+			Bun.env[mux === "tmux" ? "TMUX" : "ZELLIJ"] = "1";
+			const writes: string[] = [];
+			vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+				writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+				return true;
+			});
+
+			// When
+			getTerminalInfo("iterm2").sendNotification({ title: "Decision needed", body: "Choose an option", type: "ask" });
+
+			// Then
+			expect(writes).toEqual([
+				mux === "tmux"
+					? "\x1bPtmux;\x1b\x1b]9;Decision needed: Choose an option\x1b\x1b\\\x1b\\\x07"
+					: "\x1b]9;Decision needed: Choose an option\x1b\\\x07",
+			]);
+		},
+	);
+
+	it.each(["iterm2", "ghostty"] as const)(
+		"Given %s OSC 9 output, when title, body or string text contain controls, then controls cannot inject terminators or extra bells",
+		id => {
+			// Given
+			const writes: string[] = [];
+			vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+				writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+				return true;
+			});
+			const terminal = getTerminalInfo(id);
+
+			// When
+			terminal.sendNotification({ title: "Decision needed\x07\x1b", body: "Choose\nA\x9cB\x7f", type: "ask" });
+			terminal.sendNotification("Decision needed:\x07Choose\nA\x9cB");
+
+			// Then
+			const bell = id === "iterm2" ? "\x07" : "";
+			expect(writes).toEqual([
+				`\x1b]9;Decision needed  : Choose A B \x1b\\${bell}`,
+				`\x1b]9;Decision needed: Choose A B\x1b\\${bell}`,
+			]);
+		},
+	);
+
+	it.each(["off", "headless"] as const)(
+		"Given iTerm with notifications %s, when a decision notification is requested, then neither banner nor bell is emitted",
+		gate => {
+			// Given
+			if (gate === "off") Bun.env.PI_NOTIFICATIONS = "off";
+			else setTerminalHeadless(true);
+			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+			const spawn = vi.spyOn(Bun, "spawn").mockImplementation((..._args: unknown[]) => ({ unref: vi.fn() }) as never);
+
+			// When
+			getTerminalInfo("iterm2").sendNotification({ title: "Decision needed", body: "Choose an option", type: "ask" });
+
+			// Then
+			expect(stdout).not.toHaveBeenCalled();
+			expect(spawn).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each(["cmux", "herdr"] as const)(
+		"Given iTerm inside %s, when a decision notification is routed out of band, then no second OSC banner or bell is emitted",
+		mux => {
+			// Given
+			if (mux === "cmux") Bun.env.CMUX_SURFACE_ID = "123e4567-e89b-12d3-a456-426614174000";
+			else Bun.env.HERDR_PANE_ID = "w6:p1";
+			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+			const spawn = vi.spyOn(Bun, "spawn").mockImplementation((..._args: unknown[]) => ({ unref: vi.fn() }) as never);
+
+			// When
+			getTerminalInfo("iterm2").sendNotification({ title: "Decision needed", body: "Choose an option", type: "ask" });
+
+			// Then
+			expect(spawn).toHaveBeenCalledTimes(1);
+			expect(spawn).toHaveBeenCalledWith({
+				cmd:
+					mux === "cmux"
+						? [
+								"cmux",
+								"notify",
+								"--surface",
+								"123e4567-e89b-12d3-a456-426614174000",
+								"--title",
+								"Decision needed",
+								"--body",
+								"Choose an option",
+							]
+						: ["herdr", "notification", "show", "Decision needed", "--body", "Choose an option", "--sound", "request"],
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			expect(stdout).not.toHaveBeenCalled();
 		},
 	);
 
@@ -462,20 +564,18 @@ describe("terminal notifications", () => {
 
 	it("under tmux, Bell-protocol sendNotification stays a plain BEL (no DCS wrap)", () => {
 		Bun.env.TMUX = "/tmp/tmux-1000/default,1234,0";
-		mutableTerminal.notifyProtocol = NotifyProtocol.Bell;
 		const writes: string[] = [];
 		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
 			writes.push(typeof chunk === "string" ? chunk : chunk.toString());
 			return true;
 		});
 
-		TERMINAL.sendNotification("ping");
+		getTerminalInfo("base").sendNotification("ping");
 
 		expect(writes).toEqual(["\x07"]);
 	});
 
 	it("Bell-protocol sendNotification also fans out to D-Bus when the gate is open", () => {
-		mutableTerminal.notifyProtocol = NotifyProtocol.Bell;
 		const writes: string[] = [];
 		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
 			writes.push(typeof chunk === "string" ? chunk : chunk.toString());
@@ -484,7 +584,7 @@ describe("terminal notifications", () => {
 		vi.spyOn(desktopNotify, "shouldDeliverDesktopNotification").mockReturnValue(true);
 		const dbus = vi.spyOn(desktopNotify, "sendDesktopNotification").mockImplementation(() => {});
 
-		TERMINAL.sendNotification({ title: "Session", body: "Complete" });
+		getTerminalInfo("base").sendNotification({ title: "Session", body: "Complete" });
 
 		// BEL still hits stdout for tmux monitor-bell / X11 urgency / audible bell.
 		expect(writes).toEqual(["\x07"]);
@@ -494,12 +594,11 @@ describe("terminal notifications", () => {
 	});
 
 	it("skips the D-Bus dispatch when the gate forbids it (kept side-effect free)", () => {
-		mutableTerminal.notifyProtocol = NotifyProtocol.Bell;
 		vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 		vi.spyOn(desktopNotify, "shouldDeliverDesktopNotification").mockReturnValue(false);
 		const dbus = vi.spyOn(desktopNotify, "sendDesktopNotification").mockImplementation(() => {});
 
-		TERMINAL.sendNotification("ping");
+		getTerminalInfo("base").sendNotification("ping");
 
 		expect(dbus).not.toHaveBeenCalled();
 	});

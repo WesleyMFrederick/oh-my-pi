@@ -217,19 +217,19 @@ export class TerminalInfo {
 	}
 
 	formatNotification(message: string | TerminalNotification): string {
-		if (this.notifyProtocol === NotifyProtocol.Bell) {
-			return NotifyProtocol.Bell;
-		}
+		const itermBell = this.id === "iterm2" && this.notifyProtocol === NotifyProtocol.Bell;
+		if (this.notifyProtocol === NotifyProtocol.Bell && !itermBell) return NotifyProtocol.Bell;
 		// Structured notifications use OSC 99's rich metadata only once the
-		// terminal confirms support; otherwise collapse to a single message line
-		// (basic OSC 99 / OSC 9 still work).
-		if (typeof message !== "string") {
-			if (this.notifyProtocol === NotifyProtocol.Osc99 && osc99CapabilitiesConfirmed) {
-				return formatOsc99Notification(message);
-			}
-			return `${this.notifyProtocol}${notificationToLine(message)}\x1b\\`;
+		// terminal confirms support; otherwise collapse to a single message line.
+		if (typeof message !== "string" && this.notifyProtocol === NotifyProtocol.Osc99 && osc99CapabilitiesConfirmed) {
+			return formatOsc99Notification(message);
 		}
-		return `${this.notifyProtocol}${message}\x1b\\`;
+		const protocol = itermBell ? NotifyProtocol.Osc9 : this.notifyProtocol;
+		const line = typeof message === "string" ? message : notificationToLine(message);
+		// OSC 9 has no encoded payload: neither title nor body may terminate the
+		// notification or inject terminal controls (including an extra bell).
+		const payload = protocol === NotifyProtocol.Osc9 ? line.replace(/[\x00-\x1f\x7f-\x9f]/gu, " ") : line;
+		return `${protocol}${payload}\x1b\\${itermBell ? NotifyProtocol.Bell : ""}`;
 	}
 
 	sendNotification(message: string | TerminalNotification): void {
@@ -241,6 +241,7 @@ export class TerminalInfo {
 		if (sendHerdrNotification(message)) return;
 		if (sendCmuxNotification(message)) return;
 		const formatted = this.formatNotification(message);
+		const itermBell = this.id === "iterm2" && this.notifyProtocol === NotifyProtocol.Bell;
 		// Under tmux, terminals whose notify protocol is OSC 9 / OSC 99 would
 		// otherwise lose the notification entirely: tmux does not forward bare
 		// OSC 9/99 to the outer terminal, and the bare sequence does not flag
@@ -248,10 +249,12 @@ export class TerminalInfo {
 		// DCS passthrough envelope so users with `allow-passthrough on` still
 		// get the desktop toast, then append a BEL so `monitor-bell` flags the
 		// pane/window for everyone else — the only signal a backgrounded pane
-		// has that the agent finished or is waiting for input. `Bell` protocol
-		// already self-flags via tmux's bell monitoring, so leave it alone.
-		if (this.notifyProtocol !== NotifyProtocol.Bell && isInsideTmux()) {
-			process.stdout.write(`${wrapTmuxPassthrough(formatted)}\x07`);
+		// has that the agent finished or is waiting for input. iTerm's Bell path
+		// includes OSC 9 too; keep its one BEL outside the passthrough envelope.
+		// Other Bell terminals already self-flag, so leave them alone.
+		if ((this.notifyProtocol !== NotifyProtocol.Bell || itermBell) && isInsideTmux()) {
+			const osc = itermBell ? formatted.slice(0, -1) : formatted;
+			process.stdout.write(`${wrapTmuxPassthrough(osc)}\x07`);
 			return;
 		}
 		// Zellij drops OSC 9/99 and has no DCS passthrough envelope, but raises its
@@ -668,7 +671,7 @@ const KNOWN_TERMINALS = Object.freeze({
 	kitty: new TerminalInfo("kitty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc99, true, true, true),
 	ghostty: new TerminalInfo("ghostty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9, false, false, false, 2),
 	wezterm: new TerminalInfo("wezterm", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9),
-	// Use the profile's selected bell sound instead of Notification Center's default sound.
+	// Bell formatting pairs an OSC 9 banner with the profile's selected bell sound.
 	iterm2: new TerminalInfo("iterm2", ImageProtocol.Iterm2, true, true, NotifyProtocol.Bell),
 	vscode: new TerminalInfo("vscode", null, true, true, NotifyProtocol.Bell),
 	alacritty: new TerminalInfo("alacritty", null, true, true, NotifyProtocol.Bell),
