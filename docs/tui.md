@@ -173,6 +173,16 @@ These renderers are mounted by `ToolExecutionComponent`.
 
 On Tern Surface Protocol terminals, tools may additionally supply `describeCall(args, options)` and `describeResult(result, options, args?)`, returning a semantic `NativeToolView` or `undefined`. Custom components can implement `describe(cx)` and `handleNativeEvent(event)`; otherwise the native backend falls back to their rendered rows. See [the core renderer contract](./tui-core-renderer.md#native-rendering-tern-surface-protocol).
 
+## Terminal notifications
+
+`TERMINAL.sendNotification(...)` owns suppression and multiplexer routing. iTerm2 retains `NotifyProtocol.Bell`: formatting produces an OSC 9 notification (`ESC ] 9 ; title: body ESC \`) followed by one separate BEL, so the banner carries the supplied text and the bell uses the profile's selected sound. String notifications use the same OSC 9 path. C0, DEL, and C1 controls in title/body/string text become spaces before emission; ordinary prefixes such as `Decision needed` are preserved.
+
+Delivery uses one stdout write. Under tmux only the OSC is passthrough-wrapped, with the single BEL outside the envelope. Under Zellij the unwrapped OSC and one BEL are written together; Zellij may swallow the OSC but can flag the pane from the BEL. Other Bell terminals stay BEL-only, other terminal protocols retain their routing, and Herdr/cmux continue to own delivery when present.
+
+This does not change iTerm profile or shared preferences. Banner visibility, selected bell sound, and timing still depend on iTerm/macOS settings; writing both sequences together does not guarantee simultaneous OS presentation.
+
+For an extension-specific final attention request, use the generic [`completion-notification` session entry](./session.md#Completion%20notification%20override) rather than sending another notification beside the completion controller.
+
 ## Lifecycle and cancellation
 
 - `dispose()` is optional at type level but should be implemented when you own timers, subprocesses, watchers, sockets, or overlays. It must be idempotent: containers propagate disposal, and reset/removal paths may converge.
