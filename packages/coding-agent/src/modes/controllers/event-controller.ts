@@ -2,7 +2,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
-import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
+import { type Component, Loader, TERMINAL, type TerminalNotification } from "@oh-my-pi/pi-tui";
 import { formatDuration, isRecord, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
@@ -77,6 +77,7 @@ import { streamingStringKeysForTool, ToolArgsRevealController } from "./tool-arg
 import { createToolCallBlock } from "./tool-call-block";
 
 import {
+	cfgAskNotify,
 	cfgCompletionNotify,
 	cfgDisplayCacheMissMarker,
 	cfgDisplayShowTokenUsage,
@@ -2980,9 +2981,6 @@ export class EventController {
 	}
 
 	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
-		const notify = cfgCompletionNotify.get(settings);
-		if (notify === "off") return;
-
 		// Warp structured OSC 777 already drives native completion UX when the
 		// protocol is negotiated — avoid a second legacy desktop/OSC-9 toast.
 		if (isWarpCliAgentProtocolActive()) return;
@@ -2994,6 +2992,54 @@ export class EventController {
 		// keeps the two notifications mutually exclusive for one settled turn.
 		const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
 		if (last?.stopReason === "aborted" || last?.stopReason === "error") return;
+
+		let notification: TerminalNotification | undefined;
+		if (
+			(last?.stopReason === "stop" || last?.stopReason === "length") &&
+			!last.content.some(part => part.type === "toolCall")
+		) {
+			// session_stop is awaited before this UI settle; agent_end extension
+			// hooks are detached and cannot reliably publish completion metadata.
+			const branch = this.ctx.sessionManager.getBranch();
+			let messageText: string | undefined;
+			for (let index = branch.length - 1; index >= 0; index--) {
+				const entry = branch[index]!;
+				if (entry.type !== "custom" || entry.customType !== "completion-notification") continue;
+				const data = entry.data;
+				if (
+					!isRecord(data) ||
+					typeof data.messageTimestamp !== "number" ||
+					!Number.isFinite(data.messageTimestamp) ||
+					data.messageTimestamp !== last.timestamp ||
+					typeof data.messageText !== "string" ||
+					!isRecord(data.notification) ||
+					typeof data.notification.title !== "string" ||
+					typeof data.notification.body !== "string" ||
+					data.notification.type !== "ask" ||
+					data.notification.actions !== "focus"
+				) {
+					continue;
+				}
+				messageText ??= last.content
+					.filter(part => part.type === "text")
+					.map(part => part.text)
+					.join("\n");
+				if (data.messageText !== messageText) continue;
+				notification = {
+					title: data.notification.title,
+					body: data.notification.body,
+					type: "ask",
+					actions: "focus",
+				};
+				break;
+			}
+		}
+		const notify = notification ? cfgAskNotify.get(settings) : cfgCompletionNotify.get(settings);
+		if (notify === "off") return;
+		if (notification) {
+			TERMINAL.sendNotification(notification);
+			return;
+		}
 
 		const sessionName = this.ctx.sessionManager.getSessionName();
 		TERMINAL.sendNotification({

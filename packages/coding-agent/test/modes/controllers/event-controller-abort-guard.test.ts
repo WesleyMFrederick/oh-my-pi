@@ -25,7 +25,7 @@ import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
-import { cfgCompletionNotify, cfgErrorNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgAskNotify, cfgCompletionNotify, cfgErrorNotify } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 const originalWarpProtocolVersion = process.env.WARP_CLI_AGENT_PROTOCOL_VERSION;
 
@@ -55,7 +55,7 @@ afterEach(() => {
 	restoreWarpProtocolEnvironment();
 });
 
-type StopReason = "stop" | "aborted" | "error";
+type StopReason = "stop" | "length" | "aborted" | "error";
 
 function makeAssistantMessage(stopReason: StopReason): AssistantMessage {
 	return {
@@ -141,6 +141,247 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(spy).toHaveBeenCalledTimes(0);
 	});
+});
+
+describe("EventController — completion-notification custom entries", () => {
+	const notification = {
+		title: "Decision needed",
+		body: "Choose the notification behavior",
+		type: "ask",
+		actions: "focus",
+	} as const;
+
+	it.each(["stop", "length"] as const)(
+		"Given a matching complete final-message marker with %s stop reason, when the turn settles, then it replaces completion with one ask notification",
+		async stopReason => {
+			// Given
+			const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			cfgCompletionNotify.override(settings, "off");
+			cfgAskNotify.override(settings, "on");
+			const assistant: AssistantMessage = {
+				...makeAssistantMessage(stopReason),
+				content: [
+					{ type: "text", text: "First line" },
+					{ type: "thinking", thinking: "not displayed" },
+					{ type: "text", text: "Last line" },
+				],
+			};
+			const ctx = makeTurnEndContext();
+			ctx.sessionManager.appendCustomEntry("completion-notification", {
+				messageTimestamp: assistant.timestamp,
+				messageText: "First line\nLast line",
+				notification,
+			});
+			const controller = new EventController(ctx);
+
+			// When
+			await controller.handleEvent(makeAgentEndEvent([assistant]));
+
+			// Then
+			expect(spy.mock.calls).toEqual([[notification]]);
+		},
+	);
+
+	it.each(["stop", "length"] as const)(
+		"Given a matching marker with a tool call and %s stop reason, when the turn settles, then it cannot override completion",
+		stopReason => {
+			// Given
+			const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			cfgCompletionNotify.override(settings, "on");
+			cfgAskNotify.override(settings, "on");
+			const assistant: AssistantMessage = {
+				...makeAssistantMessage(stopReason),
+				content: [
+					{ type: "text", text: "hello" },
+					{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "example.ts" } },
+				],
+			};
+			const ctx = makeContext();
+			ctx.sessionManager.appendCustomEntry("completion-notification", {
+				messageTimestamp: assistant.timestamp,
+				messageText: "hello",
+				notification,
+			});
+
+			// When
+			new EventController(ctx).sendCompletionNotification(makeAgentEndEvent([assistant]));
+
+			// Then
+			expect(spy.mock.calls).toEqual([
+				[{ title: "test-session", body: "Complete", type: "completion", actions: "focus" }],
+			]);
+		},
+	);
+
+	it("Given ask notifications are off, when a matching marker settles, then it sends neither ask nor fallback completion", () => {
+		// Given
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		cfgCompletionNotify.override(settings, "on");
+		cfgAskNotify.override(settings, "off");
+		const assistant = makeAssistantMessage("stop");
+		const ctx = makeContext();
+		ctx.sessionManager.appendCustomEntry("completion-notification", {
+			messageTimestamp: assistant.timestamp,
+			messageText: "hello",
+			notification,
+		});
+
+		// When
+		new EventController(ctx).sendCompletionNotification(makeAgentEndEvent([assistant]));
+
+		// Then
+		expect(spy).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ name: "a previous assistant's timestamp", messageTimestamp: 1000, messageText: "hello" },
+		{ name: "different text at the same timestamp", messageTimestamp: 1001, messageText: "old card" },
+		{ name: "normalized rather than exact text", messageTimestamp: 1001, messageText: "hello\n" },
+	])("Given a marker for $name, when the last assistant settles, then normal completion is retained", data => {
+		// Given
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		cfgCompletionNotify.override(settings, "on");
+		cfgAskNotify.override(settings, "on");
+		const previous = { ...makeAssistantMessage("stop"), timestamp: 1000 };
+		const assistant = { ...makeAssistantMessage("stop"), timestamp: 1001 };
+		const ctx = makeContext();
+		ctx.sessionManager.appendCustomEntry("completion-notification", {
+			messageTimestamp: data.messageTimestamp,
+			messageText: data.messageText,
+			notification,
+		});
+
+		// When
+		new EventController(ctx).sendCompletionNotification(makeAgentEndEvent([previous, assistant]));
+
+		// Then
+		expect(spy.mock.calls).toEqual([
+			[{ title: "test-session", body: "Complete", type: "completion", actions: "focus" }],
+		]);
+	});
+
+	it.each([
+		{ name: "missing data", data: undefined },
+		{ name: "null data", data: null },
+		{ name: "a string timestamp", data: { messageTimestamp: "1001", messageText: "hello", notification } },
+		{ name: "a non-finite timestamp", data: { messageTimestamp: Number.NaN, messageText: "hello", notification } },
+		{ name: "missing message text", data: { messageTimestamp: 1001, notification } },
+		{ name: "a null notification", data: { messageTimestamp: 1001, messageText: "hello", notification: null } },
+		{
+			name: "a non-string title",
+			data: { messageTimestamp: 1001, messageText: "hello", notification: { ...notification, title: 42 } },
+		},
+		{
+			name: "a missing body",
+			data: {
+				messageTimestamp: 1001,
+				messageText: "hello",
+				notification: { title: "Decision needed", type: "ask", actions: "focus" },
+			},
+		},
+		{
+			name: "a different notification type",
+			data: { messageTimestamp: 1001, messageText: "hello", notification: { ...notification, type: "completion" } },
+		},
+		{
+			name: "different actions",
+			data: { messageTimestamp: 1001, messageText: "hello", notification: { ...notification, actions: "report" } },
+		},
+	])("Given $name in a marker, when the turn settles, then malformed metadata cannot replace completion", ({ data }) => {
+		// Given
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		cfgCompletionNotify.override(settings, "on");
+		const assistant = { ...makeAssistantMessage("stop"), timestamp: 1001 };
+		const ctx = makeContext();
+		ctx.sessionManager.appendCustomEntry("completion-notification", data);
+
+		// When
+		new EventController(ctx).sendCompletionNotification(makeAgentEndEvent([assistant]));
+
+		// Then
+		expect(spy.mock.calls).toEqual([
+			[{ title: "test-session", body: "Complete", type: "completion", actions: "focus" }],
+		]);
+	});
+
+	it("Given several entries, when the turn settles, then the latest valid matching marker wins over newer stale or malformed entries", () => {
+		// Given
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		cfgAskNotify.override(settings, "on");
+		const assistant = { ...makeAssistantMessage("stop"), timestamp: 1001 };
+		const ctx = makeContext();
+		const data = { messageTimestamp: 1001, messageText: "hello", notification };
+		ctx.sessionManager.appendCustomEntry("completion-notification", data);
+		const latest = { ...notification, body: "Use the latest displayed question" };
+		ctx.sessionManager.appendCustomEntry("completion-notification", { ...data, notification: latest });
+		ctx.sessionManager.appendCustomEntry("completion-notification", { ...data, notification: null });
+		ctx.sessionManager.appendCustomEntry("completion-notification", { ...data, messageTimestamp: 1000 });
+
+		// When
+		new EventController(ctx).sendCompletionNotification(makeAgentEndEvent([assistant]));
+
+		// Then
+		expect(spy.mock.calls).toEqual([[latest]]);
+	});
+
+	it("Given a notified decision turn, when a later turn has no marker, then it cannot reuse the prior ask payload", () => {
+		// Given
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		cfgCompletionNotify.override(settings, "on");
+		cfgAskNotify.override(settings, "on");
+		const assistant = { ...makeAssistantMessage("stop"), timestamp: 1001 };
+		const ctx = makeContext();
+		ctx.sessionManager.appendCustomEntry("completion-notification", {
+			messageTimestamp: 1001,
+			messageText: "hello",
+			notification,
+		});
+		const controller = new EventController(ctx);
+
+		// When
+		controller.sendCompletionNotification(makeAgentEndEvent([assistant]));
+		controller.sendCompletionNotification(makeAgentEndEvent([{ ...assistant, timestamp: 1002 }]));
+
+		// Then
+		expect(spy.mock.calls).toEqual([
+			[notification],
+			[{ title: "test-session", body: "Complete", type: "completion", actions: "focus" }],
+		]);
+	});
+
+	it.each(["aborted", "error", "nonterminal", "streaming", "warp"] as const)(
+		"Given a matching marker and a %s turn, when the real turn-end path runs, then existing notification gates still apply",
+		async outcome => {
+			// Given
+			const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			cfgCompletionNotify.override(settings, "on");
+			cfgAskNotify.override(settings, "on");
+			cfgErrorNotify.override(settings, "on");
+			const assistant = makeAssistantMessage(outcome === "aborted" || outcome === "error" ? outcome : "stop");
+			const ctx = makeTurnEndContext();
+			ctx.sessionManager.appendCustomEntry("completion-notification", {
+				messageTimestamp: assistant.timestamp,
+				messageText: "hello",
+				notification,
+			});
+			if (outcome === "streaming") {
+				Object.defineProperty(ctx.session, "isStreaming", { value: true, configurable: true });
+			}
+			if (outcome === "warp") process.env.WARP_CLI_AGENT_PROTOCOL_VERSION = "1";
+			const event = makeAgentEndEvent([assistant]);
+			if (outcome === "nonterminal") event.isTerminal = false;
+
+			// When
+			await new EventController(ctx).handleEvent(event);
+
+			// Then
+			expect(spy.mock.calls).toEqual(
+				outcome === "error"
+					? [[{ title: "test-session", body: "Stopped with error", type: "error", actions: "focus" }]]
+					: [],
+			);
+		},
+	);
 });
 
 describe("EventController.sendErrorNotification", () => {
