@@ -287,22 +287,25 @@ describe("EventController — completion-notification custom entries", () => {
 			name: "different actions",
 			data: { messageTimestamp: 1001, messageText: "hello", notification: { ...notification, actions: "report" } },
 		},
-	])("Given $name in a marker, when the turn settles, then malformed metadata cannot replace completion", ({ data }) => {
-		// Given
-		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
-		cfgCompletionNotify.override(settings, "on");
-		const assistant = { ...makeAssistantMessage("stop"), timestamp: 1001 };
-		const ctx = makeContext();
-		ctx.sessionManager.appendCustomEntry("completion-notification", data);
+	])(
+		"Given $name in a marker, when the turn settles, then malformed metadata cannot replace completion",
+		({ data }) => {
+			// Given
+			const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+			cfgCompletionNotify.override(settings, "on");
+			const assistant = { ...makeAssistantMessage("stop"), timestamp: 1001 };
+			const ctx = makeContext();
+			ctx.sessionManager.appendCustomEntry("completion-notification", data);
 
-		// When
-		new EventController(ctx).sendCompletionNotification(makeAgentEndEvent([assistant]));
+			// When
+			new EventController(ctx).sendCompletionNotification(makeAgentEndEvent([assistant]));
 
-		// Then
-		expect(spy.mock.calls).toEqual([
-			[{ title: "test-session", body: "Complete", type: "completion", actions: "focus" }],
-		]);
-	});
+			// Then
+			expect(spy.mock.calls).toEqual([
+				[{ title: "test-session", body: "Complete", type: "completion", actions: "focus" }],
+			]);
+		},
+	);
 
 	it("Given several entries, when the turn settles, then the latest valid matching marker wins over newer stale or malformed entries", () => {
 		// Given
