@@ -44,7 +44,7 @@ import type {
 import { projectScope, scopeKey, type UnitPolicy, type UnitScope } from "../protocol";
 
 /** Grace after the last lease before an unused server is stopped. */
-const SERVER_LINGER_MS = 5 * 60 * 1_000;
+const SERVER_LINGER_MS = 30 * 1_000;
 const SHUTDOWN_BUDGET_MS = 2_000;
 const KILL_GRACE_MS = 2_000;
 /** How long a tunnel told its server exited may stay open to flush before the unit closes it. */

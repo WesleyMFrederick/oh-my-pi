@@ -69,7 +69,7 @@ or (flat, without the `servers` wrapper):
 Top-level keys:
 
 - `servers` — map of server name to `ServerConfig` (optional wrapper; flat form is equivalent)
-- `idleTimeoutMs` — shut down idle language servers after this many milliseconds; omitted, zero, and negative values leave idle shutdown disabled
+- `idleTimeoutMs` — disconnect idle language-server clients after this many milliseconds; omitted, zero, and negative values leave idle shutdown disabled. The idle sweep runs once a minute and does not disconnect clients with requests in progress.
 
 Do not mix wrapped and flat server entries: when `servers` is an object, sibling keys other than `idleTimeoutMs` are not treated as servers.
 
@@ -197,6 +197,12 @@ Shut down language servers that have been inactive for more than five minutes:
 	"idleTimeoutMs": 300000
 }
 ```
+
+In shared-server mode, disconnecting an idle client does not immediately stop the language server. The server remains available while another session is connected, then shuts down 30 seconds after its last session leaves. A session that reconnects during that wait reuses the server and cancels shutdown.
+
+For example, `idleTimeoutMs: 120000` gives roughly 2.5–3.5 minutes from the final request completing to shared-server shutdown, provided all connected clients become idle. Later requests start a server again if it has stopped.
+
+The 30-second shared-server wait is an internal constant, not an LSP configuration field. Already-running clients cache configuration, and a running omp daemon keeps the code it loaded: reload client configuration or start a new OMP session for a changed inactivity timeout, and restart the omp daemon for a changed server wait.
 
 ### Disable a server for one project, keep it globally
 
