@@ -1199,6 +1199,9 @@
 
 - Removed the internal `urlTokenPossible` export ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
 - Removed the internal `autolinkSchemeScanIndex` export ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
+### Changed
+
+- iTerm2 notifications now ring the profile's selected bell sound instead of requesting Notification Center's default sound. Completion and question notifications follow the existing notification settings.
 
 ## [18.4.9] - 2026-10-01
 
