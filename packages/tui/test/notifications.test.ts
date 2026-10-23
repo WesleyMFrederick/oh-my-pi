@@ -425,6 +425,25 @@ describe("terminal notifications", () => {
 		expect(unref).toHaveBeenCalledTimes(1);
 	});
 
+	it.each(["completion", "ask"] as const)(
+		"Given iTerm, when a %s notification is delivered, then it rings the selected bell exactly once",
+		type => {
+			// Given
+			const terminal = getTerminalInfo("iterm2");
+			const writes: string[] = [];
+			vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+				writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+				return true;
+			});
+
+			// When
+			terminal.sendNotification({ title: "omp", body: "Your attention is needed", type });
+
+			// Then
+			expect(writes).toEqual(["\x07"]);
+		},
+	);
+
 	it("under tmux, OSC-protocol sendNotification wraps for passthrough and appends BEL", () => {
 		Bun.env.TMUX = "/tmp/tmux-1000/default,1234,0";
 		mutableTerminal.notifyProtocol = NotifyProtocol.Osc99;
