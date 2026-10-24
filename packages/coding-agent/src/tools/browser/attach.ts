@@ -444,6 +444,9 @@ export function shouldPreserveConnectedBrowserFocus(target?: string): boolean {
  * `preferVisible` is for attaching to a browser a human is using: among equally
  * usable tabs, take the one that is actually foregrounded rather than whichever
  * target CDP happens to enumerate first.
+ *
+ * A browser that starts without any page target (e.g. chrome-headless-shell)
+ * gets one new page, unless a `matcher` was requested: a blank page cannot match.
  */
 export async function pickElectronTarget(
 	browser: Browser,
@@ -462,7 +465,13 @@ export async function pickElectronTarget(
 
 	const fallbackPages = await browser.pages();
 	if (!fallbackPages.length) {
-		throw new ToolError("No page targets available on the attached browser");
+		if (options.matcher) throw new ToolError("No page targets available on the attached browser");
+		try {
+			return await browser.newPage();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new ToolError(`No page targets available on the attached browser, and creating one failed: ${message}`);
+		}
 	}
 	return pickPageFromList(fallbackPages, options);
 }

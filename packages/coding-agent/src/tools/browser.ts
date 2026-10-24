@@ -402,7 +402,8 @@ async function openOnKind(
 	// connections where installation alone exceeds that budget.
 	// The download promise is module-cached, so a caller abort here leaves it
 	// finishing in the background and the next open picks up the result.
-	if (kind.kind === "headless") await untilAborted(signal, () => ensureChromiumExecutable());
+	if (kind.kind === "headless")
+		await untilAborted(signal, () => ensureChromiumExecutable({ headless: kind.headless }));
 
 	// The requested timeout must cover the *entire* open — browser
 	// acquisition (CDP discovery/connect), queued tab acquisition, worker

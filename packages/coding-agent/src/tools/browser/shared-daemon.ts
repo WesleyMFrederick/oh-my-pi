@@ -37,9 +37,13 @@ export interface SharedBrowserEndpoint {
 	projectDir: string;
 }
 
-/** Stable broker daemon name for the shared automation browser. */
+/**
+ * Stable broker daemon name for the shared automation browser. The headless
+ * name changed when headless moved to chrome-headless-shell, so a still-running
+ * full-Chrome daemon under the old name is never adopted and idles out.
+ */
 export function sharedBrowserDaemonName(headless: boolean): string {
-	return headless ? "omp.browser.headless" : "omp.browser.headed";
+	return headless ? "omp.browser.headless-shell" : "omp.browser.headed";
 }
 
 function wsEndpointOf(snapshot: DaemonSnapshot | undefined): string | undefined {

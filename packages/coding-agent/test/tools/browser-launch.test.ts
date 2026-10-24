@@ -4,12 +4,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	chromiumExecutableProbeForTest,
+	puppeteerHeadlessMode,
 	resolveSharedBrowserLaunchSpec,
 	stealthIgnoreDefaultArgsForTest,
 	systemChromiumCandidatesForTest,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { computeExecutablePath, detectBrowserPlatform } from "@oh-my-pi/pi-utils/browsers";
+import { Browser, computeExecutablePath, detectBrowserPlatform } from "@oh-my-pi/pi-utils/browsers";
 import { APP_NAME } from "@oh-my-pi/pi-utils/dirs";
 import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
 
@@ -272,4 +273,58 @@ describe("browser executable selection", () => {
 			}
 		},
 	);
+
+	it.skipIf(process.platform === "win32")(
+		"selects the managed chrome-headless-shell for headless launches on macOS",
+		async () => {
+			const tempDir = TempDir.createSync("@browser-macos-shell-");
+			try {
+				const home = path.join(tempDir.path(), "home");
+				const xdgCache = path.join(tempDir.path(), "cache");
+				for (const xdg of [xdgCache, path.join(tempDir.path(), "data"), path.join(tempDir.path(), "state")]) {
+					fs.mkdirSync(path.join(xdg, APP_NAME), { recursive: true });
+				}
+				const env = {
+					...process.env,
+					HOME: home,
+					XDG_CACHE_HOME: xdgCache,
+					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
+					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+					OMP_BROWSER_PROBE_PLATFORM: "darwin",
+					OMP_BROWSER_PROBE_HEADLESS: "1",
+					PUPPETEER_EXECUTABLE_PATH: "",
+				};
+
+				const cacheDir = path.join(xdgCache, APP_NAME, "puppeteer");
+				const platform = detectBrowserPlatform();
+				if (!platform) throw new Error("unsupported host platform for headless-shell selection test");
+				const headlessShell = computeExecutablePath({
+					buildId: PUPPETEER_REVISIONS["chrome-headless-shell"],
+					cacheDir,
+					platform,
+					browser: Browser.CHROME_HEADLESS_SHELL,
+				});
+				await Bun.write(headlessShell, "#!/bin/sh\necho 'chrome-headless-shell'\n");
+				fs.chmodSync(headlessShell, 0o755);
+
+				const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], { env, stdout: "pipe", stderr: "pipe" });
+				const stderr = new TextDecoder().decode(result.stderr);
+
+				expect(result.exitCode, stderr).toBe(0);
+				expect(new TextDecoder().decode(result.stdout)).toBe(headlessShell);
+			} finally {
+				await tempDir.remove();
+			}
+		},
+	);
+});
+
+describe("puppeteerHeadlessMode", () => {
+	it("uses puppeteer's shell mode only for a headless chrome-headless-shell executable", () => {
+		expect(puppeteerHeadlessMode(false, "/x/chrome-headless-shell")).toBe(false);
+		expect(puppeteerHeadlessMode(true, "/x/chrome-headless-shell")).toBe("shell");
+		expect(puppeteerHeadlessMode(true, "C:\\x\\chrome-headless-shell.exe")).toBe("shell");
+		expect(puppeteerHeadlessMode(true, "/x/Google Chrome for Testing")).toBe(true);
+		expect(puppeteerHeadlessMode(true, undefined)).toBe(true);
+	});
 });

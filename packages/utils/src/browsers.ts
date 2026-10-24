@@ -31,6 +31,11 @@ export enum BrowserPlatform {
 	WIN32 = "win32",
 	WIN64 = "win64",
 }
+/** Managed browser products; values are Puppeteer's cache directory names. */
+export enum Browser {
+	CHROME = "chrome",
+	CHROME_HEADLESS_SHELL = "chrome-headless-shell",
+}
 type ChromeForTestingPlatform = Exclude<BrowserPlatform, BrowserPlatform.LINUX_ARM>;
 
 function requireChromeForTestingPlatform(platform: BrowserPlatform): ChromeForTestingPlatform {
@@ -50,6 +55,8 @@ export interface ComputeExecutablePathOptions {
 	buildId: string;
 	cacheDir: string;
 	platform?: BrowserPlatform;
+	/** Browser product to locate or install. Defaults to full Chrome for Testing. */
+	browser?: Browser;
 }
 
 /** Inputs used to download and install a browser. */
@@ -77,10 +84,15 @@ export function detectBrowserPlatform(): BrowserPlatform | undefined {
 }
 
 /** Return the Chrome-for-Testing archive URL for a browser build. */
-export function getDownloadUrl(platform: BrowserPlatform, buildId: string, baseUrl = CHROME_FOR_TESTING_BASE_URL): URL {
+export function getDownloadUrl(
+	platform: BrowserPlatform,
+	buildId: string,
+	baseUrl = CHROME_FOR_TESTING_BASE_URL,
+	browser = Browser.CHROME,
+): URL {
 	const archivePlatform = chromeArchivePlatform(platform);
 	const root = baseUrl.replace(/\/$/, "");
-	return new URL(`${root}/${buildId}/${archivePlatform}/chrome-${archivePlatform}.zip`);
+	return new URL(`${root}/${buildId}/${archivePlatform}/${browser}-${archivePlatform}.zip`);
 }
 
 /** Compute the executable path in Puppeteer's cache layout. */
@@ -88,7 +100,15 @@ export function computeExecutablePath(options: ComputeExecutablePathOptions): st
 	const detectedPlatform = options.platform ?? detectBrowserPlatform();
 	if (!detectedPlatform) throw new Error("Cannot determine a browser platform for this host");
 	const platform = requireChromeForTestingPlatform(detectedPlatform);
-	const installDir = installationDir(options.cacheDir, platform, options.buildId);
+	const browser = options.browser ?? Browser.CHROME;
+	const installDir = installationDir(options.cacheDir, platform, options.buildId, browser);
+	if (browser === Browser.CHROME_HEADLESS_SHELL) {
+		const executable =
+			platform === BrowserPlatform.WIN32 || platform === BrowserPlatform.WIN64
+				? "chrome-headless-shell.exe"
+				: "chrome-headless-shell";
+		return path.join(installDir, `chrome-headless-shell-${chromeArchivePlatform(platform)}`, executable);
+	}
 	switch (platform) {
 		case BrowserPlatform.LINUX:
 			return path.join(installDir, "chrome-linux64", "chrome");
@@ -117,12 +137,13 @@ export function computeExecutablePath(options: ComputeExecutablePathOptions): st
 	}
 }
 
-/** Download and unpack Chrome into Puppeteer's existing cache layout. */
+/** Download and unpack Chrome or chrome-headless-shell into Puppeteer's existing cache layout. */
 export async function install(options: InstallOptions): Promise<InstalledBrowser> {
 	const platform = options.platform ?? detectBrowserPlatform();
 	if (!platform) throw new Error("Cannot determine a browser platform for this host");
+	const browser = options.browser ?? Browser.CHROME;
 	const executablePath = computeExecutablePath({ ...options, platform });
-	const installPath = installationDir(options.cacheDir, platform, options.buildId);
+	const installPath = installationDir(options.cacheDir, platform, options.buildId, browser);
 	if (await pathExists(executablePath)) {
 		return { buildId: options.buildId, platform, path: installPath, executablePath };
 	}
@@ -139,7 +160,7 @@ export async function install(options: InstallOptions): Promise<InstalledBrowser
 				const stagingPath = path.join(options.cacheDir, `.browser-${nonce}`);
 				try {
 					await downloadArchive(
-						getDownloadUrl(platform, options.buildId, options.baseUrl),
+						getDownloadUrl(platform, options.buildId, options.baseUrl, browser),
 						archivePath,
 						options.downloadProgressCallback,
 					);
@@ -177,8 +198,8 @@ function chromeArchivePlatform(platform: BrowserPlatform): string {
 	}
 }
 
-function installationDir(cacheDir: string, platform: BrowserPlatform, buildId: string): string {
-	return path.join(cacheDir, "chrome", `${platform}-${buildId}`);
+function installationDir(cacheDir: string, platform: BrowserPlatform, buildId: string, browser: Browser): string {
+	return path.join(cacheDir, browser, `${platform}-${buildId}`);
 }
 
 function isMissingPath(error: unknown): boolean {

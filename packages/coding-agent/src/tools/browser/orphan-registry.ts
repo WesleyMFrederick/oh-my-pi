@@ -1,6 +1,6 @@
 /**
  * Durable ownership registry for targets in the project-shared broker-owned
- * Chromium (`omp.browser.headless`/`omp.browser.headed`).
+ * Chromium (`omp.browser.headless-shell`/`omp.browser.headed`).
  *
  * The shared browser outlives any single omp process, but tab ownership is
  * otherwise tracked only in that process's memory (`tab-supervisor`'s `tabs`

@@ -174,6 +174,9 @@ describe("browser open — failed spawned-app acquisition reaps its owned proces
 				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/test",
 				targets: () => [],
 				pages: async () => [],
+				newPage: async () => {
+					throw new Error("Target.createTarget unsupported");
+				},
 			},
 			pid: 4242,
 			subprocess: { pid: 4242, exitCode: null },

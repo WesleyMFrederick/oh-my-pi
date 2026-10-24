@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added chrome-headless-shell support to the managed browser installer (`Browser` option on `install`, `computeExecutablePath`, and `getDownloadUrl`).
+
 ## [18.4.9] - 2026-10-01
 
 ### Added
