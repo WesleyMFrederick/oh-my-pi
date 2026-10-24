@@ -898,6 +898,7 @@ const STEALTH_PATCH_SCRIPTS = [
 ];
 
 function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_SCRIPTS): string {
+	const nativeIframeAttribute = "data-omp-stealth-natives";
 	const joint = scripts
 		.map(
 			script => `
@@ -909,6 +910,9 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 		.join(";\n");
 
 	return `(() => {
+				try {
+					if (window.frameElement?.hasAttribute("${nativeIframeAttribute}")) return;
+				} catch {}
 				const Page_Function_toString = Function.prototype.toString;
 				const Page_FunctionToStringDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, "toString");
 				const Page_Proxy = Proxy;
@@ -926,6 +930,7 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 				const container = document.head ?? document.documentElement;
 				if (container) {
 					iframe = document.createElement("iframe");
+					iframe.setAttribute("${nativeIframeAttribute}", "");
 					iframe.style.display = "none";
 					container.appendChild(iframe);
 					if (!iframe.contentWindow) iframe = null;
