@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- Fixed stack-overflow page errors from the stealth bootstrap in headless browser tabs.
 - Fixed orphaned shared-browser tabs that failed to close waiting for the next tab open; the sweep now retries up to three times in the background.
 - Fixed a release or borrow silently skipping a browser launch ledger entry when its directory could not be read.
 - Fixed orphaned shared-browser tabs surviving a sweep when Puppeteer held a stale browser-target id; tabs now close over the browser-level CDP connection.
@@ -25,6 +26,8 @@
 - Fixed tabs of dead omp clients lingering in the shared browser while other clients keep it open: opening or releasing a tab now closes their targets, and a recycled pid no longer hides them.
 - Fixed launched-browser cleanup gaps: kill releases always go through the launch ledger so a borrowing process keeps the browser, ledger updates are serialized across processes, a browser that cannot be recorded fails the open and is killed, RPC teardown confirms the browser dead within 1.5 s of `SIGTERM`/`SIGHUP`/stdin EOF, a stop whose status check fails is no longer treated as stopped, and web-search browser fallback honors `browser.idleCloseSec`.
 - Fixed browser processes outliving closed agents: the shared Chromium now stops when no omp process holds it, launched headless browsers idle-close and are reaped after their owner dies, RPC `SIGTERM`/`SIGHUP` release browser tabs, and a stop that fails now reports the pid instead of silently succeeding.
+- Fixed headless browser screenshots timing out on macOS by running managed headless tabs on chrome-headless-shell instead of full Chrome.
+- Fixed `browser.open({ app: { path } })` failing with "No page targets available" for browsers that start without a tab, such as chrome-headless-shell.
 - Fixed RPC and ACP command discovery omitting user prompt templates that appear in the interactive slash-command picker.
 
 ## [17.2.15] - 2026-08-12

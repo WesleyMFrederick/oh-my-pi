@@ -218,11 +218,16 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  * preference and fall back to Chrome for Testing. The managed browser is
  * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
  * platform detection fails (puppeteer default resolution takes over).
+ *
+ * Headless callers pass `headless: true` to get the managed
+ * `chrome-headless-shell` build instead of full Chrome: full Chrome's
+ * `--headless=new` hangs `Page.captureScreenshot` on macOS arm64
+ * (vercel-labs/agent-browser#1437). Headed callers get full Chrome.
  * Exported so real-browser tests can probe launchability and skip on hosts
  * missing Chrome's system libraries.
  */
-let chromiumExecutablePromise: Promise<string | undefined> | undefined;
-export async function ensureChromiumExecutable(): Promise<string | undefined> {
+const chromiumExecutablePromises = new Map<BrowsersNs.Browser, Promise<string | undefined>>();
+export async function ensureChromiumExecutable(options: { headless?: boolean } = {}): Promise<string | undefined> {
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
 	// macOS: never route a background daemon through the user's GUI Chrome
@@ -233,8 +238,10 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 		if (sysChrome) return sysChrome;
 	}
 
-	chromiumExecutablePromise ??= (async () => {
-		const browsers = await loadBrowsers();
+	const browsers = await loadBrowsers();
+	const product = options.headless ? browsers.Browser.CHROME_HEADLESS_SHELL : browsers.Browser.CHROME;
+	let pending = chromiumExecutablePromises.get(product);
+	pending ??= (async () => {
 		const platform = browsers.detectBrowserPlatform();
 		if (!platform) {
 			logger.warn("Could not detect browser platform; relying on puppeteer default resolution");
@@ -242,24 +249,30 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 		}
 		const cacheDir = getPuppeteerDir();
 		const { PUPPETEER_REVISIONS } = await import("puppeteer-core/internal/revisions.js");
-		const buildId = PUPPETEER_REVISIONS.chrome;
+		const buildId =
+			product === browsers.Browser.CHROME_HEADLESS_SHELL
+				? PUPPETEER_REVISIONS["chrome-headless-shell"]
+				: PUPPETEER_REVISIONS.chrome;
 		const executablePath = browsers.computeExecutablePath({
 			buildId,
 			cacheDir,
 			platform,
+			browser: product,
 		});
 		if (fs.existsSync(executablePath)) return executablePath;
 
-		logger.warn("Downloading Chromium for puppeteer (first browser use)", {
+		const label = product === browsers.Browser.CHROME_HEADLESS_SHELL ? "Chrome headless shell" : "Chromium";
+		logger.warn(`Downloading ${label} for puppeteer (first browser use)`, {
 			buildId,
 			platform,
 			cacheDir,
 		});
-		await withDownload("Chromium", tracker =>
+		await withDownload(label, tracker =>
 			browsers.install({
 				buildId,
 				cacheDir,
 				platform,
+				browser: product,
 				downloadProgressCallback: ({ downloadedBytes, totalBytes }) => {
 					if (totalBytes <= 0) {
 						tracker.update({ loaded: downloadedBytes });
@@ -291,14 +304,29 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 				return sysChrome;
 			}
 		}
-		chromiumExecutablePromise = undefined;
+		chromiumExecutablePromises.delete(product);
 		throw new ToolError(
 			`Failed to install Chromium for puppeteer: ${(err as Error).message}. ` +
 				"Set PUPPETEER_EXECUTABLE_PATH to use an existing Chrome/Chromium binary, or install one manually.",
 		);
 	});
+	chromiumExecutablePromises.set(product, pending);
 
-	return await chromiumExecutablePromise;
+	return await pending;
+}
+
+/**
+ * Puppeteer `headless` launch option for the resolved executable. `"shell"`
+ * makes puppeteer pass `--headless` (the chrome-headless-shell mode) instead
+ * of `--headless=new`, which that binary does not support.
+ */
+export function puppeteerHeadlessMode(headless: boolean, executablePath: string | undefined): boolean | "shell" {
+	if (!headless) return false;
+	const name = executablePath
+		?.split(/[\\/]/)
+		.pop()
+		?.replace(/\.exe$/i, "");
+	return name === "chrome-headless-shell" ? "shell" : true;
 }
 
 let resolvedChromium: string | null | undefined; // undefined = unchecked; null = not found
@@ -536,9 +564,9 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		launchArgs.push(`--user-data-dir=${userDataDir}`);
 	}
 	try {
-		const executablePath = await ensureChromiumExecutable();
+		const executablePath = await ensureChromiumExecutable({ headless: opts.headless });
 		const browser = await puppeteer.launch({
-			headless: opts.headless,
+			headless: puppeteerHeadlessMode(opts.headless, executablePath),
 			defaultViewport: opts.headless ? initialViewport : null,
 			executablePath,
 			args: launchArgs,
@@ -573,13 +601,13 @@ export async function resolveSharedBrowserLaunchSpec(opts: {
 	userDataDir: string;
 	viewport?: { width: number; height: number };
 }): Promise<SharedBrowserLaunchSpec | null> {
-	const executablePath = await ensureChromiumExecutable();
+	const executablePath = await ensureChromiumExecutable({ headless: opts.headless });
 	if (!executablePath) return null;
 	const puppeteer = await loadPuppeteer();
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
 	const ignored = new Set(stealthIgnoreDefaultArgs(executablePath));
 	const defaults = await puppeteer.defaultArgs({
-		headless: opts.headless,
+		headless: puppeteerHeadlessMode(opts.headless, executablePath),
 		args: buildHeadlessLaunchArgs(vp),
 		userDataDir: opts.userDataDir,
 	});
@@ -870,6 +898,7 @@ const STEALTH_PATCH_SCRIPTS = [
 ];
 
 function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_SCRIPTS): string {
+	const nativeIframeAttribute = "data-omp-stealth-natives";
 	const joint = scripts
 		.map(
 			script => `
@@ -881,6 +910,9 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 		.join(";\n");
 
 	return `(() => {
+				try {
+					if (window.frameElement?.hasAttribute("${nativeIframeAttribute}")) return;
+				} catch {}
 				const Page_Function_toString = Function.prototype.toString;
 				const Page_FunctionToStringDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, "toString");
 				const Page_Proxy = Proxy;
@@ -898,6 +930,7 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 				const container = document.head ?? document.documentElement;
 				if (container) {
 					iframe = document.createElement("iframe");
+					iframe.setAttribute("${nativeIframeAttribute}", "");
 					iframe.style.display = "none";
 					container.appendChild(iframe);
 					if (!iframe.contentWindow) iframe = null;

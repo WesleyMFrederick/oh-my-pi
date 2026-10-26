@@ -144,6 +144,34 @@ describe("pickElectronTarget", () => {
 		);
 	});
 
+	test("creates a page when the attached browser has no page target", async () => {
+		const created = fakePage({ url: "about:blank", title: "" });
+		const browser = {
+			targets: () => [fakeTarget("browser", null)],
+			pages: async () => [],
+			newPage: async () => created,
+		} as unknown as Browser;
+
+		await expect(pickElectronTarget(browser)).resolves.toBe(created);
+	});
+
+	test("does not create a page when a matcher was requested and no page target exists", async () => {
+		let newPageCalled = false;
+		const browser = {
+			targets: () => [fakeTarget("browser", null)],
+			pages: async () => [],
+			newPage: async () => {
+				newPageCalled = true;
+				return fakePage({ url: "about:blank", title: "" });
+			},
+		} as unknown as Browser;
+
+		await expect(pickElectronTarget(browser, { matcher: "google" })).rejects.toThrow(
+			"No page targets available on the attached browser",
+		);
+		expect(newPageCalled).toBe(false);
+	});
+
 	test("prefers the foreground tab when asked to, without disturbing default order", async () => {
 		const background = fakePage({ url: "https://example.com/", title: "Example" });
 		const foreground = fakePage({ url: "https://example.org/", title: "Example Org", visible: true });

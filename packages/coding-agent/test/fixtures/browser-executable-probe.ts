@@ -3,5 +3,5 @@ import { ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browse
 const platform = process.env.OMP_BROWSER_PROBE_PLATFORM;
 if (platform) Object.defineProperty(process, "platform", { value: platform });
 
-const executable = await ensureChromiumExecutable();
+const executable = await ensureChromiumExecutable({ headless: process.env.OMP_BROWSER_PROBE_HEADLESS === "1" });
 process.stdout.write(executable ?? "");
