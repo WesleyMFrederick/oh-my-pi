@@ -11,17 +11,18 @@ import {
 	type StreamFn,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
-import type {
-	Context,
-	CredentialDisabledEvent,
-	Effort,
-	Message,
-	Model,
-	ModelUsageHealth,
-	ProviderSessionState,
-	ServiceTier,
-	ServiceTierByFamily,
-	SimpleStreamOptions,
+import {
+	type Context,
+	type CredentialDisabledEvent,
+	type Effort,
+	type Message,
+	type Model,
+	type ModelUsageHealth,
+	type ProviderSessionState,
+	type ServiceTier,
+	type ServiceTierByFamily,
+	type SimpleStreamOptions,
+	streamSimple,
 } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
@@ -188,6 +189,7 @@ import {
 	USER_INTERRUPT_LABEL,
 	wrapSteeringForModel,
 } from "./session/messages";
+import { createModelCallJournalStream } from "./session/model-call-journal";
 import { clampProviderContextImages, dropUnreadableContextImages } from "./session/provider-image-budget";
 import {
 	expandDefaultRetryFallbackChains,
@@ -4189,7 +4191,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const settingsBoundStreamFn = wrapStreamFnWithBlobUrlFallback(
 			wrapStreamFnWithProviderConcurrency(
 				settings,
-				createSettingsAwareStreamFn(settings, undefined, {
+				createSettingsAwareStreamFn(settings, createModelCallJournalStream(sessionManager, streamSimple), {
 					canAutoAccept: streamModel =>
 						anthropicSlowModeHasNoSiblingHeadroom(modelRegistry.authStorage, streamModel, session?.sessionId),
 					notify: (level, message) => session?.emitNotice(level, message, "anthropic-slow-mode"),

@@ -342,9 +342,28 @@ Publish `completion-notification` only during awaited `session_stop`, after conf
 
 The `notification` object requires string `title` and `body`, `type: "ask"`, and `actions: "focus"`. The host does not parse extension-specific cards or add a title prefix. A matching override uses `ask.notify` instead of `completion.notify`; when ask notifications are off it does not fall back to a completion notification. Abort, error, superseded/non-terminal settle, Warp, headless, and terminal-notification suppression/routing gates still apply. The controller does not retain a selected override between turns.
 
+#### Full-context export records
+
+The SDK records model calls as `custom` entries with `customType: "omp:model-call"`. Each record has `version: 1`, a shared `requestId`, model identity (`provider`, `id`, `api`), and a `phase`:
+
+- `request`: `context` contains the transformed system prompt, messages, and complete tool schemas passed to the provider adapter. Each entry of `tools` and `inactiveTools` keeps only the model-facing `Tool` fields (`name`, `description`, `parameters`, `strict`, `deferLoading`, `customFormat`, `customWireName`, `native`, `examples`); runtime tool objects also hold session and runner back-references, which once made each request record about 10 MB.
+- `payload`: `payload` contains the provider request after payload hooks have run. This is not a capture of exact HTTP bytes or headers.
+- `response`: `message` contains the complete assistant response, including returned thinking and tool calls.
+- `error`: `message`, when available, and `error` retain the failed call's response or dispatch error.
+
+This includes calls through the SDK's shared stream, including auxiliary turns and compaction. Calls dispatched outside that stream are not recorded. Records belong to the session that dispatched the call; late records after a session switch are written back through the original session's storage. A replaced in-memory session cannot accept late records and fails explicitly. Journaling materializes persistent session files before provider dispatch; serialization or persistence failures can fail the call.
+
+`omp:user-submission` records the original interactive text and images before input hooks, including Ctrl+Enter. `omp:prompt-submission` records text, images, attribution, and submission time at the prompt API boundary before command or template expansion. A submission may be transformed, handled locally, or dropped without reaching the model. These audit entries do not enter model context.
+
+HTML exports display saved injections even when `display: false`, alongside original submissions, text sent to the LLM, and its reply text. Request and auxiliary response text loads only when its disclosure is opened; the input view prefers the post-hook payload over the earlier context snapshot. Raw API objects, tool schemas, binary data, and full stored-entry sections are not rendered. Complete tool-result text can be opened separately. Text search is cached and does not render unopened requests. Use the **All** tree filter to browse stored records and branches; child sessions remain accessible through their tool results.
+
+Capture applies to new calls only. Older sessions cannot recover context that was never stored. The export labels the current system/tool snapshot separately from historical call records. Exports and session files now contain complete prompts, injected context, attachments, tool data, and original submissions—including secrets typed into commands. Review them before sharing. The journal does not add transport API keys or authentication headers.
+
 ### `custom_message`
 
 Extension-provided message that does participate in LLM context. `content` can be a string or text/image content blocks, and `attribution` records whether the user or agent initiated it.
+
+`display` controls terminal visibility only; HTML export shows both visible and hidden messages.
 
 ```json
 {
