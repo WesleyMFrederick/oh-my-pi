@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- `/guided-goal` now appears and works in RPC/ACP hosts such as Paseo.
 - Fixed orphaned shared-browser tabs that failed to close waiting for the next tab open; the sweep now retries up to three times in the background.
 - Fixed a release or borrow silently skipping a browser launch ledger entry when its directory could not be read.
 - Fixed orphaned shared-browser tabs surviving a sweep when Puppeteer held a stale browser-target id; tabs now close over the browser-level CDP connection.

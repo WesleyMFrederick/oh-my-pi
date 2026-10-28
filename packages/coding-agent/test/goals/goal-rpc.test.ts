@@ -198,6 +198,27 @@ describe("/goal over RPC/ACP", () => {
 		expect(harness.session.getActiveToolNames()).toContain("goal");
 	});
 
+	it("/guided-goal arms the goal tool and returns a hidden interview kickoff", async () => {
+		const result = await harness.command("/guided-goal ship the release");
+
+		expect(result).toEqual({
+			prompt: expect.stringContaining("ship the release"),
+			synthetic: true,
+		});
+		expect(result).toMatchObject({ prompt: expect.stringContaining("<rough-goal>") });
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+		expect(harness.goalMode.enabled).toBe(false);
+	});
+
+	it("/guided-goal refuses while a goal is active", async () => {
+		await harness.command("/goal Ship the release");
+
+		const result = await harness.command("/guided-goal x");
+
+		expect(result).toEqual({ consumed: true });
+		expect(harness.output.at(-1)).toContain("Goal mode is already active");
+	});
+
 	// Failure guarded: /goal silently doing nothing (or being sent to the model) where no controller exists.
 	it("reports loudly when the host provides no goal controller", async () => {
 		const bare = await createHarness(fixture, {}, { withController: false });
