@@ -1572,7 +1572,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 							await watchAndReportPromptResult({
 								ticket,
 								startPrompt: onPromptAdmitted =>
-									session.prompt(builtinResult.prompt, { images: command.images, onPromptAdmitted }),
+									session.prompt(builtinResult.prompt, {
+										images: command.images,
+										onPromptAdmitted,
+										synthetic: builtinResult.synthetic === true ? true : undefined,
+									}),
 								results: promptResults,
 								onError: onPromptError(id, "prompt"),
 								extensionUserMessageTracker,

@@ -132,6 +132,7 @@ class FakeAgentSession {
 		return Settings.instance;
 	}
 	promptCalls: string[] = [];
+	promptOptions: Array<{ synthetic?: boolean } | undefined> = [];
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
 	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
 	skillsSettings = { enableSkillCommands: true };
@@ -225,8 +226,9 @@ class FakeAgentSession {
 		return [...this.#listeners];
 	}
 
-	async prompt(text: string): Promise<boolean> {
+	async prompt(text: string, options?: { synthetic?: boolean }): Promise<boolean> {
 		this.promptCalls.push(text);
+		this.promptOptions.push(options);
 		this.isStreaming = true;
 		this.sessionManager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
 		const assistantMessage = makeAssistantMessage("pong");
@@ -335,6 +337,18 @@ class FakeAgentSession {
 	}
 
 	setActiveToolsByName(_toolNames: string[]): void {}
+
+	getEnabledToolNames(): string[] {
+		return [];
+	}
+
+	getGoalModeState(): undefined {
+		return undefined;
+	}
+
+	getVibeModeState(): undefined {
+		return undefined;
+	}
 
 	setClientBridge(_bridge: unknown): void {}
 
@@ -2124,6 +2138,24 @@ describe("ACP agent", () => {
 			harness.abortController.abort();
 			await Bun.sleep(0);
 		}
+	});
+
+	// Failure guarded: the dispatcher dropping `synthetic`, so the client shows the interview kickoff as a typed user message.
+	it("sends the /guided-goal interview kickoff as a synthetic prompt", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/guided-goal ship the thing" }],
+		});
+
+		expect(response.stopReason).toBe("end_turn");
+		expect(session.promptCalls).toEqual([expect.stringContaining("ship the thing")]);
+		expect(session.promptOptions).toEqual([expect.objectContaining({ synthetic: true })]);
+
+		harness.abortController.abort();
 	});
 
 	it("streams the retried turn inside the /retry prompt turn", async () => {

@@ -1,10 +1,51 @@
+import { prompt } from "@oh-my-pi/pi-utils";
 import { formatGoalDetails, GOAL_TEXT, parseGoalBudget, parseGoalSubcommand } from "../../goals/command-text";
 import type { GoalModeController } from "../../goals/mode-controller";
 import { cfgGoalEnabled } from "../../goals/settings";
+import guidedGoalInterviewPrompt from "../../prompts/goals/guided-goal-interview.md" with { type: "text" };
+import type { AgentSession } from "../../session/agent-session";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 import { commandConsumed, usage } from "./parse";
 
 const GOAL_SUBCOMMAND_LIST = "set|show|pause|resume|drop|budget";
+
+/** Expose the goal tool for the interview and preserve the toolset restored when the goal exits. */
+export async function armGuidedGoal(
+	session: AgentSession,
+	goalMode: GoalModeController,
+	rough: string | undefined,
+): Promise<string> {
+	const enabledTools = session.getEnabledToolNames();
+	goalMode.setPreviousTools(enabledTools.filter(name => name !== "goal"));
+	if (!enabledTools.includes("goal")) {
+		await session.setActiveToolsByName([...enabledTools, "goal"]);
+	}
+	return prompt.render(guidedGoalInterviewPrompt, { initial: rough?.trim() || undefined });
+}
+
+export async function handleGuidedGoalTextCommand(
+	command: ParsedSlashCommand,
+	runtime: SlashCommandRuntime,
+): Promise<SlashCommandResult> {
+	const { goalMode, session } = runtime;
+	const say = async (text: string): Promise<SlashCommandResult> => {
+		await runtime.output(text);
+		return commandConsumed();
+	};
+	if (!goalMode) return await say("Goal mode is not available in this mode.");
+	if (session.getPlanModeState()?.enabled) return await say("Exit plan mode first.");
+	if (session.getVibeModeState()?.enabled) return await say("Exit vibe mode first.");
+	if (!cfgGoalEnabled.get(runtime.settings)) return await say(GOAL_TEXT.disabled);
+	if (goalMode.enabled) return await say(GOAL_TEXT.alreadyActive);
+	if (goalMode.getPausedState()) return await say(GOAL_TEXT.resumeFirst);
+
+	const kickoff = await armGuidedGoal(session, goalMode, command.args);
+	if (session.isStreaming) {
+		await session.followUp(kickoff, undefined, { synthetic: true });
+		return commandConsumed({ agentInvoked: true });
+	}
+	return { prompt: kickoff, synthetic: true };
+}
 
 /** Loud line shown when a goal is running but nothing will keep it going between turns. */
 function autoContinueOffLine(goalMode: GoalModeController): string | undefined {
