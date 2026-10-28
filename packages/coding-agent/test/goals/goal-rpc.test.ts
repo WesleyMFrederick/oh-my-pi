@@ -7,7 +7,9 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { GoalModeController } from "@oh-my-pi/pi-coding-agent/goals/mode-controller";
 import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
+import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { createRpcGoalMode } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import type { RpcPromptResultFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -366,4 +368,34 @@ describe("RPC goal continuation", () => {
 			"Auto-continue is off in rpc mode; add it to goal.continuationModes to keep working between turns.",
 		);
 	});
+});
+
+describe("/guided-goal through the RPC prompt dispatcher", () => {
+	// Failure guarded: the dispatcher dropping `synthetic`, so Paseo shows the interview kickoff as a typed user message.
+	it("starts the interview turn with a hidden developer message and reports its prompt_result", async () => {
+		await using temp = await TempDir.create("@pi-guided-goal-rpc-");
+		const client = new RpcClient({
+			command: [process.execPath, path.join(import.meta.dir, "..", "fixtures", "queued-message-rpc-agent.ts")],
+			cwd: temp.path(),
+			env: { PI_CODING_AGENT_DIR: temp.path(), PI_NO_TITLE: "1" },
+		});
+		const results: RpcPromptResultFrame[] = [];
+		const unsubscribe = client.onPromptResult(result => {
+			results.push(result);
+		});
+		try {
+			await client.start();
+			await client.promptAndWait("/guided-goal ship the thing", undefined, 10_000);
+
+			expect(results).toEqual([expect.objectContaining({ agentInvoked: true, status: "completed" })]);
+			const messages = await client.getMessages();
+			const kickoff = messages.find(message => message.role === "developer" || message.role === "user");
+			expect(kickoff).toMatchObject({ role: "developer", synthetic: true });
+			expect(JSON.stringify(kickoff?.content)).toContain("ship the thing");
+			expect(messages.some(message => message.role === "user")).toBe(false);
+		} finally {
+			unsubscribe();
+			await client.stop();
+		}
+	}, 30_000);
 });
