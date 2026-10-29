@@ -302,7 +302,7 @@ describe("createModelCallJournalStream", () => {
 		expect(await fs.readdir(dir)).toEqual([]);
 	});
 
-	for (const operation of ["branch", "forkFrom", "forkFromWithArtifacts", "persistCopy"] as const) {
+	for (const operation of ["fork", "branch", "forkFrom", "forkFromWithArtifacts", "persistCopy"] as const) {
 		it(`keeps inherited model-call bodies readable after ${operation}`, async () => {
 			const source = createManager();
 			await (
@@ -314,7 +314,9 @@ describe("createModelCallJournalStream", () => {
 			await source.flush();
 			const sourceFile = source.getSessionFile()!;
 			let destination = source;
-			if (operation === "branch") {
+			if (operation === "fork") {
+				await source.fork();
+			} else if (operation === "branch") {
 				source.createBranchedSession(source.getLeafId()!);
 				await (
 					await createModelCallJournalStream(source, provider({ body: "new payload" }, reply("new response")))(

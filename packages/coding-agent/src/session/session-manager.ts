@@ -2288,6 +2288,7 @@ export class SessionManager {
 		this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
 
 		await this.#rewriteAtomically();
+		await copyModelCallRecords(oldSessionFile, this.#sessionFile);
 		return { oldSessionFile, newSessionFile: this.#sessionFile };
 	}
 
