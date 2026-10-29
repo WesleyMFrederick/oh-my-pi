@@ -4,12 +4,14 @@
 
 ### Added
 
+- Added text-first HTML exports with original submissions, hidden injections, complete tool-result text, and captured LLM input and replies for new calls; repeated request text loads only when opened.
 - Added `/goal` over RPC and ACP, with goal auto-continuation between turns in RPC mode (controlled by `goal.continuationModes`, now defaulting to `["interactive", "rpc"]`).
 - Added folder gating for TTSR rules on assistant text and thinking: a rule with `globs` now matches prose against the run's working set (paths of every tool call since the current USER prompt), so it fires only while the agent works under those paths. Before, a `globs` text rule never fired.
 - Added the shared `completion-notification` custom session entry: awaited stop hooks can replace final completion with one matching attention request, honoring `ask.notify` and ignoring malformed or stale turn metadata.
 
 ### Changed
 
+- Model-call records now live in a per-session `model-calls.ndjson` beside the transcript, keeping transcripts small and fast to reopen while preserving full HTML exports.
 - Shared language servers now stop 30 seconds after their last session disconnects, down from five minutes, while reconnecting sessions still cancel shutdown.
 
 ### Fixed

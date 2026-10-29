@@ -37,7 +37,8 @@
 
       // Session render context: scopes entry lookups and tool-view host
       // wiring to one transcript (main session or an embedded subagent).
-      const mainSctx = { entries, prefix: '', idPrefix: 'entry-' };
+      const mainSctx = { entries, prefix: '', idPrefix: 'entry-',
+        payloadRequests: new Set(entries.filter(e => e.type === 'custom' && e.customType === 'omp:model-call' && e.data?.phase === 'payload' && !e.data.unavailable).map(e => e.data.requestId)) };
 
       // ============================================================
       // URL PARAMETER HANDLING
@@ -300,15 +301,9 @@
       let filterMode = 'default';
       let searchQuery = '';
 
-      function hasTextContent(content) {
+      function hasDisplayContent(content) {
         if (typeof content === 'string') return Boolean(canonicalizeMessage(content));
-        if (Array.isArray(content)) {
-          for (const c of content) {
-            if (c.type === 'text' && c.text) {
-              if (canonicalizeMessage(c.text)) return true;
-            }
-          }
-        }
+        if (Array.isArray(content)) return content.some(block => block.type !== 'toolCall');
         return false;
       }
 
@@ -324,6 +319,8 @@
       }
 
       function getSearchableText(entry, label) {
+        const cached = searchableText.get(entry);
+        if (cached !== undefined) return cached;
         const parts = [];
         if (label) parts.push(label);
 
@@ -357,7 +354,17 @@
             break;
         }
 
-        return parts.join(' ').toLowerCase();
+        if (entry.type === 'custom' && entry.customType === 'omp:model-call') {
+          parts.push(entry.data?.phase);
+          if (entry.data?.phase !== 'request' || !mainSctx.payloadRequests.has(entry.data.requestId)) {
+            parts.push(collectModelText(entry.data?.payload ?? entry.data?.context ?? entry.data?.message ?? entry.data?.error));
+          }
+        } else if (entry.type === 'custom') {
+          parts.push(collectModelText(entry.data));
+        }
+        const text = parts.join(' ').toLowerCase();
+        searchableText.set(entry, text);
+        return text;
       }
 
       /**
@@ -373,17 +380,20 @@
 
           // Always show current leaf
           if (isCurrentLeaf) return true;
+          if (entry.type === 'custom' && entry.customType === 'omp:model-call' &&
+              entry.data?.phase === 'request' && mainSctx.payloadRequests.has(entry.data.requestId)) return false;
 
           // Hide assistant messages with only tool calls (no text) unless error/aborted
           if (entry.type === 'message' && entry.message.role === 'assistant') {
             const msg = entry.message;
-            const hasText = hasTextContent(msg.content);
+            const hasContent = hasDisplayContent(msg.content);
             const isErrorOrAborted = msg.stopReason && msg.stopReason !== 'stop' && msg.stopReason !== 'toolUse';
-            if (!hasText && !isErrorOrAborted) return false;
+            if (!hasContent && !isErrorOrAborted) return false;
           }
 
           // Apply filter mode
-          const isSettingsEntry = ['label', 'custom', 'model_change', 'thinking_level_change', 'mode_change', 'ttsr_injection', 'session_init', 'credential_pin'].includes(entry.type);
+          const isSettingsEntry = ['label', 'custom', 'model_change', 'thinking_level_change', 'mode_change', 'ttsr_injection', 'session_init', 'credential_pin'].includes(entry.type) &&
+            !(entry.type === 'custom' && ['omp:model-call', 'omp:user-submission', 'omp:prompt-submission'].includes(entry.customType));
           let passesFilter = true;
 
           switch (filterMode) {
@@ -477,6 +487,70 @@
         return div.innerHTML;
       }
 
+      const deferredText = new Map();
+      const searchableText = new WeakMap();
+      let deferredTextSeq = 0;
+      const omittedTextFields = new Set(['tools', 'inactiveTools', 'tool_choice', 'tool_config', 'toolConfig',
+        'parameters', 'input_schema', 'response_format', 'generationConfig', 'generation_config',
+        'metadata', 'usage', 'cost', 'model', 'provider', 'api', 'id', 'requestId', 'phase', 'version',
+        'type', 'name', 'mimeType', 'mime_type', 'data', 'url', 'image_url', 'imageUrl', 'signature',
+        'thoughtSignature', 'encrypted_content', 'timestamp', 'stopReason', 'attribution']);
+      const textFields = new Set(['text', 'thinking', 'content', 'system', 'systemPrompt', 'instructions',
+        'prompt', 'input', 'output', 'summary', 'notes', 'task', 'reason', 'message', 'error',
+        'additionalContext', 'additional_context']);
+
+      function collectModelText(value) {
+        const parts = [];
+        function visit(item, includeText) {
+          if (typeof item === 'string') {
+            if (includeText && item && !/^data:image\//i.test(item)) parts.push(item);
+          } else if (Array.isArray(item)) {
+            for (const child of item) visit(child, includeText);
+          } else if (item && typeof item === 'object') {
+            for (const [key, child] of Object.entries(item)) {
+              if (key === 'role') parts.push('[' + child + ']');
+              else if (!omittedTextFields.has(key)) visit(child, textFields.has(key));
+            }
+          }
+        }
+        visit(value, true);
+        return parts.join('\n\n');
+      }
+
+      function renderTextDisclosure(label, value) {
+        const key = String(++deferredTextSeq);
+        deferredText.set(key, value);
+        return `<details class="audit-disclosure" data-model-text="${key}"><summary>${escapeHtml(label)}</summary></details>`;
+      }
+
+      document.addEventListener('toggle', event => {
+        const details = event.target;
+        const key = details.dataset?.modelText;
+        if (!details.open || !key || details.querySelector('pre')) return;
+        const text = document.createElement('pre');
+        text.className = 'audit-text';
+        text.textContent = collectModelText(deferredText.get(key));
+        details.appendChild(text);
+      }, true);
+
+      function renderImage(block) {
+        if (!/^image\/(?:png|jpeg|gif|webp|avif|bmp)$/i.test(block.mimeType || '') ||
+            !/^[a-z0-9+/=\s]*$/i.test(block.data || '')) return '';
+        return `<div class="message-images"><img src="data:${escapeHtml(block.mimeType)};base64,${escapeHtml(block.data)}" class="message-image" /></div>`;
+      }
+
+      function renderContent(content) {
+        if (typeof content === 'string') return `<div class="markdown-content">${safeMarkedParse(content)}</div>`;
+        if (!Array.isArray(content)) return '';
+        return content.map(block => {
+          if (block.type === 'text') return `<div class="markdown-content">${safeMarkedParse(block.text)}</div>`;
+          if (block.type === 'image') return renderImage(block);
+          if (block.type === 'thinking') return `<pre class="audit-text">${escapeHtml(block.thinking || '')}</pre>`;
+          const text = collectModelText(block);
+          return text ? `<pre class="audit-text">${escapeHtml(text)}</pre>` : '';
+        }).join('');
+      }
+
       function canonicalizeMessage(text) {
         if (!text) return '';
         const trimmed = text.trim();
@@ -536,7 +610,7 @@
               if (toolCall) {
                 return labelHtml + `<span class="tree-role-tool">${escapeHtml(formatToolCall(toolCall.name, toolCall.arguments))}</span>`;
               }
-              return labelHtml + `<span class="tree-role-tool">[${msg.toolName || 'tool'}]</span>`;
+              return labelHtml + `<span class="tree-role-tool">[${escapeHtml(msg.toolName || 'tool')}]</span>`;
             }
             if (msg.role === 'bashExecution') {
               const cmd = truncate(normalizeTreeText(msg.command || ''));
@@ -546,7 +620,7 @@
               const code = truncate(normalizeTreeText(msg.code || ''));
               return labelHtml + `<span class="tree-role-tool">[js]:</span> ${escapeHtml(code)}`;
             }
-            return labelHtml + `<span class="tree-muted">[${msg.role}]</span>`;
+            return labelHtml + `<span class="tree-muted">[${escapeHtml(msg.role)}]</span>`;
           }
           case 'compaction':
             return labelHtml + `<span class="tree-compaction">[compaction: ${Math.round(entry.tokensBefore/1000)}k tokens]</span>`;
@@ -558,14 +632,24 @@
             const content = typeof entry.content === 'string' ? entry.content : extractContent(entry.content);
             return labelHtml + `<span class="tree-custom">[${escapeHtml(entry.customType)}]:</span> ${escapeHtml(truncate(normalizeTreeText(content)))}`;
           }
+          case 'custom':
+            if (entry.customType === 'omp:user-submission' || entry.customType === 'omp:prompt-submission') {
+              return labelHtml + `<span class="tree-role-user">submission:</span> ${escapeHtml(truncate(normalizeTreeText(String(entry.data?.text || ''))))}`;
+            }
+            if (entry.customType === 'omp:model-call') {
+              const phase = entry.data?.phase;
+              const text = phase === 'response' ? 'LLM reply' : phase === 'error' ? 'LLM error' : 'LLM input';
+              return labelHtml + `<span class="tree-custom">${text}</span>`;
+            }
+            return labelHtml + `<span class="tree-muted">[${escapeHtml(entry.customType || entry.type)}]</span>`;
           case 'model_change':
             return labelHtml + `<span class="tree-muted">[model: ${escapeHtml(entry.model)}]</span>`;
           case 'thinking_level_change':
-            return labelHtml + `<span class="tree-muted">[thinking: ${entry.thinkingLevel}]</span>`;
+            return labelHtml + `<span class="tree-muted">[thinking: ${escapeHtml(entry.thinkingLevel)}]</span>`;
           case 'mode_change':
             return labelHtml + `<span class="tree-muted">[mode: ${escapeHtml(entry.mode)}]</span>`;
           default:
-            return labelHtml + `<span class="tree-muted">[${entry.type}]</span>`;
+            return labelHtml + `<span class="tree-muted">[${escapeHtml(entry.type)}]</span>`;
         }
       }
 
@@ -938,7 +1022,8 @@
             openAgent: (id) => openSubSession(joinKey(sctx.prefix, id)),
           },
         });
-        return '<omp-tool-view class="tool-execution ' + statusClass + '" id="' + blockId + '" data-key="' + key + '" open></omp-tool-view>';
+        return '<omp-tool-view class="tool-execution ' + statusClass + '" id="' + blockId + '" data-key="' + key + '" open></omp-tool-view>' +
+          (result ? renderTextDisclosure('Complete tool result text', result.content) : '');
       }
 
       // ============================================================
@@ -967,6 +1052,7 @@
             entries: subSessions[key].entries,
             prefix: key,
             idPrefix: 'sub-' + key.replace(/[^A-Za-z0-9_-]/g, '_') + '-entry-',
+            payloadRequests: new Set(subSessions[key].entries.filter(e => e.type === 'custom' && e.customType === 'omp:model-call' && e.data?.phase === 'payload' && !e.data.unavailable).map(e => e.data.requestId)),
           };
           subSctxCache.set(key, sctx);
         }
@@ -1227,36 +1313,14 @@
 
           if (msg.role === 'user') {
             let html = `<div class="user-message" id="${entryId}">${copyBtnHtml}${tsHtml}`;
-            const content = msg.content;
-
-            if (Array.isArray(content)) {
-              const images = content.filter(c => c.type === 'image');
-              if (images.length > 0) {
-                html += '<div class="message-images">';
-                for (const img of images) {
-                  html += `<img src="data:${img.mimeType};base64,${img.data}" class="message-image" />`;
-                }
-                html += '</div>';
-              }
-            }
-
-            const text = typeof content === 'string' ? content : 
-              content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-            if (text.trim()) {
-              html += `<div class="markdown-content">${safeMarkedParse(text)}</div>`;
-            }
+            html += renderContent(msg.content);
             html += '</div>';
             return html;
           }
 
           if (msg.role === 'developer') {
             let html = `<div class="user-message developer-message" id="${entryId}">${copyBtnHtml}${tsHtml}`;
-            const content = msg.content;
-            const text = typeof content === 'string' ? content :
-              content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-            if (text.trim()) {
-              html += `<div class="markdown-content">${safeMarkedParse(text)}</div>`;
-            }
+            html += renderContent(msg.content);
             html += '</div>';
             return html;
           }
@@ -1281,9 +1345,11 @@
                   <div class="thinking-collapsed">Thinking ...</div>
                 </div>`;
               } else if (block.type === 'image') {
-                html += `<div class="message-images" id="${blockId}"><img src="data:${block.mimeType};base64,${block.data}" class="message-image" /></div>`;
+                html += `<div class="message-images" id="${blockId}">${renderImage(block)}</div>`;
               } else if (block.type === 'toolCall') {
                 html += renderToolCall(block, sctx, blockId);
+              } else {
+                html += `<div id="${blockId}">${renderContent([block])}</div>`;
               }
             }
 
@@ -1325,7 +1391,12 @@
             return html;
           }
 
-          if (msg.role === 'toolResult') return '';
+          if (msg.role === 'toolResult') {
+            const hasCall = sctx.entries.some(e => e.type === 'message' && e.message.role === 'assistant' &&
+              Array.isArray(e.message.content) && e.message.content.some(b => b.type === 'toolCall' && b.id === msg.toolCallId));
+            if (hasCall) return '';
+            return `<div class="tool-execution ${msg.isError ? 'error' : 'success'}" id="${entryId}">${tsHtml}${renderContent(msg.content)}</div>`;
+          }
         }
 
         if (entry.type === 'model_change') {
@@ -1354,14 +1425,43 @@
           </div>`;
         }
 
-        if (entry.type === 'custom_message' && entry.display) {
+        if (entry.type === 'custom_message') {
           return `<div class="hook-message" id="${entryId}">${tsHtml}
-            <div class="hook-type">[${escapeHtml(entry.customType)}]</div>
-            <div class="markdown-content">${safeMarkedParse(typeof entry.content === 'string' ? entry.content : JSON.stringify(entry.content))}</div>
+            <div class="hook-type">[${escapeHtml(entry.customType)}]${entry.display ? '' : ' — hidden in terminal'}</div>
+            ${renderContent(entry.content)}
           </div>`;
         }
 
-        return '';
+        if (entry.type === 'custom' && entry.customType === 'omp:model-call') {
+          const call = entry.data || {};
+          if (call.phase === 'request' && sctx.payloadRequests.has(call.requestId)) return '';
+          const label = call.phase === 'request' || call.phase === 'payload' ? 'Text sent to LLM' :
+            call.phase === 'response' ? 'LLM response text' : 'Model call error';
+          const value = call.payload ?? call.context ?? call.message ?? call.error;
+          return `<div class="hook-message model-call" id="${entryId}" data-request-id="${escapeHtml(call.requestId || '')}">${tsHtml}
+            ${call.unavailable ? '<div class="hook-type">Model-call record is missing from model-calls.ndjson</div>' : renderTextDisclosure(label, value)}
+          </div>`;
+        }
+
+        if (entry.type === 'custom' && (entry.customType === 'omp:user-submission' || entry.customType === 'omp:prompt-submission')) {
+          const data = entry.data || {};
+          const images = Array.isArray(data.images) ? data.images.map(renderImage).join('') : '';
+          return `<div class="user-message" id="${entryId}">${tsHtml}
+            <div class="hook-type">Original submission (${escapeHtml(entry.customType)}) — may have been handled or dropped before reaching the model</div>
+            ${renderContent(typeof data.text === 'string' ? data.text : '')}${images}
+          </div>`;
+        }
+
+        if (entry.type === 'custom') {
+          const text = collectModelText(entry.data);
+          if (!text) return '';
+          return `<div class="hook-message" id="${entryId}">${tsHtml}<div class="hook-type">[${escapeHtml(entry.customType || 'custom')}]</div><pre class="audit-text">${escapeHtml(text)}</pre></div>`;
+        }
+
+        const text = collectModelText(entry.type === 'session_init'
+          ? { systemPrompt: entry.systemPrompt, task: entry.task }
+          : entry.content ?? entry.summary ?? entry.reason);
+        return text ? `<div class="hook-message" id="${entryId}">${tsHtml}<pre class="audit-text">${escapeHtml(text)}</pre></div>` : '';
       }
 
       // ============================================================
@@ -1434,9 +1534,10 @@
           <div class="header">
             <h1>Session: ${escapeHtml(header?.id || 'unknown')}</h1>
             <div class="help-bar">T toggle thinking · O toggle tools</div>
+            <div class="export-notice">Open “Text sent to LLM” to read captured input, including injected context. Request text loads only when opened. Raw API and stored-entry views are omitted. Older context that was never captured cannot be recovered. Review sensitive prompt and tool text before sharing.</div>
             <div class="header-info">
               <div class="info-item"><span class="info-label">Date:</span><span class="info-value">${header?.timestamp ? new Date(header.timestamp).toLocaleString() : 'unknown'}</span></div>
-              <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${globalStats.models.join(', ') || 'unknown'}</span></div>
+              <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${escapeHtml(globalStats.models.join(', ') || 'unknown')}</span></div>
               <div class="info-item"><span class="info-label">Messages:</span><span class="info-value">${msgParts.join(', ') || '0'}</span></div>
               <div class="info-item"><span class="info-label">Tool Calls:</span><span class="info-value">${globalStats.toolCalls}</span></div>
               <div class="info-item"><span class="info-label">Tokens:</span><span class="info-value">${tokenParts.join(' ') || '0'}</span></div>
@@ -1446,7 +1547,7 @@
 
         if (systemPrompt) {
           html += `<div class="system-prompt">
-            <div class="system-prompt-header">System Prompt</div>
+            <div class="system-prompt-header">Live System Prompt Snapshot (not historical)</div>
             <div class="system-prompt-content">${escapeHtml(systemPrompt)}</div>
           </div>`;
         }
@@ -1455,7 +1556,7 @@
           const namesHtml = tools.map(t => `<span class="tool-name-chip">${escapeHtml(t.name)}</span>`).join('');
           const fullHtml = tools.map(t => `<div class="tool-item"><span class="tool-item-name">${escapeHtml(t.name)}</span> - <span class="tool-item-desc">${escapeHtml(t.description)}</span></div>`).join('');
           html += `<div class="tools-list collapsed" onclick="this.classList.toggle('collapsed')">
-            <div class="tools-header">Available Tools (${tools.length})</div>
+            <div class="tools-header">Live Tools Snapshot (not historical; ${tools.length})</div>
             <div class="tools-collapsed">${namesHtml}</div>
             <div class="tools-content">${fullHtml}</div>
           </div>`;
@@ -1566,6 +1667,20 @@
         breaks: true,
         gfm: true,
         renderer: {
+          link(token) {
+            const text = this.parser.parseInline(token.tokens);
+            const href = token.href || '';
+            if (/[\u0000-\u0020]/.test(href) || (/^[^/?#]*:/.test(href) && !/^(https?:|mailto:)/i.test(href))) return text;
+            return `<a href="${escapeHtml(href)}" rel="noreferrer">${text}</a>`;
+          },
+          image(token) {
+            const href = token.href || '';
+            if (!/^https?:\/\//i.test(href)) return escapeHtml(token.text || '');
+            return `<img src="${escapeHtml(href)}" alt="${escapeHtml(token.text || '')}" />`;
+          },
+          html(token) {
+            return escapeHtml(token.text);
+          },
           // Code blocks: syntax highlight, no HTML escaping
           code(token) {
             const code = token.text;

@@ -27,6 +27,7 @@ import { Settings } from "../config/settings";
 import type { Setting } from "../config/registry";
 
 import { BLOB_HASH_RE, BLOB_STAGING_RE, blobStagingPath } from "../session/blob-store";
+import { MODEL_CALL_RECORDS_FILE, modelCallRecordsPath } from "../session/model-call-journal";
 import { listSessionsReadOnly, type SessionInfo, type SessionStatus } from "../session/session-listing";
 import { parseTerminalBreadcrumb } from "../session/session-paths";
 import { FileSessionStorage, sessionOwnerLeasePath } from "../session/session-storage";
@@ -47,6 +48,8 @@ const BLOB_REF_RE = /\bblob:sha256:([a-f0-9]{64})\b/gi;
 const JSONL_GLOB = new Bun.Glob("**/*.jsonl");
 const JSONL_GZ_GLOB = new Bun.Glob("**/*.jsonl.gz");
 const JSONL_BACKUP_GLOB = new Bun.Glob("**/*.jsonl.*.bak");
+const MODEL_CALL_GLOB = new Bun.Glob(`**/${MODEL_CALL_RECORDS_FILE}`);
+const MODEL_CALL_GZ_GLOB = new Bun.Glob(`**/${MODEL_CALL_RECORDS_FILE}.gz`);
 const ACTIVE_STATUSES: ReadonlySet<SessionStatus> = new Set(["pending", "interrupted", "unknown"]);
 const DAY_MS = 86_400_000;
 const GC_WRITE_GRACE_MS = 5 * 60_000;
@@ -321,7 +324,7 @@ async function scanSessionLinesIfPresent(file: string, onLine: (line: Uint8Array
 	};
 	try {
 		const stream = Bun.file(file).stream();
-		if (file.endsWith(COMPRESSED_SESSION_SUFFIX)) {
+		if (file.endsWith(".gz")) {
 			const gunzip = createGunzip();
 			await pipeline(stream, gunzip, async (source: NodeJS.ReadableStream) => {
 				// Match the native stream's byte budget, not one arbitrary chunk or
@@ -385,9 +388,24 @@ async function collectReferencedBlobHashes(sessionRoots: string[], exactSessionF
 		]) {
 			files.set(normalizePathForComparison(file), file);
 		}
+		for (const glob of [MODEL_CALL_GLOB, MODEL_CALL_GZ_GLOB]) {
+			try {
+				for await (const name of glob.scan(root)) {
+					const file = path.join(root, name);
+					files.set(normalizePathForComparison(file), file);
+				}
+			} catch (error) {
+				if (codeOf(error) !== "ENOENT") throw error;
+			}
+		}
 	}
 	for (const file of exactSessionFiles) {
 		files.set(normalizePathForComparison(file), file);
+		const sidecar = modelCallRecordsPath(file);
+		if (sidecar) {
+			files.set(normalizePathForComparison(sidecar), sidecar);
+			files.set(normalizePathForComparison(`${sidecar}.gz`), `${sidecar}.gz`);
+		}
 	}
 
 	const hashes = new Set<string>();
@@ -973,6 +991,15 @@ async function moveSessionWithArtifacts(candidate: ArchiveCandidate): Promise<vo
 		if (await pathExists(sourceArtifacts)) {
 			await movePath(sourceArtifacts, destArtifacts);
 			moved.push({ source: sourceArtifacts, destination: destArtifacts });
+			const sidecar = path.join(destArtifacts, MODEL_CALL_RECORDS_FILE);
+			if (await pathExists(sidecar)) {
+				await gzipSessionFile(sidecar, `${sidecar}.gz`);
+				moved.push({
+					source: sidecar,
+					destination: `${sidecar}.gz`,
+					compressed: true,
+				});
+			}
 		}
 	} catch (error) {
 		for (const move of moved.reverse()) {

@@ -188,6 +188,7 @@ function createContext(): {
 		sessionManager: {
 			getSessionName: () => "existing session",
 			flushSync: vi.fn(),
+			appendCustomEntry: vi.fn(),
 		} as unknown as InteractiveModeContext["sessionManager"],
 		keybindings: {
 			getKeys: () => [],

@@ -136,6 +136,30 @@ async function createHarness(factory: ExtensionFactory) {
 afterEach(() => vi.restoreAllMocks());
 
 describe("interactive native input ingress", () => {
+	for (const key of [ENTER, FOLLOW_UP]) {
+		it(`retains the original submission when ${key === ENTER ? "Enter" : "Ctrl+Enter"} hooks replace text and images`, async () => {
+			const h = await createHarness(pi => {
+				pi.on("input", () => ({ text: "rewritten for model", images: [transformedImage] }));
+			});
+			h.draftWithImage("original attachment [Image #1]");
+			await h.pressSubmit(key);
+
+			expect(h.prompt.mock.calls[0]?.[0]).toBe("rewritten for model");
+			expect(h.prompt.mock.calls[0]?.[1]?.images).toEqual([transformedImage]);
+			expect(h.ctx.sessionManager.getEntries()).toContainEqual(
+				expect.objectContaining({
+					type: "custom",
+					customType: "omp:user-submission",
+					data: {
+						source: "interactive",
+						text: "original attachment [Image #1]",
+						images: [originalImage],
+					},
+				}),
+			);
+		});
+	}
+
 	it("Ctrl+Enter chains partial text/image transforms and restores materialized images after rejection", async () => {
 		const seen: InputEvent[] = [];
 		const h = await createHarness(pi => {

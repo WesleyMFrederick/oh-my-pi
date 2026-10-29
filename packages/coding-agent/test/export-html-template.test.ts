@@ -33,6 +33,7 @@ const bundledDependencyStubs: Record<string, string> = {
 	"@oh-my-pi/pi-tui/theme":
 		"export const getResolvedThemeColors = async () => ({}); export const getThemeExportColors = async () => ({});",
 	"../../session/session-loader": "export const loadEntriesFromFile = async () => [];",
+	"../../session/model-call-journal": "export const resolveModelCallEntries = async (_file, entries) => entries;",
 	"../../session/session-manager":
 		"export class SessionManager { static async open() { return new SessionManager(); } }",
 	"./args": "export const parseExportArgs = () => undefined;",

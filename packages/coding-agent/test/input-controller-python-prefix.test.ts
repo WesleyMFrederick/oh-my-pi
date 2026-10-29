@@ -54,7 +54,10 @@ function createContext() {
 			queuedMessageCount: 0,
 			getQueuedMessages: () => ({ steering: [], followUp: [] }),
 		} as unknown as InteractiveModeContext["session"],
-		sessionManager: { getSessionName: () => "named-session" } as unknown as InteractiveModeContext["sessionManager"],
+		sessionManager: {
+			getSessionName: () => "named-session",
+			appendCustomEntry: vi.fn(),
+		} as unknown as InteractiveModeContext["sessionManager"],
 		compactionQueuedMessages: [] as InteractiveModeContext["compactionQueuedMessages"],
 		locallySubmittedUserSignatures: new Set<string>(),
 		onInputCallback,

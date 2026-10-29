@@ -8,6 +8,7 @@ import { withStatsSyncLock } from "@oh-my-pi/omp-stats/aggregator";
 import { type GcResult, runGcCommand } from "@oh-my-pi/pi-coding-agent/cli/gc-cli";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { BlobStore, blobStagingPath } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import { MODEL_CALL_RECORDS_FILE, modelCallRecordsPath } from "@oh-my-pi/pi-coding-agent/session/model-call-journal";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
@@ -167,6 +168,22 @@ describe("runGcCommand blob sweep", () => {
 		expect(result.blobs?.deleted).toBe(1);
 		expect(await Bun.file(orphan).exists()).toBe(false);
 		expect(await Bun.file(referenced).exists()).toBe(true);
+	});
+
+	test("--apply keeps blobs referenced only by model-call sidecars", async () => {
+		const hash = hashFor("sidecar-only");
+		const referenced = await writeBlob(root, hash, "sidecar-only");
+		const orphan = await writeBlob(root, hashFor("sidecar-orphan"), "orphan");
+		await agePath(referenced);
+		await agePath(orphan);
+		const session = await writeSession(root, "project", "sidecar", "complete");
+		await Bun.write(modelCallRecordsPath(session)!, `${JSON.stringify({ data: `blob:sha256:${hash}` })}\n`);
+		const result = await runGcCommand({
+			flags: { agentDir: root, blobs: true, apply: true },
+		});
+		expect(result.blobs?.deleted).toBe(1);
+		expect(await Bun.file(referenced).exists()).toBe(true);
+		expect(await Bun.file(orphan).exists()).toBe(false);
 	});
 
 	test("--apply keeps fresh unreferenced blobs out of sweep candidates", async () => {
@@ -779,6 +796,8 @@ describe("runGcCommand cold-session archive", () => {
 		await fs.mkdir(archiveMe.slice(0, -".jsonl".length), { recursive: true });
 		await Bun.write(path.join(archiveMe.slice(0, -".jsonl".length), "0.bash.log"), "artifact");
 		const original = await Bun.file(archiveMe).bytes();
+		const sidecarBytes = '{"version":2,"key":"archived-body"}\n';
+		await Bun.write(modelCallRecordsPath(archiveMe)!, sidecarBytes);
 
 		const result = await runGcCommand({
 			flags: {
@@ -798,6 +817,9 @@ describe("runGcCommand cold-session archive", () => {
 		expect(await Bun.file(archived).exists()).toBe(true);
 		expect(new Uint8Array(gunzipSync(await Bun.file(archived).bytes()))).toEqual(original);
 		expect(await Bun.file(path.join(archived.slice(0, -".jsonl.gz".length), "0.bash.log")).exists()).toBe(true);
+		const archivedSidecar = path.join(archived.slice(0, -".jsonl.gz".length), MODEL_CALL_RECORDS_FILE);
+		expect(await Bun.file(archivedSidecar).exists()).toBe(false);
+		expect(gunzipSync(await Bun.file(`${archivedSidecar}.gz`).bytes()).toString()).toBe(sidecarBytes);
 		expect(await Bun.file(keepRecent).exists()).toBe(true);
 		expect(await Bun.file(pending).exists()).toBe(true);
 		expect(await Bun.file(interrupted).exists()).toBe(true);

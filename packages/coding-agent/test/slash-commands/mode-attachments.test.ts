@@ -59,6 +59,7 @@ function createHarness(
 			},
 		},
 		sessionManager: {
+			appendCustomEntry: vi.fn(),
 			putBlob: vi.fn(async () => ({ displayPath: "file:///replacement.png" })),
 		},
 		focusedAgentId: undefined,

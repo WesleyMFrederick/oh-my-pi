@@ -169,8 +169,9 @@ describe("AgentSession concurrent prompt dispatch", () => {
 		const pending = session.prompt("Still belongs here");
 		try {
 			await reached.promise;
+			const leafBeforeNavigation = manager.getLeafId();
 			expect((await session.navigateTree(target)).cancelled).toBe(true);
-			expect(manager.getLeafId()).toBe(target);
+			expect(manager.getLeafId()).toBe(leafBeforeNavigation);
 		} finally {
 			release.resolve();
 		}
