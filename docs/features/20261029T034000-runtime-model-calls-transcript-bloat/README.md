@@ -4,6 +4,6 @@ Since commit `e7ed7a2f32` (2026-10-26, fork branch `wesley/dev` only), every omp
 
 Start with [the Baseline / Ideal / Delta analysis](research/runtime-model-calls-in-session-transcripts-baseline-ideal-delta.md), then [the raw evidence](research/evidence-2026-10-29.md). [Who reads these entries](research/downstream-consumers-2026-10-29.md) maps every downstream reader. The three design sketches from the Design-It-Twice pass are in [design/design-it-twice/](design/design-it-twice/).
 
-Status (2026-10-29): planning only. No code changed. The delta choice is with Wesley. Nothing here is live: omp runs from the main checkout, and any fix goes live only after it merges to `wesley/dev` and the main checkout is updated.
+Status (2026-10-29): Wesley picked the separate file per session with a small pointer in the transcript. It is built on `feat/model-call-sidecar-store` with a PR into `wesley/dev`; see [the results](results/sidecar-store-results-2026-10-29.md). Nothing here is live: omp runs from the main checkout, and the fix goes live only after it merges to `wesley/dev` and the main checkout is updated.
 
 Folder layout: oh-my-pi had no plan or design folder, so this follows the cc-workflows-plugin `docs/features/<timestamp>-<slug>/` convention.
