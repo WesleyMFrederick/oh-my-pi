@@ -1110,6 +1110,13 @@ export class InputController {
 			// The Editor resets before calling onSubmit, so this is normally empty;
 			// different editor text after an await below is a newer draft.
 			const draftText = this.ctx.editor.getText();
+			if (submittedText || this.ctx.editor.pendingImages.length > 0) {
+				this.ctx.sessionManager.appendCustomEntry("omp:user-submission", {
+					source: "interactive",
+					text: submittedText,
+					images: structuredClone(this.ctx.editor.pendingImages),
+				});
+			}
 			const armed = this.#armedBareCommand;
 			this.#armedBareCommand = undefined;
 			const armedBareCommand =
@@ -2163,11 +2170,17 @@ export class InputController {
 
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
-		let text = this.#compactDraftImages(this.ctx.editor.getExpandedText().trim());
+		const submittedText = this.ctx.editor.getExpandedText();
+		let text = this.#compactDraftImages(submittedText.trim());
 		let images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
 		let imageLinks =
 			images && this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
 		if (!text && !images) return;
+		this.ctx.sessionManager.appendCustomEntry("omp:user-submission", {
+			source: "interactive",
+			text: submittedText,
+			images: images ? structuredClone(images) : undefined,
+		});
 
 		// Focused subagent session: follow-ups go to it; non-chat input is gated.
 		if (this.ctx.focusedAgentId && !this.ctx.approvalOwnsComposer) {

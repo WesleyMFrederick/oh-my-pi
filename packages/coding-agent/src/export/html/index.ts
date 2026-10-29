@@ -5,6 +5,7 @@ import type { SessionTrace } from "@oh-my-pi/omp-stats/types";
 import type { AgentState } from "@oh-my-pi/pi-agent-core";
 import { APP_NAME, isCompiledBinary, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
 import { getResolvedThemeColors, getThemeExportColors } from "@oh-my-pi/pi-tui/theme";
+import { resolveModelCallEntries } from "../../session/model-call-journal";
 import type { SessionEntry, SessionHeader } from "../../session/session-entries";
 import { SessionManager } from "../../session/session-manager";
 import { collectSubSessions, type SubSession } from "../../session/sub-sessions";
@@ -201,10 +202,19 @@ export function buildSessionData(sm: SessionManager, state?: AgentState): Sessio
 	};
 }
 
-/** All trace transcripts next to `sessionFile`, with export-only header fields stripped. */
+/**
+ * All trace transcripts next to `sessionFile`, with export-only header fields stripped
+ * and model-call pointers resolved from each transcript's sidecar.
+ */
 async function collectExportSubSessions(sessionFile: string): Promise<Record<string, SubSession>> {
 	const subSessions = await collectSubSessions(sessionFile, { includeAdvisors: true, includeCompressed: true });
-	for (const sub of Object.values(subSessions)) sub.header = sessionHeaderForExport(sub.header);
+	// Keys are slash-joined transcript stems relative to the main session's directory.
+	const transcript = sessionFile.endsWith(".jsonl.gz") ? sessionFile.slice(0, -3) : sessionFile;
+	const subSessionDir = transcript.slice(0, -".jsonl".length);
+	for (const [key, sub] of Object.entries(subSessions)) {
+		sub.header = sessionHeaderForExport(sub.header);
+		sub.entries = await resolveModelCallEntries(path.join(subSessionDir, `${key}.jsonl`), sub.entries);
+	}
 	return subSessions;
 }
 
@@ -238,6 +248,7 @@ async function writeExportHtml(sessionData: SessionData, outputPath: string, opt
 
 /** Attach sub-sessions and the trace, then write the export; returns the output path. */
 async function exportSessionData(sessionData: SessionData, sessionFile: string, opts: ExportOptions): Promise<string> {
+	sessionData.entries = await resolveModelCallEntries(sessionFile, sessionData.entries);
 	if (opts.includeSubSessions !== false) {
 		const subSessions = await collectExportSubSessions(sessionFile);
 		if (Object.keys(subSessions).length > 0) sessionData.subSessions = subSessions;

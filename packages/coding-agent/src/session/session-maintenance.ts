@@ -6262,9 +6262,15 @@ export class SessionMaintenance {
 									// retry too — the budgets would multiply and each outer
 									// wait would stack on top of an inner backoff.
 									oneshotRetry: false,
-									// The default transport, wrapped so every provider attempt is journaled.
+									// Route through the session's side stream so model calls are recorded,
+									// and journal every provider attempt.
 									completeImpl: async (requestModel, requestContext, requestOptions) => {
-										const message = await completeSimple(requestModel, requestContext, requestOptions);
+										const stream = await this.#host.sideStreamFn(
+											requestModel,
+											requestContext,
+											requestOptions,
+										);
+										const message = await stream.result();
 										journal?.(message);
 										return message;
 									},

@@ -198,6 +198,7 @@ async function createContext() {
 		autoCompactionEscapeHandler: undefined,
 		retryEscapeHandler: undefined,
 		session: session as unknown as InteractiveModeContext["session"],
+		sessionManager: { appendCustomEntry: vi.fn() },
 		viewSession: session as unknown as InteractiveModeContext["viewSession"],
 		keybindings: {
 			getKeys(action: string) {
@@ -1114,6 +1115,7 @@ describe("InputController image paste into an image-accepting prompt", () => {
 		const context = await createContext();
 		Object.assign(context.ctx, {
 			sessionManager: {
+				appendCustomEntry: vi.fn(),
 				getCwd: () => tempDir.path(),
 				getArtifactsDir: () => tempDir.path(),
 				getSessionId: () => "session",

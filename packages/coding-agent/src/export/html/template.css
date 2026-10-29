@@ -1288,3 +1288,27 @@
       #content { display: block !important; max-width: none; padding: 0; overflow: visible; }
       .user-message, .tool-execution, .compaction, .branch-summary, .hook-message { break-inside: avoid; }
     }
+
+    .audit-disclosure {
+      margin: 10px 0;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+
+    .audit-disclosure summary {
+      cursor: pointer;
+      overflow-wrap: anywhere;
+    }
+
+    .audit-text {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      max-height: none;
+    }
+
+    .export-notice {
+      margin: 10px 0;
+      color: var(--warning);
+      line-height: 1.5;
+    }

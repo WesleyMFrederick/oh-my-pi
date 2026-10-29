@@ -9277,6 +9277,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					options?.onPromptAdmitted?.();
 				}
 			: options?.onPromptAdmitted;
+		this.sessionManager.appendCustomEntry("omp:prompt-submission", {
+			text: typedText,
+			images: options?.images ? structuredClone(options.images) : undefined,
+			attribution: options?.attribution ?? (options?.synthetic ? "agent" : "user"),
+			submittedAt,
+		});
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			if (options?.runCommands !== false) {
