@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentState } from "@oh-my-pi/pi-agent-core";
 import { APP_NAME, isEnoent } from "@oh-my-pi/pi-utils";
 import { getResolvedThemeColors, getThemeExportColors } from "@oh-my-pi/pi-tui/theme";
+import { resolveModelCallEntries } from "../../session/model-call-journal";
 import type { SessionEntry, SessionHeader } from "../../session/session-entries";
 import { loadEntriesFromFile } from "../../session/session-loader";
 import { SessionManager } from "../../session/session-manager";
@@ -236,11 +237,15 @@ async function collectSubSessionsFromDir(
 		if (!name.endsWith(".jsonl") || name.includes(".bak")) continue;
 		const agentId = name.slice(0, -6);
 		const key = parentKey ? `${parentKey}/${agentId}` : agentId;
-		const fileEntries = await loadEntriesFromFile(path.join(dir, name));
+		const sessionFile = path.join(dir, name);
+		const fileEntries = await loadEntriesFromFile(sessionFile);
 		// Empty/corrupt files (no valid session header) load as [] — skip silently.
 		if (fileEntries.length > 0) {
 			const header = (fileEntries.find(e => e.type === "session") as SessionHeader | undefined) ?? null;
-			const entries = fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+			const entries = await resolveModelCallEntries(
+				sessionFile,
+				fileEntries.filter((e): e is SessionEntry => e.type !== "session"),
+			);
 			out[key] = {
 				agentId,
 				parent: parentKey,
@@ -282,6 +287,7 @@ export async function exportSessionToHtml(
 	if (!sessionFile) throw new Error("Cannot export in-memory session to HTML");
 
 	const sessionData = buildSessionData(sm, state);
+	sessionData.entries = await resolveModelCallEntries(sessionFile, sessionData.entries);
 	if (opts.includeSubSessions !== false) {
 		const subSessions = await collectSubSessions(sessionFile);
 		if (Object.keys(subSessions).length > 0) sessionData.subSessions = subSessions;
@@ -312,7 +318,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	const sessionData: SessionData = {
 		header: sessionHeaderForExport(sm.getHeader()),
-		entries: sm.getEntries(),
+		entries: await resolveModelCallEntries(inputPath, sm.getEntries()),
 		leafId: sm.getLeafId(),
 	};
 	if (opts.includeSubSessions !== false) {

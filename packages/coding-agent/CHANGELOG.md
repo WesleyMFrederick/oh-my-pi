@@ -11,6 +11,7 @@
 
 ### Changed
 
+- Model-call records now live in a per-session `model-calls.ndjson` beside the transcript, keeping transcripts small and fast to reopen while preserving full HTML exports.
 - Shared language servers now stop 30 seconds after their last session disconnects, down from five minutes, while reconnecting sessions still cancel shutdown.
 
 ### Fixed

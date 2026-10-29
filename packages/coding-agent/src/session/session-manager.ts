@@ -40,6 +40,7 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import { copyModelCallRecords } from "./model-call-journal";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
@@ -2287,6 +2288,7 @@ export class SessionManager {
 		this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
 
 		await this.#rewriteAtomically();
+		copyModelCallRecords(oldSessionFile, this.#sessionFile);
 		return { oldSessionFile, newSessionFile: this.#sessionFile };
 	}
 
@@ -2480,6 +2482,7 @@ export class SessionManager {
 		manager.#index.rebuild(manager.#entries);
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
+		if (this.#sessionFile) copyModelCallRecords(this.#sessionFile, manager.#sessionFile!);
 		return manager;
 	}
 
@@ -2917,6 +2920,10 @@ export class SessionManager {
 
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
+	}
+
+	isPersisted(): boolean {
+		return this.#persist;
 	}
 
 	/**
@@ -3683,6 +3690,7 @@ export class SessionManager {
 		this.#sessionFile = newSessionFile;
 		this.#expectedDiskSize = null;
 		this.#rewriteSynchronously();
+		if (sourceSessionFile) copyModelCallRecords(sourceSessionFile, newSessionFile);
 		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
 		return newSessionFile;
 	}
@@ -3801,6 +3809,7 @@ export class SessionManager {
 		if (options?.copyArtifacts !== false) {
 			await copySessionArtifacts(sourcePath, manager.#sessionFile!);
 		}
+		copyModelCallRecords(sourcePath, manager.#sessionFile!);
 		return manager;
 	}
 

@@ -38,7 +38,7 @@
       // Session render context: scopes entry lookups and tool-view host
       // wiring to one transcript (main session or an embedded subagent).
       const mainSctx = { entries, prefix: '', idPrefix: 'entry-',
-        payloadRequests: new Set(entries.filter(e => e.type === 'custom' && e.customType === 'omp:model-call' && e.data?.phase === 'payload').map(e => e.data.requestId)) };
+        payloadRequests: new Set(entries.filter(e => e.type === 'custom' && e.customType === 'omp:model-call' && e.data?.phase === 'payload' && !e.data.unavailable).map(e => e.data.requestId)) };
 
       // ============================================================
       // URL PARAMETER HANDLING
@@ -1052,7 +1052,7 @@
             entries: subSessions[key].entries,
             prefix: key,
             idPrefix: 'sub-' + key.replace(/[^A-Za-z0-9_-]/g, '_') + '-entry-',
-            payloadRequests: new Set(subSessions[key].entries.filter(e => e.type === 'custom' && e.customType === 'omp:model-call' && e.data?.phase === 'payload').map(e => e.data.requestId)),
+            payloadRequests: new Set(subSessions[key].entries.filter(e => e.type === 'custom' && e.customType === 'omp:model-call' && e.data?.phase === 'payload' && !e.data.unavailable).map(e => e.data.requestId)),
           };
           subSctxCache.set(key, sctx);
         }
@@ -1439,7 +1439,7 @@
             call.phase === 'response' ? 'LLM response text' : 'Model call error';
           const value = call.payload ?? call.context ?? call.message ?? call.error;
           return `<div class="hook-message model-call" id="${entryId}" data-request-id="${escapeHtml(call.requestId || '')}">${tsHtml}
-            ${renderTextDisclosure(label, value)}
+            ${call.unavailable ? '<div class="hook-type">Model-call record is missing from model-calls.ndjson</div>' : renderTextDisclosure(label, value)}
           </div>`;
         }
 

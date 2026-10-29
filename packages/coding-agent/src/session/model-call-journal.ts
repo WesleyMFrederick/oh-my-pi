@@ -1,11 +1,32 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, Tool } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isEexist, isEnoent, logger, readLines } from "@oh-my-pi/pi-utils";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
+import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
 export const MODEL_CALL_CUSTOM_TYPE = "omp:model-call";
+export const MODEL_CALL_RECORDS_FILE = "model-calls.ndjson";
+
+export function modelCallRecordsPath(sessionFile: string): string | null {
+	return sessionFile.endsWith(".jsonl") ? path.join(sessionFile.slice(0, -6), MODEL_CALL_RECORDS_FILE) : null;
+}
+
+export function copyModelCallRecords(sourceSessionFile: string, destinationSessionFile: string): void {
+	const source = modelCallRecordsPath(sourceSessionFile);
+	const destination = modelCallRecordsPath(destinationSessionFile);
+	if (!source || !destination || path.resolve(source) === path.resolve(destination)) return;
+	try {
+		fs.mkdirSync(path.dirname(destination), { recursive: true });
+		fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE);
+	} catch (error) {
+		if (isEnoent(error) || isEexist(error)) return;
+		logger.warn("Failed to copy model-call records", { source, destination, error: String(error) });
+	}
+}
 
 export interface ModelCallJournalData {
 	version: 1;
@@ -20,10 +41,49 @@ export interface ModelCallJournalData {
 
 type ModelCallRecord = Omit<ModelCallJournalData, "version" | "requestId" | "model">;
 
-function snapshot<T>(value: T): T {
-	const json = JSON.stringify(value);
-	if (json === undefined) throw new Error("Model-call journal value is not JSON-serializable");
-	return JSON.parse(json) as T;
+export interface ModelCallJournalPointer {
+	version: 2;
+	key: string;
+	requestId: string;
+	phase: ModelCallJournalData["phase"];
+	model: ModelCallJournalData["model"];
+}
+
+export interface ModelCallJournalRecord extends Omit<ModelCallJournalData, "version"> {
+	version: 2;
+	key: string;
+}
+
+export async function resolveModelCallEntries(sessionFile: string, entries: SessionEntry[]): Promise<SessionEntry[]> {
+	const keys = new Set<string>();
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== MODEL_CALL_CUSTOM_TYPE) continue;
+		const data = entry.data as ModelCallJournalPointer | undefined;
+		if (data?.version === 2) keys.add(data.key);
+	}
+	const records = new Map<string, ModelCallJournalRecord>();
+	const file = modelCallRecordsPath(sessionFile);
+	if (keys.size > 0 && file) {
+		const decoder = new TextDecoder();
+		try {
+			for await (const line of readLines(Bun.file(file).stream())) {
+				try {
+					const record = JSON.parse(decoder.decode(line)) as ModelCallJournalRecord;
+					if (record?.version === 2 && keys.has(record.key)) records.set(record.key, record);
+				} catch {
+					// A damaged line must not hide the rest of the call history.
+				}
+			}
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+	}
+	return entries.map(entry => {
+		if (entry.type !== "custom" || entry.customType !== MODEL_CALL_CUSTOM_TYPE) return entry;
+		const data = entry.data as ModelCallJournalPointer | undefined;
+		if (data?.version !== 2) return entry;
+		return { ...entry, data: records.get(data.key) ?? { ...data, unavailable: "missing" } };
+	});
 }
 
 const TOOL_SCHEMA_KEYS = [
@@ -47,11 +107,11 @@ function toolSchema(tool: Tool): Tool {
 // Runtime tools carry session/runner back-references that would serialize megabytes per call.
 function requestSnapshot(context: Context): Context {
 	const { tools, inactiveTools, ...rest } = context;
-	return snapshot({
+	return {
 		...rest,
 		...(tools ? { tools: tools.map(toolSchema) } : {}),
 		...(inactiveTools ? { inactiveTools: inactiveTools.map(toolSchema) } : {}),
-	});
+	};
 }
 
 /**
@@ -60,14 +120,12 @@ function requestSnapshot(context: Context): Context {
  *
  * Each call is bound to the session that dispatched it. SessionManager is one mutable
  * object across `/new` and session switches and appends to its *current* file, but side
- * turns outlive a switch. While the session is unchanged records append synchronously. After
- * a switch, a private manager is cloned and pointed back at the dispatching session's file
- * through the same storage; late records are written and flushed there, sequenced, before the
- * event that triggered them is forwarded, and that manager is closed when the call finishes.
- * A session that has no file (in-memory) cannot be reopened and fails the call explicitly.
+ * turns outlive a switch. Sidecar writes precede pointers; late pointers are flushed
+ * through a cloned manager pointed at the dispatching file. In-memory calls pass through.
  */
 export function createModelCallJournalStream(sm: SessionManager, stream: StreamFn): StreamFn {
 	return (model, context, options) => {
+		if (!sm.isPersisted()) return stream(model, context, options);
 		const requestId = Snowflake.next();
 		const sessionId = sm.getSessionId();
 		const originalFile = sm.getSessionFile();
@@ -77,19 +135,17 @@ export function createModelCallJournalStream(sm: SessionManager, stream: StreamF
 		let lateManager: Promise<SessionManager> | undefined;
 		let lateTail: Promise<void> = Promise.resolve();
 		const openOriginal = async (): Promise<SessionManager> => {
-			if (!originalFile) {
-				throw new Error("Model-call journal cannot record into a replaced session that has no session file");
-			}
+			// Persisted sessions always have a file at dispatch.
 			const late = sm.cloneCurrentSession();
 			try {
-				await late.setSessionFile(originalFile);
+				await late.setSessionFile(originalFile!);
 			} catch (error) {
 				await late.close().catch(() => undefined);
 				throw error;
 			}
 			return late;
 		};
-		const appendLate = (entry: ModelCallJournalData): Promise<void> => {
+		const appendLate = (entry: ModelCallJournalPointer): Promise<void> => {
 			const written = lateTail.then(async () => {
 				lateManager ??= openOriginal();
 				const late = await lateManager;
@@ -106,20 +162,32 @@ export function createModelCallJournalStream(sm: SessionManager, stream: StreamF
 			if (pending) await (await pending.catch(() => undefined))?.close();
 		};
 
-		const record = (data: ModelCallRecord, detached = false): Promise<void> | undefined => {
-			const entry: ModelCallJournalData = { version: 1, requestId, model: identity, ...data };
-			const owned = detached ? entry : snapshot(entry);
-			if (sm.getSessionId() === sessionId) {
-				sm.appendCustomEntry(MODEL_CALL_CUSTOM_TYPE, owned);
-				return undefined;
-			}
-			return appendLate(owned);
+		const record = (data: ModelCallRecord): Promise<void> => {
+			const pointer: ModelCallJournalPointer = {
+				version: 2,
+				key: Snowflake.next(),
+				requestId,
+				phase: data.phase,
+				model: identity,
+			};
+			const serialized = `${JSON.stringify({ ...pointer, ...data })}\n`;
+			return (async () => {
+				const sessionFile = sm.getSessionId() === sessionId ? sm.getSessionFile()! : originalFile!;
+				const file = modelCallRecordsPath(sessionFile);
+				if (!file) throw new Error("Model-call journal requires a .jsonl session file");
+				await fs.promises.mkdir(path.dirname(file), { recursive: true });
+				await fs.promises.appendFile(file, serialized);
+				if (sm.getSessionId() === sessionId) {
+					sm.appendCustomEntry(MODEL_CALL_CUSTOM_TYPE, pointer);
+				} else {
+					await appendLate(pointer);
+				}
+			})();
 		};
 
 		const run = async (): Promise<void> => {
-			const requestContext = requestSnapshot(context);
+			await record({ phase: "request", context: requestSnapshot(context) });
 			await sm.ensureOnDisk();
-			await record({ phase: "request", context: requestContext }, true);
 			try {
 				const inner = await stream(model, context, {
 					...options,
