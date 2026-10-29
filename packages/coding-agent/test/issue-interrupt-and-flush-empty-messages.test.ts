@@ -46,6 +46,9 @@ function createContext(options?: {
 			abort,
 			prompt,
 		},
+		sessionManager: {
+			appendCustomEntry: vi.fn(),
+		} as unknown as InteractiveModeContext["sessionManager"],
 		get viewSession() {
 			return (this as typeof ctx).session;
 		},
