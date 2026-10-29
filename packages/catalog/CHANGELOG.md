@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Claude Haiku 5.5 to the Anthropic catalog with adaptive thinking, its supported effort levels, and long-context pricing.
+
 ### Fixed
 
 - Fixed a cold model cache still blocking signal handlers for hundreds of milliseconds: provider cache writes now run one per event-loop turn through a single queue.

@@ -1,6 +1,19 @@
 // Model-lineage compat for "anthropic"; regenerated from the frozen census using class taxonomy selectors.
 
 class "anthropic" {
+	// Haiku 5.5 rejects budget thinking, sampling parameters, and assistant
+	// prefill. Signed thinking is bound to the preceding conversation.
+	// https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide
+	family "haiku" {
+		revision "=5.5" priority=1 {
+			thinking-mode "anthropic-adaptive"
+			thinking-efforts "low" "medium" "high" "xhigh" "max"
+			thinking-default-level "medium"
+			thinking-prefix-binding #true
+			supports-sampling-params #false
+			supports-assistant-prefill #false
+		}
+	}
 	family "fable" {
 		revision ">=5.1" {
 			// Fable 5.1+ binds signed thinking to the exact preceding conversation.
@@ -214,6 +227,28 @@ class "anthropic" {
 	}
 	// Reviewed catalog-metadata corrections (stale upstream pricing/limits).
 	on "anthropic" {
+		family "haiku" {
+			revision "=5.5" {
+				// https://platform.claude.com/docs/en/models/haiku-5-5/overview
+				cost-patch {
+					input 0.1
+					output 0.5
+					cache-read 0.01
+					cache-write 0.125
+				}
+				long-context-cost {
+					input-threshold 100000
+					input 0.5
+					output 2.5
+					cache-read 0.05
+					cache-write 0.625
+				}
+				limits-patch {
+					context-window 1000000
+					max-tokens 128000
+				}
+			}
+		}
 		family "opus" {
 			revision "=4.5" {
 				// stencil.so reports 3x the correct cache pricing.
