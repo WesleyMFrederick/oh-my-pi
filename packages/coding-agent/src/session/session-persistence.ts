@@ -105,7 +105,7 @@ function isNonEmptyString(value: unknown): value is string {
  * synchronous blob-store path (`fs.writeFileSync`), so blob bytes are in the
  * kernel page cache before the JSONL line referencing them is written.
  */
-function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): unknown {
+export function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): unknown {
 	if (obj === null || obj === undefined) return obj;
 	if (
 		typeof obj === "object" &&

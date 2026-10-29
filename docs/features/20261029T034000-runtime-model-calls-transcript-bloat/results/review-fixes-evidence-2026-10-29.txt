@@ -1,0 +1,25 @@
+## 2026-10-29T13:33:12Z head=c83edd32fd+worktree
+## image.ts
+NEW sidecar bytes 3741 transcript bytes 3039
+OLD transcript bytes 3318
+## replay-sidecar.ts
+{"source":"/tmp/transcript-bloat/replay-src/B545.jsonl","sourceBytes":545281269,"sourceJournalBytes":535198522,"calls":630,"replayed":630,"noRequest":0,"convertedBytes":10656044,"sidecarBytes":534996292,"scratchTranscriptBytes":573677,"seconds":11.9,"converted":"/tmp/transcript-bloat/replay-out/B545.jsonl"}
+## verify-sidecar.ts
+{"sourceCalls":630,"sourceRecords":1890,"convertedPointers":1890,"missingRecords":0,"completeCalls":630,"badCalls":[]}
+## ls
+-rw-r--r--@ 1 wesleyfrederick  wheel   10656044 Oct 29 06:33 /tmp/transcript-bloat/replay-out/B545.jsonl
+-rw-r--r--@ 1 wesleyfrederick  wheel  534996292 Oct 29 06:33 /tmp/transcript-bloat/replay-out/B545/model-calls.ndjson
+-rw-r--r--@ 1 wesleyfrederick  wheel  545281269 Oct 29 06:03 /tmp/transcript-bloat/replay-src/B545.jsonl
+## open-rss old-format (3 runs)
+{"file":"/tmp/transcript-bloat/replay-src/B545.jsonl","sizeBytes":545281269,"entries":4611,"modelCallEntries":1890,"contextMessages":58,"openMs":2011,"buildContextMs":8,"rssBeforeMB":179,"rssAfterMB":1661,"heapUsedAfterMB":1152,"maxRSSRaw":1661026304}
+{"file":"/tmp/transcript-bloat/replay-src/B545.jsonl","sizeBytes":545281269,"entries":4611,"modelCallEntries":1890,"contextMessages":58,"openMs":1778,"buildContextMs":5,"rssBeforeMB":179,"rssAfterMB":1655,"heapUsedAfterMB":1412,"maxRSSRaw":1655193600}
+{"file":"/tmp/transcript-bloat/replay-src/B545.jsonl","sizeBytes":545281269,"entries":4611,"modelCallEntries":1890,"contextMessages":58,"openMs":2064,"buildContextMs":5,"rssBeforeMB":180,"rssAfterMB":1653,"heapUsedAfterMB":1439,"maxRSSRaw":1653211136}
+## open-rss sidecar (3 runs)
+{"file":"/tmp/transcript-bloat/replay-out/B545.jsonl","sizeBytes":10656044,"entries":4611,"modelCallEntries":1890,"contextMessages":58,"openMs":49,"buildContextMs":4,"rssBeforeMB":179,"rssAfterMB":225,"heapUsedAfterMB":57,"maxRSSRaw":225296384}
+{"file":"/tmp/transcript-bloat/replay-out/B545.jsonl","sizeBytes":10656044,"entries":4611,"modelCallEntries":1890,"contextMessages":58,"openMs":48,"buildContextMs":4,"rssBeforeMB":181,"rssAfterMB":226,"heapUsedAfterMB":57,"maxRSSRaw":226787328}
+{"file":"/tmp/transcript-bloat/replay-out/B545.jsonl","sizeBytes":10656044,"entries":4611,"modelCallEntries":1890,"contextMessages":58,"openMs":47,"buildContextMs":4,"rssBeforeMB":180,"rssAfterMB":227,"heapUsedAfterMB":57,"maxRSSRaw":226983936}
+## done
+## archived-export.ts (export of a gzipped archived session, this branch)
+EXPORT FAILED Cannot resume session "/var/folders/g9/jl1w0vp90pz8r5h9gvgw26hm0000gn/T/sc-arch-xuHcI5/2026-10-29T13-34-09-953Z_01a187de-3821-7000-8778-c5350d7dfe28.jsonl.gz": the session header is missing or malformed. The file was not modified.
+## archived-export.ts on origin/wesley/dev 626061efcb (before this PR)
+EXPORT FAILED Cannot resume session "/var/folders/g9/jl1w0vp90pz8r5h9gvgw26hm0000gn/T/sc-arch-ct308Y/2026-10-29T13-34-48-786Z_01a187de-cfd2-7000-aaed-f2e163b2de4b.jsonl.gz": the session header is missing or malformed. The file was not modified.

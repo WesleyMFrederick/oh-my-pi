@@ -3,10 +3,13 @@ import * as path from "node:path";
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, Tool } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
-import { isEexist, isEnoent, logger, readLines } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, isEexist, isEnoent, logger, readLines } from "@oh-my-pi/pi-utils";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
+import { BlobStore } from "./blob-store";
 import type { SessionEntry } from "./session-entries";
+import { resolveBlobRefsInEntries } from "./session-loader";
 import type { SessionManager } from "./session-manager";
+import { truncateForPersistence } from "./session-persistence";
 
 export const MODEL_CALL_CUSTOM_TYPE = "omp:model-call";
 export const MODEL_CALL_RECORDS_FILE = "model-calls.ndjson";
@@ -15,17 +18,55 @@ export function modelCallRecordsPath(sessionFile: string): string | null {
 	return sessionFile.endsWith(".jsonl") ? path.join(sessionFile.slice(0, -6), MODEL_CALL_RECORDS_FILE) : null;
 }
 
-export function copyModelCallRecords(sourceSessionFile: string, destinationSessionFile: string): void {
+const pendingCopies = new Map<string, Promise<void>>();
+const checkedTails = new Map<string, Promise<void>>();
+
+export async function copyModelCallRecords(sourceSessionFile: string, destinationSessionFile: string): Promise<void> {
 	const source = modelCallRecordsPath(sourceSessionFile);
 	const destination = modelCallRecordsPath(destinationSessionFile);
 	if (!source || !destination || path.resolve(source) === path.resolve(destination)) return;
-	try {
-		fs.mkdirSync(path.dirname(destination), { recursive: true });
-		fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE);
-	} catch (error) {
-		if (isEnoent(error) || isEexist(error)) return;
-		logger.warn("Failed to copy model-call records", { source, destination, error: String(error) });
+	const key = path.resolve(destination);
+	const copy = (async () => {
+		try {
+			await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+			await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE);
+		} catch (error) {
+			if (isEnoent(error) || isEexist(error)) return;
+			logger.warn("Failed to copy model-call records", {
+				source,
+				destination,
+				error: String(error),
+			});
+		}
+	})();
+	pendingCopies.set(key, copy);
+	await copy;
+	if (pendingCopies.get(key) === copy) pendingCopies.delete(key);
+}
+
+function repairTail(file: string): Promise<void> {
+	const key = path.resolve(file);
+	let pending = checkedTails.get(key);
+	if (!pending) {
+		pending = (async () => {
+			try {
+				const handle = await fs.promises.open(file, "r");
+				try {
+					const { size } = await handle.stat();
+					if (size === 0) return;
+					const last = new Uint8Array(1);
+					await handle.read(last, 0, 1, size - 1);
+					if (last[0] !== 0x0a) await fs.promises.appendFile(file, "\n");
+				} finally {
+					await handle.close();
+				}
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+		})();
+		checkedTails.set(key, pending);
 	}
+	return pending;
 }
 
 export interface ModelCallJournalData {
@@ -64,6 +105,7 @@ export async function resolveModelCallEntries(sessionFile: string, entries: Sess
 	const records = new Map<string, ModelCallJournalRecord>();
 	const file = modelCallRecordsPath(sessionFile);
 	if (keys.size > 0 && file) {
+		await pendingCopies.get(path.resolve(file));
 		const decoder = new TextDecoder();
 		try {
 			for await (const line of readLines(Bun.file(file).stream())) {
@@ -78,12 +120,21 @@ export async function resolveModelCallEntries(sessionFile: string, entries: Sess
 			if (!isEnoent(error)) throw error;
 		}
 	}
-	return entries.map(entry => {
+	const sidecarEntries: SessionEntry[] = [];
+	const resolved = entries.map(entry => {
 		if (entry.type !== "custom" || entry.customType !== MODEL_CALL_CUSTOM_TYPE) return entry;
 		const data = entry.data as ModelCallJournalPointer | undefined;
 		if (data?.version !== 2) return entry;
-		return { ...entry, data: records.get(data.key) ?? { ...data, unavailable: "missing" } };
+		const record = records.get(data.key);
+		const resolvedEntry = {
+			...entry,
+			data: record ?? { ...data, unavailable: "missing" },
+		};
+		if (record) sidecarEntries.push(resolvedEntry);
+		return resolvedEntry;
 	});
+	await resolveBlobRefsInEntries(sidecarEntries, new BlobStore(getBlobsDir()));
+	return resolved;
 }
 
 const TOOL_SCHEMA_KEYS = [
@@ -124,6 +175,7 @@ function requestSnapshot(context: Context): Context {
  * through a cloned manager pointed at the dispatching file. In-memory calls pass through.
  */
 export function createModelCallJournalStream(sm: SessionManager, stream: StreamFn): StreamFn {
+	const blobStore = new BlobStore(getBlobsDir());
 	return (model, context, options) => {
 		if (!sm.isPersisted()) return stream(model, context, options);
 		const requestId = Snowflake.next();
@@ -170,13 +222,20 @@ export function createModelCallJournalStream(sm: SessionManager, stream: StreamF
 				phase: data.phase,
 				model: identity,
 			};
-			const serialized = `${JSON.stringify({ ...pointer, ...data })}\n`;
+			const serialized = `${JSON.stringify(truncateForPersistence({ ...pointer, ...data }, blobStore))}\n`;
 			return (async () => {
 				const sessionFile = sm.getSessionId() === sessionId ? sm.getSessionFile()! : originalFile!;
 				const file = modelCallRecordsPath(sessionFile);
 				if (!file) throw new Error("Model-call journal requires a .jsonl session file");
-				await fs.promises.mkdir(path.dirname(file), { recursive: true });
-				await fs.promises.appendFile(file, serialized);
+				await pendingCopies.get(path.resolve(file));
+				try {
+					await repairTail(file);
+					await fs.promises.mkdir(path.dirname(file), { recursive: true });
+					await fs.promises.appendFile(file, serialized);
+				} catch (error) {
+					checkedTails.delete(path.resolve(file));
+					throw error;
+				}
 				if (sm.getSessionId() === sessionId) {
 					sm.appendCustomEntry(MODEL_CALL_CUSTOM_TYPE, pointer);
 				} else {

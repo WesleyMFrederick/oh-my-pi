@@ -101,6 +101,41 @@ async function journal(manager: SessionManager): Promise<ModelCallJournalData[]>
 }
 
 describe("createModelCallJournalStream", () => {
+	it("externalizes request images and restores them without mutating manager entries", async () => {
+		const manager = createManager();
+		const data = Buffer.from("image bytes".repeat(200)).toString("base64");
+		const context = contextWith("image");
+		context.messages = [
+			{
+				role: "user",
+				content: [{ type: "image", data, mimeType: "image/png" }],
+				timestamp: 1,
+			},
+		];
+		await (
+			await createModelCallJournalStream(manager, provider({}, reply("seen")))(model, context, undefined)
+		).result();
+		const text = await Bun.file(modelCallRecordsPath(manager.getSessionFile()!)!).text();
+		expect(text).toContain("blob:sha256:");
+		expect(text).not.toContain(data);
+		const entries = manager.getEntries();
+		const before = structuredClone(entries);
+		const records = await journal(manager);
+		expect(records.find(record => record.phase === "request")?.context?.messages).toEqual(context.messages);
+		expect(entries).toEqual(before);
+	});
+
+	it("separates a torn tail from every record of the next call", async () => {
+		const manager = createManager();
+		await Bun.write(modelCallRecordsPath(manager.getSessionFile()!)!, '{"version":2,"key":"torn');
+		await (
+			await createModelCallJournalStream(manager, provider({}, reply("answer")))(model, contextWith("q"), undefined)
+		).result();
+		const records = await journal(manager);
+		expect(records.map(record => record.phase)).toEqual(["request", "payload", "response"]);
+		for (const record of records) expect(record).not.toHaveProperty("unavailable");
+	});
+
 	it("journals two sequential calls with their own request-only context and effective payload, durably and outside LLM context", async () => {
 		const storage = new FileSessionStorage();
 		const manager = createManager();
@@ -267,7 +302,7 @@ describe("createModelCallJournalStream", () => {
 		expect(await fs.readdir(dir)).toEqual([]);
 	});
 
-	for (const operation of ["fork", "branch", "forkFrom", "persistCopy"] as const) {
+	for (const operation of ["branch", "forkFrom", "forkFromWithArtifacts", "persistCopy"] as const) {
 		it(`keeps inherited model-call bodies readable after ${operation}`, async () => {
 			const source = createManager();
 			await (
@@ -279,15 +314,26 @@ describe("createModelCallJournalStream", () => {
 			await source.flush();
 			const sourceFile = source.getSessionFile()!;
 			let destination = source;
-			if (operation === "fork") await source.fork();
-			else if (operation === "branch") source.createBranchedSession(source.getLeafId()!);
-			else if (operation === "persistCopy") {
+			if (operation === "branch") {
+				source.createBranchedSession(source.getLeafId()!);
+				await (
+					await createModelCallJournalStream(source, provider({ body: "new payload" }, reply("new response")))(
+						model,
+						contextWith("new question"),
+						undefined,
+					)
+				).result();
+			} else if (operation === "persistCopy") {
 				destination = await source.persistCopy({ sessionDir: dir });
 				managers.push(destination);
 			} else {
-				destination = await SessionManager.forkFrom(sourceFile, dir, dir, new FileSessionStorage(), {
-					copyArtifacts: false,
-				});
+				destination = await SessionManager.forkFrom(
+					sourceFile,
+					dir,
+					dir,
+					new FileSessionStorage(),
+					operation === "forkFrom" ? { copyArtifacts: false } : undefined,
+				);
 				managers.push(destination);
 			}
 			expect(destination.getSessionFile()).not.toBe(sourceFile);
@@ -299,6 +345,14 @@ describe("createModelCallJournalStream", () => {
 			expect(records.find(record => record.phase === "response")?.message?.content).toEqual([
 				{ type: "text", text: "carried response" },
 			]);
+			if (operation === "branch") {
+				expect(
+					records.filter(record => record.phase === "request").map(record => record.context?.messages[0]?.content),
+				).toEqual(["carried question", "new question"]);
+				expect(
+					records.filter(record => record.phase === "response").map(record => record.message?.content),
+				).toEqual([[{ type: "text", text: "carried response" }], [{ type: "text", text: "new response" }]]);
+			}
 		});
 	}
 
@@ -358,6 +412,37 @@ describe("createModelCallJournalStream", () => {
 		expect(records.find(record => record?.phase === "payload")?.payload).toEqual({ body: "export payload" });
 		expect(records.find(record => record?.phase === "response")?.message?.content).toEqual([
 			{ type: "text", text: "export response" },
+		]);
+	});
+
+	it("embeds resolved sub-session request and response bodies in the parent export", async () => {
+		const parent = createManager();
+		parent.appendMessage({ role: "user", content: "parent", timestamp: 1 });
+		await parent.flush();
+		await parent.ensureOnDisk();
+		const parentFile = parent.getSessionFile()!;
+		const childFile = path.join(parentFile.slice(0, -6), "agent-child.jsonl");
+		const child = createManager();
+		await child.setSessionFile(childFile);
+		await (
+			await createModelCallJournalStream(child, provider({}, reply("child response")))(
+				model,
+				contextWith("child question"),
+				undefined,
+			)
+		).result();
+		await child.flush();
+		const outputPath = path.join(dir, "sub-export.html");
+		await exportFromFile(parentFile, { outputPath });
+		const { document } = parseHTML(await Bun.file(outputPath).text());
+		const embedded = document.getElementById("session-data")!.textContent!;
+		const data = JSON.parse(Buffer.from(embedded.trim(), "base64").toString()) as {
+			subSessions: Record<string, { entries: { data?: ModelCallJournalData }[] }>;
+		};
+		const records = data.subSessions["agent-child"]!.entries.map(entry => entry.data);
+		expect(records.find(record => record?.phase === "request")?.context?.messages[0]?.content).toBe("child question");
+		expect(records.find(record => record?.phase === "response")?.message?.content).toEqual([
+			{ type: "text", text: "child response" },
 		]);
 	});
 });
