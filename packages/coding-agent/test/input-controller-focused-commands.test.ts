@@ -37,6 +37,7 @@ function createFocusedContext() {
 	const ctx = {
 		editor,
 		ui: { requestRender: vi.fn() },
+		sessionManager: { appendCustomEntry: vi.fn() },
 		session: {
 			isStreaming: false,
 			isCompacting: false,

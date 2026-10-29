@@ -72,6 +72,7 @@ function createContext(opts: {
 		editor,
 		ui: { requestRender },
 		skillCommands: new Map<string, string>(),
+		sessionManager: { appendCustomEntry: vi.fn() },
 		session: {
 			isStreaming: opts.isStreaming,
 			isCompacting: false,

@@ -108,6 +108,16 @@ function renderSession(entries: unknown[], leafId: string): RenderedSession {
 	return { assistant, document, context, lastScrolledId: () => lastScrolledId };
 }
 
+function openTextDisclosures(rendered: RenderedSession): void {
+	vm.runInContext(
+		`document.querySelectorAll('details[data-model-text]').forEach(details => {
+		details.open = true;
+		details.dispatchEvent(new window.Event('toggle', { bubbles: true }));
+	})`,
+		rendered.context,
+	);
+}
+
 function renderAssistant(
 	content: AssistantBlock[],
 	stopReason: "stop" | "aborted" | "error" = "stop",
@@ -415,5 +425,216 @@ describe("HTML export assistant content ordering", () => {
 		expect(renderedSidebarOrder(rendered)).toEqual(["assistant: root", "user: branch-b", "user: branch-a"]);
 		const updatedRows = Array.from(rendered.document.querySelectorAll("#tree-container .tree-node"));
 		expect(updatedRows.map(row => row.classList.contains("in-path"))).toEqual([true, true, false]);
+	});
+});
+
+describe("HTML export retained content", () => {
+	const root = {
+		type: "message",
+		id: "root",
+		parentId: null,
+		timestamp: "2026-01-01T00:00:01.000Z",
+		message: { role: "assistant", content: [{ type: "text", text: "root" }], stopReason: "stop" },
+	};
+
+	test("shows hidden HARNESS text, images and legacy notes safely without stored-entry metadata", () => {
+		const attack = '<img src=x onerror="alert(1)"><script>alert(2)</script>';
+		const rendered = renderSession(
+			[
+				root,
+				{
+					type: "custom_message",
+					id: "hidden",
+					parentId: "root",
+					customType: "harness",
+					display: false,
+					content: [
+						{ type: "text", text: `hidden first\nhidden second\n${attack}\n[unsafe](javascript:alert%281%29)` },
+						{ type: "image", mimeType: "image/png", data: "YWJj" },
+						{ type: "provider-extra", nested: { text: "unknown block retained" } },
+					],
+				},
+				{
+					type: "custom",
+					id: "legacy",
+					parentId: "hidden",
+					customType: "decision-label",
+					data: { notes: "legacy decision note\nsecond line" },
+				},
+				{
+					type: "session_init",
+					id: "init",
+					parentId: "legacy",
+					systemPrompt: "initial system",
+					task: "initial task",
+					tools: [{ parameters: { extra: "schema retained" } }],
+				},
+				{ type: "ttsr_injection", id: "injection", parentId: "init", content: "retained TTSR rule" },
+				{ type: "session_reset", id: "reset", parentId: "injection", reason: "reset boundary" },
+			],
+			"reset",
+		);
+		const messages = rendered.document.getElementById("messages")!;
+		const hidden = messages.querySelector("#entry-hidden")!;
+		expect(hidden.textContent).toContain("hidden in terminal");
+		expect(hidden.textContent).toContain("hidden first");
+		expect(hidden.textContent).toContain("hidden second");
+		expect(hidden.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,YWJj");
+		expect(hidden.querySelector("script")).toBeNull();
+		expect(hidden.querySelector("[onerror]")).toBeNull();
+		expect(hidden.querySelector('a[href^="javascript:"]')).toBeNull();
+		expect(hidden.textContent).toContain(attack);
+		for (const text of [
+			"unknown block retained",
+			"legacy decision note\nsecond line",
+			"initial system",
+			"initial task",
+			"retained TTSR rule",
+			"reset boundary",
+		]) {
+			expect(messages.textContent).toContain(text);
+		}
+		expect(messages.textContent).not.toContain("schema retained");
+		expect(messages.textContent).not.toContain("Full stored entry");
+	});
+
+	test("loads complete tool result text on demand without raw provider fields or duplicate tool navigation", () => {
+		const fullText = `${"output line\n".repeat(150)}last line beyond preview`;
+		const rendered = renderSession(
+			[
+				{
+					...root,
+					message: {
+						role: "assistant",
+						stopReason: "toolUse",
+						content: [
+							{ type: "text", text: "running" },
+							{ type: "toolCall", id: "call", name: "read", arguments: { path: "large.txt" } },
+						],
+					},
+				},
+				{
+					type: "message",
+					id: "result",
+					parentId: "root",
+					message: {
+						role: "toolResult",
+						toolCallId: "call",
+						toolName: "read",
+						isError: true,
+						content: [
+							{ type: "text", text: fullText },
+							{ type: "image", mimeType: "image/png", data: "YWJj" },
+						],
+						details: { providerField: "unrecognized tool detail" },
+					},
+				},
+			],
+			"result",
+		);
+		const disclosure = rendered.assistant.querySelector(".audit-disclosure")!;
+		expect(disclosure.querySelector("pre")).toBeNull();
+		openTextDisclosures(rendered);
+		expect(disclosure.textContent).toContain(fullText);
+		expect(disclosure.textContent).not.toContain("unrecognized tool detail");
+		expect(disclosure.textContent).not.toContain("YWJj");
+		expect(rendered.document.querySelectorAll("omp-tool-view")).toHaveLength(1);
+		expect(renderedSidebarOrder(rendered).filter(row => row === "[read: large.txt]")).toHaveLength(1);
+	});
+
+	test("loads sent text and LLM replies on demand without raw API fields or duplicate pre-hook inputs", () => {
+		const model = { provider: "provider", id: "model", api: "api" };
+		const phases = [
+			{
+				requestId: "first",
+				phase: "request",
+				context: {
+					systemPrompt: "historical system\nsecond line",
+					messages: [{ role: "developer", content: "request-only injection" }],
+					tools: [{ parameters: { properties: { fullSchema: { description: "historical schema" } } } }],
+				},
+			},
+			{
+				requestId: "first",
+				phase: "payload",
+				payload: {
+					instructions: "historical system\nsecond line",
+					messages: [
+						{ role: "developer", content: "request-only injection" },
+						{ content: "effective post-hook payload" },
+					],
+					unknown: "provider extension",
+					tools: [{ parameters: { properties: { fullSchema: { description: "historical schema" } } } }],
+				},
+			},
+			{
+				requestId: "first",
+				phase: "response",
+				message: { content: [{ type: "text", text: "raw first response" }], providerExtra: "raw response field" },
+			},
+			{
+				requestId: "second",
+				phase: "request",
+				context: { systemPrompt: "different system", messages: [{ content: "second call input" }] },
+			},
+			{ requestId: "second", phase: "error", error: "second call failed" },
+		];
+		const rendered = renderSession(
+			[
+				root,
+				...phases.map((phase, index) => ({
+					type: "custom",
+					customType: "omp:model-call",
+					id: `audit-${index}`,
+					parentId: index === 0 ? "root" : `audit-${index - 1}`,
+					data: { version: 1, model, ...phase },
+				})),
+			],
+			"audit-4",
+		);
+		const calls = rendered.document.querySelectorAll("#messages .model-call");
+		expect(Array.from(calls).map(call => call.getAttribute("data-request-id"))).toEqual([
+			"first",
+			"first",
+			"second",
+			"second",
+		]);
+		expect(rendered.document.querySelectorAll(".model-call pre")).toHaveLength(0);
+		openTextDisclosures(rendered);
+		for (const text of ["historical system\nsecond line", "request-only injection", "effective post-hook payload"])
+			expect(calls[0]!.textContent).toContain(text);
+		expect(calls[1]!.textContent).toContain("raw first response");
+		expect(calls[2]!.textContent).toContain("second call input");
+		expect(calls[2]!.textContent).not.toContain("request-only injection");
+		expect(calls[3]!.textContent).toContain("second call failed");
+		for (const text of ["historical schema", "provider extension", "raw response field", "Full stored entry"])
+			expect(rendered.document.getElementById("messages")!.textContent).not.toContain(text);
+		expect(renderedSidebarOrder(rendered).filter(row => row.startsWith("LLM "))).toHaveLength(4);
+	});
+
+	test("shows original submissions, including images and unsafe text, as non-sent records", () => {
+		const rendered = renderSession(
+			[
+				root,
+				{
+					type: "custom",
+					id: "sub",
+					parentId: "root",
+					customType: "omp:user-submission",
+					data: {
+						source: "interactive",
+						text: "/drop <script>alert(1)</script>",
+						images: [{ type: "image", mimeType: "image/png", data: "YWJj" }],
+					},
+				},
+			],
+			"sub",
+		);
+		const submission = rendered.document.querySelector("#messages #entry-sub")!;
+		expect(submission.textContent).toContain("may have been handled or dropped");
+		expect(submission.textContent).toContain("/drop <script>alert(1)</script>");
+		expect(submission.querySelector("script")).toBeNull();
+		expect(submission.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,YWJj");
+		expect(renderedSidebarOrder(rendered)).toContain("submission: /drop <script>alert(1)</script>");
 	});
 });

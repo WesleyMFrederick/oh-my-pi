@@ -39,6 +39,7 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			},
 			ui: { requestRender: vi.fn() },
 			skillCommands: new Map<string, string>(),
+			sessionManager: { appendCustomEntry: vi.fn() },
 			session: {
 				isStreaming: true,
 				isCompacting: false,
@@ -86,6 +87,7 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			},
 			ui: { requestRender: vi.fn() },
 			skillCommands: new Map<string, string>(),
+			sessionManager: { appendCustomEntry: vi.fn() },
 			session: {
 				isStreaming: false,
 				isCompacting: false,

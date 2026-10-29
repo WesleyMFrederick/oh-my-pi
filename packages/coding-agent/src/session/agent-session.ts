@@ -7029,6 +7029,12 @@ export class AgentSession implements SettingsScope {
 		// Slash/custom-command handling below rewrites `text`; keep the original
 		// so a dropped prompt is handed back exactly as the user typed it.
 		const typedText = text;
+		this.sessionManager.appendCustomEntry("omp:prompt-submission", {
+			text: typedText,
+			images: options?.images ? structuredClone(options.images) : undefined,
+			attribution: options?.attribution ?? (options?.synthetic ? "agent" : "user"),
+			submittedAt,
+		});
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			if (options?.runCommands !== false) {

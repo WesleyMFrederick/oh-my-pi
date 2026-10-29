@@ -104,7 +104,10 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 		ui: { requestRender } as unknown as InteractiveModeContext["ui"],
 		session,
 		settings: session.settings,
-		sessionManager: { getSessionName: () => "named-session" } as InteractiveModeContext["sessionManager"],
+		sessionManager: {
+			getSessionName: () => "named-session",
+			appendCustomEntry: vi.fn(),
+		} as unknown as InteractiveModeContext["sessionManager"],
 		compactionQueuedMessages: [] as InteractiveModeContext["compactionQueuedMessages"],
 		skillCommands: new Map(),
 		fileSlashCommands: new Set<string>(),
