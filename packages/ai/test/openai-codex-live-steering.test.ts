@@ -14,6 +14,7 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import * as piUtils from "@oh-my-pi/pi-utils";
+import { LiveSteeringChannel } from "../../agent/src/live-steering";
 
 const { getAgentDir, setAgentDir, TempDir } = piUtils;
 const originalAgentDir = getAgentDir();
@@ -288,7 +289,7 @@ describe("codex live steering", () => {
 		]);
 	});
 
-	it("hands rejected steering back and sends it as ordinary input next time", async () => {
+	it("Given a native turn collision, When steering is rejected, Then the response continues and steering is sent at the next boundary", async () => {
 		installSocket((frame, socket) => {
 			if (frame.type === "response.create" && creates().length === 1) {
 				socket.emit({ type: "response.created", response: { id: "resp_1" } }, ...messageFrames("msg_1", "Hi"));
@@ -297,9 +298,8 @@ describe("codex live steering", () => {
 			if (frame.type === "response.steer") {
 				socket.emit(
 					{
-						type: "response.steer.failed",
-						steer: { previous_response_id: "resp_1", input: frame.input },
-						error: { type: "invalid_request_error", code: "response_already_completed", message: "done" },
+						type: "error",
+						error: { code: "unsupported_native_inflight_message", message: "native turn running" },
 					},
 					{ type: "response.completed", response: { id: "resp_1", status: "completed", usage: USAGE } },
 				);
@@ -312,19 +312,27 @@ describe("codex live steering", () => {
 		});
 		const model = createGpt6Model();
 		const state = new Map<string, ProviderSessionState>();
-		const steering = oneShotSteering("one more thing");
+		const steerMessage: UserMessage = { role: "user", content: "one more thing", timestamp: Date.now() };
+		const steering = new LiveSteeringChannel({
+			wait: async () => {},
+			take: async () => [steerMessage],
+			toProvider: async messages => messages as UserMessage[],
+		});
 		const user: UserMessage = { role: "user", content: "Hello", timestamp: Date.now() };
 
 		const first: AssistantMessage = await streamOpenAICodexResponses(
 			model,
 			{ systemPrompt: SYSTEM, messages: [user] },
-			options(state, steering.source),
+			options(state, steering),
 		).result();
-		expect(steering.settled()).toBe("rejected");
+		expect(first.stopReason).not.toBe("error");
+		expect(steering.deferred).toEqual([steerMessage]);
 
-		const steerMessage: UserMessage = { role: "user", content: "one more thing", timestamp: Date.now() };
-		const context: Context = { systemPrompt: SYSTEM, messages: [user, first, steerMessage] };
-		await streamOpenAICodexResponses(model, context, options(state)).result();
+		const context: Context = { systemPrompt: SYSTEM, messages: [user, first, ...steering.deferred] };
+		const laterSteering = oneShotSteering("later");
+		await streamOpenAICodexResponses(model, context, options(state, laterSteering.source)).result();
+		expect(laterSteering.settled()).toBeUndefined();
+		expect(ScriptedWebSocket.sent.filter(frame => frame.type === "response.steer")).toHaveLength(1);
 
 		expect(creates()[1]?.previous_response_id).toBe("resp_1");
 		expect(creates()[1]?.input).toEqual([

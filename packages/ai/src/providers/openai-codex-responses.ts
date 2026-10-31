@@ -423,6 +423,7 @@ export interface OpenAICodexWebSocketDebugStats {
  */
 type CodexWebSocketSessionState = {
 	disableWebsocket: boolean;
+	steeringUnsupported?: boolean;
 	lastRequest?: RequestBody;
 	/** Last completed response; an in-progress response cannot replace the retry baseline. */
 	lastResponseId?: string;
@@ -2458,6 +2459,7 @@ class CodexStreamProcessor {
 		if (
 			!source ||
 			!connection ||
+			this.runtime.websocketState?.steeringUnsupported ||
 			this.#steerPump ||
 			typeof responseId !== "string" ||
 			this.runtime.transport !== "websocket" ||
@@ -3827,6 +3829,7 @@ interface CodexSteerWaiter {
 
 interface CodexWebSocketConnectionOptions {
 	onHandshakeHeaders?: (headers: Headers) => void;
+	onSteeringUnsupported?: () => void;
 	proxy?: string;
 }
 
@@ -3835,6 +3838,7 @@ class CodexWebSocketConnection {
 	#headers: Record<string, string>;
 	#proxy?: string;
 	#onHandshakeHeaders?: (headers: Headers) => void;
+	#onSteeringUnsupported?: () => void;
 	#socket: Bun.WebSocket | null = null;
 	#queue: Array<Record<string, unknown> | Error | null> = [];
 	#waiters: Array<() => void> = [];
@@ -3874,6 +3878,7 @@ class CodexWebSocketConnection {
 		this.#headers = headers;
 		this.#proxy = options.proxy;
 		this.#onHandshakeHeaders = options.onHandshakeHeaders;
+		this.#onSteeringUnsupported = options.onSteeringUnsupported;
 	}
 
 	isOpen(): boolean {
@@ -4042,6 +4047,20 @@ class CodexWebSocketConnection {
 					}
 				}
 				notifyCodexWebSocketInbound(this.#streamObserver, parsed, text);
+				if (parsed.type === "error" && parsed.code === "unsupported_native_inflight_message") {
+					const waiter = this.#steerWaiters.shift();
+					if (waiter) {
+						this.#onSteeringUnsupported?.();
+						waiter.resolve({
+							accepted: false,
+							code: parsed.code,
+							message: typeof parsed.message === "string" ? parsed.message : undefined,
+						});
+					} else {
+						logger.warn("[codex] dropping unsolicited native steering rejection", { code: parsed.code });
+					}
+					return;
+				}
 				// Steering acknowledgements belong to the submitter, not to the
 				// response stream they interleave with.
 				if (typeof parsed.type === "string" && parsed.type.startsWith("response.steer.")) {
@@ -4586,6 +4605,9 @@ async function getOrCreateCodexWebSocketConnection(
 	state.connection = new CodexWebSocketConnection(url, headerRecord, {
 		onHandshakeHeaders: handshakeHeaders => {
 			updateCodexSessionMetadataFromHeaders(turnState, state, handshakeHeaders);
+		},
+		onSteeringUnsupported: () => {
+			state.steeringUnsupported = true;
 		},
 		proxy,
 	});

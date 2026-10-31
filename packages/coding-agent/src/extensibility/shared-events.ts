@@ -12,6 +12,7 @@
  * carry subsystem-specific message types — lives in the per-subsystem
  * `types.ts` files and is documented there.
  */
+import type { FallbackCause } from "../session/fallback-cause";
 import { type AgentMessage, isNonBlankContext, joinAdditionalContext } from "@oh-my-pi/pi-agent-core";
 import type { CompactionPreparation, CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantRetryRecovery, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
@@ -274,6 +275,8 @@ export interface RetryFallbackAppliedEvent {
 	from: string;
 	to: string;
 	role: string;
+	cause: FallbackCause;
+	trigger: "turn" | "steer";
 	/** Decision-time cause, including whether the source request was skipped. */
 	reason?: string;
 }

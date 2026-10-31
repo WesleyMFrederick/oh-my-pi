@@ -2072,6 +2072,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			emitSubagentEvent(event);
 			publishAdvisorState(session);
 			publishServingModel();
+			if (event.type === "retry_fallback_applied") {
+				progress.fallback = { from: event.from, to: event.to, cause: event.cause, trigger: event.trigger };
+				scheduleProgress(true);
+			}
 			if (event.type === "auto_retry_start") {
 				progress.retryState = {
 					attempt: event.attempt,
@@ -2798,6 +2802,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		resolvedModelIdentity: progress.resolvedModelIdentity,
 		resolvedThinkingLevel: progress.resolvedThinkingLevel,
 		resolvedModelIsFallback: progress.resolvedModelIsFallback,
+		fallback: progress.fallback,
 		resolvedModelRoute: progress.resolvedModelRoute,
 		advisor: progress.advisor,
 		error: exitCode !== 0 && stderr ? stderr : undefined,

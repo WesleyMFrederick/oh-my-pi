@@ -4153,6 +4153,7 @@ export class AgentSession implements SettingsScope {
 					return;
 				}
 			}
+			this.#recovery.recordTerminalHarnessFault(msg);
 			// Classifier refusals are persisted-skipped above; also prune the trailing
 			// stub from active context so the next turn's prompt does not replay it.
 			// Keep a reference for post-settle readers (print mode, task executor via
@@ -4923,6 +4924,8 @@ export class AgentSession implements SettingsScope {
 				from: event.from,
 				to: event.to,
 				role: event.role,
+				cause: event.cause,
+				trigger: event.trigger,
 				reason: event.reason,
 			});
 		} else if (event.type === "retry_fallback_succeeded") {

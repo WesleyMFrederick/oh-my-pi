@@ -71,6 +71,7 @@ export function formatTaskResultSummary(
 		duration: formatDuration(options.totalDurationMs),
 		abortReason: result.aborted ? result.abortReason : undefined,
 		error,
+		fallback: result.fallback,
 		resumable,
 		preview,
 		truncated,

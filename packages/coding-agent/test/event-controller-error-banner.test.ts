@@ -128,10 +128,13 @@ describe("EventController error banner", () => {
 			from: "source/model",
 			to: "target/model",
 			role: "default",
+			cause: { origin: "provider", kind: "server_error", code: "unavailable" },
+			trigger: "turn",
 			reason,
 		});
 		const warning = showWarning.mock.calls[0][0];
 		expect(warning).toContain("source/model -> target/model");
+		expect(warning).toContain("server_error (unavailable)");
 		const lines = warning.split("\n");
 		expect(lines).toHaveLength(2);
 		expect(lines[1]).toContain("503 unavailable");
