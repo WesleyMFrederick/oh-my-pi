@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- Prevent harness-caused failures from switching models; retry overload and unknown failures on the same model, and record fallback causes and triggers in session history, advisor switch records, warnings, and parent task results.
 - `/guided-goal` now appears and works in RPC/ACP hosts such as Paseo.
 - Fixed orphaned shared-browser tabs that failed to close waiting for the next tab open; the sweep now retries up to three times in the background.
 - Fixed a release or borrow silently skipping a browser launch ledger entry when its directory could not be read.

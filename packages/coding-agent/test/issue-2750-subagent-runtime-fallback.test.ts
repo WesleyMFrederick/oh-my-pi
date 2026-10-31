@@ -75,6 +75,8 @@ function createYieldingSession(
 					from: "primary/bad-runtime-model",
 					to: "fallback/working-model",
 					role: "subagent:issue-2750",
+					cause: { origin: "provider", kind: "server_error" },
+					trigger: "turn",
 				});
 				if (fallback === "served") {
 					session.servingModel = { selector: "fallback/working-model", isFallback: true };

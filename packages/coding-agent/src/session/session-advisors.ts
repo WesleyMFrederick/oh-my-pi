@@ -38,6 +38,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { isUsageLimitOutcome, resolveModelServiceTier, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { classifyFallbackCause } from "./fallback-cause";
 import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { extractHttpStatusFromError, logger, prompt } from "@oh-my-pi/pi-utils";
@@ -341,6 +342,7 @@ interface ActiveAdvisor {
 	retryFallbackPendingSuccess: boolean;
 	/** Count of consecutive usage-limit block waits, bounded by retry.maxRetries; reset on turn success. */
 	usageLimitRetries: number;
+	recoveryRetries: number;
 	signature: string;
 }
 /** First index whose provider usage may anchor the advisor's context estimate. */
@@ -1040,6 +1042,7 @@ export class SessionAdvisors {
 			// A reset aborts any pending usage-limit wait; clear its budget so the new
 			// conversation starts with a fresh retry allowance (issue #11947).
 			a.usageLimitRetries = 0;
+			a.recoveryRetries = 0;
 			// Resets the emission guard and every tool-side note state together.
 			a.adviseTool.resetDeliveredNotes();
 			a.eligibleUpdates = 0;
@@ -1567,6 +1570,7 @@ export class SessionAdvisors {
 					// A completed turn ended the usage-limit episode — start the next
 					// block's bounded wait budget fresh.
 					advisorRef.usageLimitRetries = 0;
+					advisorRef.recoveryRetries = 0;
 					const fallback = advisorRef.retryFallback;
 					if (!advisorRef.retryFallbackPendingSuccess || !fallback) return;
 					advisorRef.retryFallbackPendingSuccess = false;
@@ -1626,6 +1630,7 @@ export class SessionAdvisors {
 				pendingCoveredTurn: 0,
 				retryFallbackPendingSuccess: false,
 				usageLimitRetries: 0,
+				recoveryRetries: 0,
 				signature,
 			};
 			this.#refreshAdvisorProviderIdentity(advisorRef);
@@ -1874,6 +1879,7 @@ export class SessionAdvisors {
 			// Match the conversation-boundary re-prime: a reset must not carry a
 			// pending wait's usage-limit budget into the reset conversation.
 			a.usageLimitRetries = 0;
+			a.recoveryRetries = 0;
 		}
 	}
 
@@ -2048,7 +2054,8 @@ export class SessionAdvisors {
 					errorStatus: assistantFailure.errorStatus,
 				})
 			: AIError.classify(error, currentModel.api);
-		if (AIError.is(errorId, AIError.Flag.Abort) || AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
+		const cause = classifyFallbackCause(assistantFailure ?? ({ errorMessage: message } as AssistantMessage), errorId);
+		if (AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
 		// Text-ambiguous overflows waive the veto; usage-backed do not — see AIError.isTextAmbiguousContextOverflow (#9235).
 		const contextWindow = currentModel.contextWindow ?? 0;
 		const overflowVeto =
@@ -2056,6 +2063,32 @@ export class SessionAdvisors {
 				(assistantFailure !== undefined && AIError.isContextOverflow(assistantFailure, contextWindow))) &&
 			!AIError.isTextAmbiguousContextOverflow(errorId, assistantFailure, contextWindow);
 		if (overflowVeto) {
+			return false;
+		}
+
+		const retrySettings = cfgRetry.get(this.#host.settings);
+		const boundedRetry =
+			cause.origin === "unknown" ||
+			(cause.origin === "harness" && (cause.kind === "rate_limit" || cause.kind === "abort"));
+		if (boundedRetry && retrySettings.enabled && advisor.recoveryRetries < retrySettings.maxRetries) {
+			const delayMs = Math.max(
+				retrySettings.baseDelayMs,
+				extractProviderRetryHint(currentModel.provider, message) ?? 0,
+			);
+			if (retrySettings.maxDelayMs <= 0 || delayMs <= retrySettings.maxDelayMs) {
+				await scheduler.wait(delayMs, { signal });
+				advisor.recoveryRetries++;
+				return true;
+			}
+		}
+		if (cause.origin === "harness") {
+			this.#host.sessionManager.appendCustomEntry("omp:model-switch-refused", {
+				advisor: advisor.name,
+				model: formatRetryFallbackSelector(currentModel, advisor.thinkingLevel),
+				cause,
+				trigger: "turn",
+				attempt: advisor.recoveryRetries + 1,
+			});
 			return false;
 		}
 
@@ -2103,7 +2136,6 @@ export class SessionAdvisors {
 
 		const currentSelector = formatRetryFallbackSelector(currentModel, advisor.thinkingLevel);
 
-		const retrySettings = cfgRetry.get(this.#host.settings);
 		// A usage-limit error with no sibling credential and no usable model
 		// fallback is not automatically fatal: wait out a transient credential
 		// block and retry, mirroring the primary turn-recovery. Only a wait past
@@ -2167,11 +2199,22 @@ export class SessionAdvisors {
 				}
 				advisor.retryFallbackPendingSuccess = true;
 				this.#host.settings.getStorage()?.recordModelUsage(formatModelStringWithRouting(candidate));
+				this.#host.sessionManager.appendCustomEntry("omp:advisor-model-switch", {
+					advisor: advisor.name,
+					from: currentSelector,
+					to: selector.raw,
+					cause,
+					trigger: "turn",
+					attempt: advisor.recoveryRetries + 1,
+				});
+				advisor.recoveryRetries = 0;
 				await this.#host.emitSessionEvent({
 					type: "retry_fallback_applied",
 					from: currentSelector,
 					to: selector.raw,
 					role,
+					cause,
+					trigger: "turn",
 					reason: `Advisor request failed: ${message}`,
 				});
 				return true;
