@@ -40,7 +40,7 @@ function createContext(approvalOwnsComposer: boolean) {
 		viewSession: { isStreaming: true, queuedMessageCount: 0, prompt: focusedPrompt, abort: vi.fn(async () => {}) },
 		focusedAgentId: "Worker",
 		approvalOwnsComposer,
-		sessionManager: { putBlob: vi.fn() },
+		sessionManager: { putBlob: vi.fn(), appendCustomEntry: vi.fn() },
 		loopModeEnabled: false,
 		flushPendingBashComponents: vi.fn(),
 		startPendingSubmission: vi.fn((input: { text: string }) => ({ ...input, cancelled: false, started: false })),

@@ -95,7 +95,8 @@ describe("bundled agent parsing", () => {
 		for (const [name, role, model] of [
 			["task", "task", "anthropic/sonnet"],
 			["sonic", "smol", "fast/hy3"],
-			["scout", "smol", "fast/hy3"],
+			// Local: scout routes through @tiny (6a2f8df3ce); unset `tiny` falls back to `smol`.
+			["scout", "tiny", "fast/hy3"],
 			["reviewer", "slow", "codex/sol"],
 		] as const) {
 			const agent = getBundledAgent(name);

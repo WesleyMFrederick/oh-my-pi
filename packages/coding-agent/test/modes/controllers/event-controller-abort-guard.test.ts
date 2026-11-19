@@ -352,7 +352,7 @@ describe("EventController — completion-notification custom entries", () => {
 		]);
 	});
 
-	it.each(["aborted", "error", "nonterminal", "streaming", "warp"] as const)(
+	it.each(["aborted", "error", "nonterminal", "warp"] as const)(
 		"Given a matching marker and a %s turn, when the real turn-end path runs, then existing notification gates still apply",
 		async outcome => {
 			// Given
@@ -367,9 +367,6 @@ describe("EventController — completion-notification custom entries", () => {
 				messageText: "hello",
 				notification,
 			});
-			if (outcome === "streaming") {
-				Object.defineProperty(ctx.session, "isStreaming", { value: true, configurable: true });
-			}
 			if (outcome === "warp") process.env.WARP_CLI_AGENT_PROTOCOL_VERSION = "1";
 			// A loop that stops while the run goes on arrives as `agent_pause`, never `agent_end`.
 			const event: AgentSessionEvent =

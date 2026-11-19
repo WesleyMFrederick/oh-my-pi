@@ -177,7 +177,8 @@ describe("launched browser lifecycle", () => {
 
 		it("given an aborted session owning a launched browser, when disposed, then that browser dies and another session's browser survives (M3, M21)", async () => {
 			const session = createSession(() => ({ content: ["ok"] }));
-			const id = session.sessionManager.getSessionId();
+			// Tabs are owned by the agent's stable kernel owner id, not the rotating conversation id.
+			const id = session.getEvalKernelOwnerId();
 			const mine = await seedTab({ owner: id, headless: false });
 			const theirs = await seedTab({ owner: "someone-else" });
 			await session.abort();
@@ -190,7 +191,7 @@ describe("launched browser lifecycle", () => {
 			const session = createSession(() => {
 				throw new Error("provider exploded");
 			});
-			const id = session.sessionManager.getSessionId();
+			const id = session.getEvalKernelOwnerId();
 			const mine = await seedTab({ owner: id });
 			await session.prompt("hi").catch(() => undefined);
 			await session.dispose();

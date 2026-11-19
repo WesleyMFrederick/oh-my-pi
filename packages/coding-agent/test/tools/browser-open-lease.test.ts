@@ -9,11 +9,14 @@
  * `CmuxSocketClient.prototype` is spied and no real socket / Chromium is used.
  */
 
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import * as attach from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import * as ledger from "@oh-my-pi/pi-coding-agent/tools/browser/launch-ledger";
 import { resolveCmuxKind } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/rpc";
 import { CmuxSocketClient } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/socket-client";
 import * as launch from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
@@ -307,12 +310,18 @@ describe("browser open — an abandoned browser acquisition does not hold up the
 			firstConnect.resolve();
 			return stalledConnect.promise;
 		});
+		// The app is ledgered at launch, so the abandoned open kills it through the ledger release.
+		const ledgerDir = await fs.mkdtemp(path.join(os.tmpdir(), "open-lease-ledger-"));
+		ledger.setLedgerDirForTest(ledgerDir);
 		const killGate = Promise.withResolvers<void>();
-		spyOn(attach, "gracefulKillTreeOnce").mockImplementation(async pid => {
+		const realRelease = ledger.releaseLaunchedBrowser;
+		spyOn(ledger, "releaseLaunchedBrowser").mockImplementation(async (pid, release, opts) => {
+			if (!release.kill) return await realRelease(pid, release, opts);
 			events.push("kill-start");
 			await killGate.promise;
-			process.kill(pid, "SIGKILL");
+			const outcome = await realRelease(pid, release, opts);
 			events.push("kill-end");
+			return outcome;
 		});
 		const browser = {
 			connected: true,
@@ -320,19 +329,24 @@ describe("browser open — an abandoned browser acquisition does not hold up the
 			wsEndpoint: () => "ws://127.0.0.1/devtools/browser/test",
 		} as unknown as Browser;
 
-		const owner = new AbortController();
-		const first = rejectionOf(registry.acquireBrowser(kind, { cwd, signal: owner.signal }));
-		await firstConnect.promise;
-		owner.abort();
-		const second = registry.acquireBrowser(kind, { cwd });
-		stalledConnect.resolve(browser);
-		for (let i = 0; i < 20; i++) await Promise.resolve();
-		killGate.resolve();
+		try {
+			const owner = new AbortController();
+			const first = rejectionOf(registry.acquireBrowser(kind, { cwd, signal: owner.signal }));
+			await firstConnect.promise;
+			owner.abort();
+			const second = registry.acquireBrowser(kind, { cwd });
+			stalledConnect.resolve(browser);
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+			killGate.resolve();
 
-		expect(await first).toBeInstanceOf(ToolAbortError);
-		const handle = await second;
-		await registry.releaseBrowser(handle, { kill: false });
-		expect(events).toEqual(["lookup", "connect", "kill-start", "kill-end", "lookup", "connect"]);
+			expect(await first).toBeInstanceOf(ToolAbortError);
+			const handle = await second;
+			await registry.releaseBrowser(handle, { kill: false });
+			expect(events).toEqual(["lookup", "connect", "kill-start", "kill-end", "lookup", "connect"]);
+		} finally {
+			ledger.setLedgerDirForTest(undefined);
+			await fs.rm(ledgerDir, { recursive: true, force: true });
+		}
 	});
 });
 

@@ -811,6 +811,7 @@ describe("InputController keybinding setup", () => {
 			queueCompactionMessage,
 			runYieldCompaction: vi.fn(),
 			sessionManager: {
+				appendCustomEntry: vi.fn(),
 				getSessionId: () => "session-1",
 				getLeafId: () => "entry-7",
 				getBranch: () => [{ id: "entry-7" }],
@@ -953,6 +954,7 @@ describe("InputController keybinding setup", () => {
 		const showWarning = vi.fn();
 		const sessionManager = {
 			sessionId: "session-1",
+			appendCustomEntry: vi.fn(),
 			getSessionId: () => sessionManager.sessionId,
 			getLeafId: () => null,
 		};

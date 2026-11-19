@@ -90,12 +90,24 @@ describe("acquireTab on the shared browser", () => {
 		projectDirs.push(projectDir);
 		setTabWorkerSpawnerForTest(async () => fakeWorker());
 		const closedTargets: string[] = [];
-		const session = {
+		const destroyedHandlers = new Set<(event: { targetId: string }) => void>();
+		// Closes go over the browser's root CDP connection, never a per-call target session.
+		const connection = {
 			send: async (method: string, params?: { targetId: string }) => {
-				if (method === "Target.closeTarget" && params) closedTargets.push(params.targetId);
+				if (method === "Target.closeTarget" && params) {
+					closedTargets.push(params.targetId);
+					const { targetId } = params;
+					queueMicrotask(() => {
+						for (const handler of destroyedHandlers) handler({ targetId });
+					});
+				}
 				return { success: true, targetInfos: [] };
 			},
-			detach: async () => undefined,
+			on: (_event: string, handler: (event: { targetId: string }) => void) => destroyedHandlers.add(handler),
+			off: (_event: string, handler: (event: { targetId: string }) => void) => destroyedHandlers.delete(handler),
+			createSession: async () => {
+				throw new Error("closes must not attach to targets");
+			},
 		};
 		const handle: PuppeteerBrowserHandle = {
 			key: "shared",
@@ -103,7 +115,7 @@ describe("acquireTab on the shared browser", () => {
 			browser: {
 				connected: true,
 				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub",
-				target: () => ({ createCDPSession: async () => session }),
+				_connection: connection,
 			} as never,
 			wsEndpoint: "ws://127.0.0.1/devtools/browser/stub",
 			sharedDaemon: { name: DAEMON, projectDir },
@@ -132,13 +144,17 @@ describe("acquireTab on the shared browser", () => {
 		projectDirs.push(projectDir);
 		setTabWorkerSpawnerForTest(async () => fakeWorker());
 		const closedTargets: string[] = [];
-		const session = {
+		const connection = {
 			send: async (method: string, params?: { targetId: string }) => {
 				if (method === "Target.closeTarget" && params) closedTargets.push(params.targetId);
 				// Dropped connection: neither the close nor the confirming target listing succeeds.
 				throw new Error("Connection closed");
 			},
-			detach: async () => undefined,
+			on: () => undefined,
+			off: () => undefined,
+			createSession: async () => {
+				throw new Error("closes must not attach to targets");
+			},
 		};
 		const handle: PuppeteerBrowserHandle = {
 			key: "shared",
@@ -146,7 +162,7 @@ describe("acquireTab on the shared browser", () => {
 			browser: {
 				connected: true,
 				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub",
-				target: () => ({ createCDPSession: async () => session }),
+				_connection: connection,
 			} as never,
 			wsEndpoint: "ws://127.0.0.1/devtools/browser/stub",
 			sharedDaemon: { name: DAEMON, projectDir },

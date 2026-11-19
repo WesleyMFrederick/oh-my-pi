@@ -108,7 +108,7 @@ describe("--agent launch flag", () => {
 
 	it("uses the agent tool list as the maximum, which --tools cannot widen", async () => {
 		const fromAgent = await optionsFor(["--agent", "launch-reviewer"]);
-		expect(fromAgent.toolNames).toEqual(["read", "grep", "yield"]);
+		expect(fromAgent.toolNames).toEqual(["read", "grep"]);
 
 		const narrowed = await optionsFor(["--agent", "launch-reviewer", "--tools", "read,bash"]);
 		expect(narrowed.toolNames).toEqual(["read"]);

@@ -222,6 +222,8 @@ function composerFor(view: AgentViewSession, focusedAgentId: string) {
 		editor,
 		ui: { requestRender() {} },
 		session: { isStreaming: false, isCompacting: false, extensionRunner: undefined, queuedMessageCount: 0 },
+		// The composer records each raw submission on the host session before dispatching it.
+		sessionManager: { appendCustomEntry: vi.fn(), getSessionId: () => "main-session" },
 		viewSession: view,
 		focusedAgentId,
 		compactionQueuedMessages: [],

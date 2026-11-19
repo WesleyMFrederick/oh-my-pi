@@ -467,7 +467,8 @@ describe("Agent hub Enter activation", () => {
 		await hub.persistedSubagentsReady;
 
 		const workerEntry = renderedRosterEntry(hub, "Worker", 120).replace(/\s+/g, " ");
-		expect(workerEntry).toContain("SMOL");
+		// Local: bundled scout routes through @tiny (6a2f8df3ce).
+		expect(workerEntry).toContain("TINY");
 		expect(workerEntry).toContain("$0.123");
 		expect(workerEntry).toContain("1m30s");
 		expect(workerEntry).toContain("1 req");
