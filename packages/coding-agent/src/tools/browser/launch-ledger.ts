@@ -16,7 +16,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
-import { getDaemonDir, isEnoent, logger, withFileLock } from "@oh-my-pi/pi-utils";
+import { getDaemonDir, getTestTempDir, isBunTestRuntime, isEnoent, logger, withFileLock } from "@oh-my-pi/pi-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { logLifecycle, withLifecycleLog } from "../../launch/lifecycle-log";
 
@@ -41,7 +41,7 @@ export interface LedgerEntry {
 	state: "live" | "kill-failed";
 }
 
-/** Test seam: ledger directory. Defaults to `~/.omp/run/browser-launches`. */
+/** Test seam: ledger directory. Defaults to `~/.omp/run/browser-launches` (a per-user temp dir under `bun test`). */
 export interface LedgerOptions {
 	dir?: string;
 }
@@ -68,8 +68,12 @@ export function setLedgerDirForTest(dir: string | undefined): void {
 	ledgerDirOverride = dir;
 }
 
+// `bun test` processes never read or reap the developer's real ledger, mirroring `getLogsDir`.
 function ledgerDir(opts: LedgerOptions): string {
-	return opts.dir ?? ledgerDirOverride ?? path.join(path.dirname(getDaemonDir()), "browser-launches");
+	const explicit = opts.dir ?? ledgerDirOverride;
+	if (explicit !== undefined) return explicit;
+	if (isBunTestRuntime()) return getTestTempDir("omp-test-browser-launches");
+	return path.join(path.dirname(getDaemonDir()), "browser-launches");
 }
 
 /**
