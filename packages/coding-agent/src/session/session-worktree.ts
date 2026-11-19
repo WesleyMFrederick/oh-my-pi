@@ -108,7 +108,7 @@ export async function createSessionWorktree(
 	settings: Settings,
 	branch: string,
 	options: { keepChanges?: boolean } = {},
-): Promise<SessionWorktree & { hookError?: string }> {
+): Promise<SessionWorktree> {
 	const keepChanges = options.keepChanges ?? true;
 	try {
 		await settings.flush();

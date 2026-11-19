@@ -2849,6 +2849,8 @@ pub enum SlashCommandSource {
 	McpPrompt,
 	#[serde(rename = "file")]
 	File,
+	#[serde(rename = "prompt")]
+	Prompt,
 }
 
 impl SlashCommandSource {
@@ -2861,6 +2863,7 @@ impl SlashCommandSource {
 			Self::Custom => "custom",
 			Self::McpPrompt => "mcp_prompt",
 			Self::File => "file",
+			Self::Prompt => "prompt",
 		}
 	}
 }

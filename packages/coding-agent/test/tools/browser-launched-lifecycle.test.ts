@@ -3,6 +3,7 @@
 // browser is never killed by the idle sweep. Outcomes are observed as real fixture-process liveness. The
 // fixture is a real process standing in for the browser; tabs are seeded exactly as `open` leaves them.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as os from "node:os";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
@@ -95,6 +96,7 @@ describe("launched browser lifecycle", () => {
 			kind: { kind: "spawned", path: "/fixture", args: [] },
 			// Closing a stand-in connection is a no-op; the process kill is what is under test.
 			browser: { connected: false, disconnect: async () => undefined, close: async () => undefined } as never,
+			wsEndpoint: "ws://127.0.0.1/devtools/browser/fixture",
 			refCount: 1,
 			pid: proc.pid,
 			subprocess: proc,
@@ -119,10 +121,12 @@ describe("launched browser lifecycle", () => {
 				send: () => undefined,
 				onMessage: () => () => undefined,
 				onError: () => () => undefined,
+				onExit: () => () => undefined,
 				terminate: async () => undefined,
 				mode: "inline",
 			},
-			activateForScreenshot: false,
+			ownsPage: true,
+			uploadDir: path.join(os.tmpdir(), `omp-fixture-upload-${proc.pid}`),
 		};
 		getTabsMapForTest().set(name, tab);
 		return { pid: proc.pid, proc };

@@ -2330,7 +2330,8 @@
 				"extension",
 				"custom",
 				"mcp_prompt",
-				"file"
+				"file",
+				"prompt"
 			],
 			"type": "string"
 		},

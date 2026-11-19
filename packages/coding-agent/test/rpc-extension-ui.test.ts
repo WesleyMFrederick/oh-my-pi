@@ -156,7 +156,10 @@ await runRpcMode(session);
 			await child.exited;
 		}
 
-		expect(notices.map(({ id: _id, ...notice }) => notice), await stderr).toEqual([
+		expect(
+			notices.map(({ id: _id, ...notice }) => notice),
+			await stderr,
+		).toEqual([
 			{ type: "extension_ui_request", method: "notify", message: "Structured notice", notifyType: "info", details },
 			{ type: "extension_ui_request", method: "notify", message: "Legacy notice", notifyType: "warning" },
 		]);

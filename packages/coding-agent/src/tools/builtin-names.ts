@@ -81,6 +81,7 @@ export const BUILTIN_TOOL_HELP: Record<BuiltinToolName, BuiltinToolHelp> = {
 	learn: { summary: "Capture reusable lessons in long-term memory", defaultState: "off" },
 	manage_skill: { summary: "Create, update, or delete managed skills", defaultState: "off" },
 	security_scan: { summary: "Run security scans", defaultState: "off" },
+	session_info: { summary: "Query current session metadata", defaultState: "on" },
 };
 
 export const HIDDEN_TOOL_NAMES = ["yield", "goal", "think"] as const;

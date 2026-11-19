@@ -108,8 +108,8 @@ _GOAL_STATUS_VALUES: Final[frozenset[str]] = frozenset({"active", "paused", "bud
 _decode_goal_status = cast("Decoder[GoalStatus]", literal(_GOAL_STATUS_VALUES))
 
 
-SlashCommandSource: TypeAlias = Literal["builtin", "skill", "extension", "custom", "mcp_prompt", "file"]
-_SLASH_COMMAND_SOURCE_VALUES: Final[frozenset[str]] = frozenset({"builtin", "skill", "extension", "custom", "mcp_prompt", "file"})
+SlashCommandSource: TypeAlias = Literal["builtin", "skill", "extension", "custom", "mcp_prompt", "file", "prompt"]
+_SLASH_COMMAND_SOURCE_VALUES: Final[frozenset[str]] = frozenset({"builtin", "skill", "extension", "custom", "mcp_prompt", "file", "prompt"})
 _decode_slash_command_source = cast("Decoder[SlashCommandSource]", literal(_SLASH_COMMAND_SOURCE_VALUES))
 
 

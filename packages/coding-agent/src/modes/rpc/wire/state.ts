@@ -22,7 +22,7 @@ export const stateDefs = {
 	TodoStatus: "'pending' | 'in_progress' | 'completed' | 'abandoned'",
 	GoalOp: "'get' | 'create' | 'resume' | 'pause' | 'drop'",
 	GoalStatus: "'active' | 'paused' | 'budget-limited' | 'complete' | 'dropped'",
-	SlashCommandSource: "'builtin' | 'skill' | 'extension' | 'custom' | 'mcp_prompt' | 'file'",
+	SlashCommandSource: "'builtin' | 'skill' | 'extension' | 'custom' | 'mcp_prompt' | 'file' | 'prompt'",
 	SubagentSubscriptionLevel: doc(
 		"'off' | 'progress' | 'events'",
 		"Forwarded subagent frames: none, lifecycle and progress, or also raw session events.",

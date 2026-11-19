@@ -371,8 +371,11 @@ describe("EventController — completion-notification custom entries", () => {
 				Object.defineProperty(ctx.session, "isStreaming", { value: true, configurable: true });
 			}
 			if (outcome === "warp") process.env.WARP_CLI_AGENT_PROTOCOL_VERSION = "1";
-			const event = makeAgentEndEvent([assistant]);
-			if (outcome === "nonterminal") event.isTerminal = false;
+			// A loop that stops while the run goes on arrives as `agent_pause`, never `agent_end`.
+			const event: AgentSessionEvent =
+				outcome === "nonterminal"
+					? { type: "agent_pause", messages: [assistant], yielded: true, awaiting: false }
+					: makeAgentEndEvent([assistant]);
 
 			// When
 			await new EventController(ctx).handleEvent(event);

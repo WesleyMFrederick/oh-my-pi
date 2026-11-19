@@ -4054,7 +4054,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	ruleJudge(model?: string): Judge | undefined {
 		const mode = cfgTtsrJudge.get(this.settings);
-		if (mode === "off" || (mode === "auto" && !hasNativeJudge(this.settings, this.#modelRegistry, this.model, model))) {
+		if (
+			mode === "off" ||
+			(mode === "auto" && !hasNativeJudge(this.settings, this.#modelRegistry, this.model, model))
+		) {
 			return undefined;
 		}
 		return resolveJudge({

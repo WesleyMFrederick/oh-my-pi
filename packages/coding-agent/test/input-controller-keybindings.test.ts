@@ -198,7 +198,6 @@ async function createContext() {
 		autoCompactionEscapeHandler: undefined,
 		retryEscapeHandler: undefined,
 		session: session as unknown as InteractiveModeContext["session"],
-		sessionManager: { appendCustomEntry: vi.fn() },
 		viewSession: session as unknown as InteractiveModeContext["viewSession"],
 		keybindings: {
 			getKeys(action: string) {
@@ -268,7 +267,7 @@ async function createContext() {
 		showError,
 		showStatus: vi.fn(),
 		isGuidedGoalInterviewActive,
-		sessionManager: { getSessionId: () => "session", getLeafId: () => null },
+		sessionManager: { appendCustomEntry: vi.fn(), getSessionId: () => "session", getLeafId: () => null },
 	} as unknown as InteractiveModeContext;
 
 	return {

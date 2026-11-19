@@ -11,6 +11,8 @@ export interface SessionWorktree {
 	clonedWith?: IsoBackendKind;
 	cloneError?: string;
 	ovnfs?: OvnfsCheckout;
+	/** Set when the repository's `post-checkout` hook failed in the new worktree; the worktree is kept. */
+	hookError?: string;
 }
 
 /** Identity and provenance of a managed ovnfs checkout. */

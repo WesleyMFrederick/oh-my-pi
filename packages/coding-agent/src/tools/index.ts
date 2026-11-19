@@ -506,7 +506,7 @@ export interface ToolSession {
 	/** Get cumulative session usage statistics (input/output tokens, cost). */
 	getUsageStatistics?: () => UsageStatistics;
 	/** Get the current approval mode. */
-	getApprovalMode?: () => "always-ask" | "write" | "yolo" | null;
+	getApprovalMode?: () => "always-ask" | "always-ask-cached" | "write" | "yolo" | null;
 	/** Get the current context usage. */
 	getContextUsage?: () => { tokens: number; contextWindow: number; percent: number } | null;
 	/** Get current message counts. */
