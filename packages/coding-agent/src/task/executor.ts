@@ -2424,7 +2424,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			emitSubagentEvent(event);
 			publishAdvisorState(session);
 			publishServingModel();
-			if (event.type === "retry_fallback_applied") {
+			if (event.type === "retry_fallback_applied" && event.role !== "advisor") {
 				progress.fallback = { from: event.from, to: event.to, cause: event.cause, trigger: event.trigger };
 				scheduleProgress(true);
 			}

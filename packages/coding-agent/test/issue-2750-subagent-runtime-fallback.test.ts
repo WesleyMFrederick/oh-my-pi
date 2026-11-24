@@ -14,7 +14,7 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { RetryFallbackRole, ServingModel } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -55,7 +55,7 @@ function model(provider: string, id: string): Model<Api> {
  * - `"unproven"` errors on its first request, producing none of the run's work.
  */
 function createYieldingSession(
-	fallback: "served" | "unproven" | "none" = "served",
+	fallback: "served" | "unproven" | "none" | "advisor-only" = "served",
 	beforeYield?: () => Promise<void>,
 ): AgentSession {
 	const listeners: Array<(event: { type: string; [key: string]: unknown }) => void> = [];
@@ -80,7 +80,18 @@ function createYieldingSession(
 				for (const listener of listeners) listener(event);
 			};
 			await beforeYield?.();
-			if (fallback !== "none") {
+			if (fallback === "advisor-only") {
+				emit({
+					type: "retry_fallback_applied",
+					from: "advisor/primary",
+					to: "advisor/recovered",
+					role: "advisor",
+					cause: { origin: "provider", kind: "server_error" },
+					trigger: "turn",
+				});
+				emit({ type: "retry_fallback_succeeded", model: "advisor/recovered", role: "advisor" });
+			}
+			if (fallback !== "none" && fallback !== "advisor-only") {
 				session.model = model("fallback", "working-model");
 				emit({
 					type: "retry_fallback_applied",
@@ -356,6 +367,44 @@ describe("subagent runtime model resolution", () => {
 			enableLsp: false,
 		});
 
+		expect(result.resolvedModel).toBe("primary/bad-runtime-model");
+		expect(result.resolvedModelIsFallback).toBeFalsy();
+	});
+
+	it("Given an advisor-only switch, When a child yields, Then child progress does not claim that fallback", async () => {
+		// Given a child whose own model never failed, but whose advisor recovered.
+		const primary = model("primary", "bad-runtime-model");
+		const snapshots: AgentProgress[] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(
+			async () =>
+				({
+					session: createYieldingSession("advisor-only"),
+					extensionsResult: {},
+					setToolUIContext: () => {},
+				}) as never,
+		);
+
+		// When the executor observes the advisor events through the child session.
+		const result = await runSubprocess({
+			cwd: "/tmp",
+			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "work",
+			index: 0,
+			id: "advisor-only-switch",
+			modelOverride: ["primary/bad-runtime-model"],
+			settings: Settings.isolated({}),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary],
+				getApiKey: async () => "test-key",
+			} as never,
+			onProgress: progress => snapshots.push({ ...progress }),
+			enableLsp: false,
+		});
+
+		// Then neither the live child row nor its result attributes advisor work to the child.
+		expect(snapshots.length).toBeGreaterThan(0);
+		expect(snapshots.every(progress => progress.fallback === undefined)).toBe(true);
 		expect(result.resolvedModel).toBe("primary/bad-runtime-model");
 		expect(result.resolvedModelIsFallback).toBeFalsy();
 	});
@@ -803,6 +852,17 @@ describe("subagent runtime fallback on a real provider error", () => {
 		);
 		const available = modelRegistry.getAvailable.bind(modelRegistry);
 		vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [...mocks, ...available(kind)]);
+		const createAgentSession = sdkModule.createAgentSession;
+		let childSession: AgentSession | undefined;
+		const fallbackEvents: AgentSessionEvent[] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			const created = await createAgentSession(options);
+			childSession = created.session;
+			created.session.subscribe(event => {
+				if (event.type === "retry_fallback_applied") fallbackEvents.push(event);
+			});
+			return created;
+		});
 		try {
 			const result = await runSubprocess({
 				cwd: path.join(root, "home", "work"),
@@ -842,7 +902,15 @@ describe("subagent runtime fallback on a real provider error", () => {
 				enableMCP: false,
 				enableIrc: false,
 			});
-			return { result, primaryRequests: primary.calls.length, fallbackRequests: fallback.calls.length };
+			return {
+				result,
+				primaryRequests: primary.calls.length,
+				fallbackRequests: fallback.calls.length,
+				fallbackEvents,
+				modelChanges: childSession?.sessionManager
+					.getEntries()
+					.filter(entry => entry.type === "model_change" && entry.fallback),
+			};
 		} finally {
 			authStorage.close();
 		}
@@ -857,11 +925,34 @@ describe("subagent runtime fallback on a real provider error", () => {
 		expect(result.error).toContain(OVERLOADED);
 	});
 
-	it("recovers on the inherited default fallback when the role has no chain", async () => {
-		const { result, fallbackRequests } = await runPinnedWorker("UnsetRoleChain", undefined);
+	it("Given a child provider failure, When its inherited chain recovers, Then its own switch is persisted and emitted", async () => {
+		// Given a real child session with no role-specific chain.
+		// When its primary provider fails and the inherited fallback answers.
+		const { result, fallbackRequests, fallbackEvents, modelChanges } = await runPinnedWorker(
+			"UnsetRoleChain",
+			undefined,
+		);
 		expect(fallbackRequests).toBeGreaterThan(0);
 		expect(result.exitCode).toBe(0);
 		expect(result.resolvedModel).toBe("fallback/working-model");
 		expect(result.resolvedModelIsFallback).toBe(true);
+		// Then the child's transcript and subscribers agree on its own recovery.
+		expect(modelChanges).toMatchObject([
+			{
+				fallback: {
+					from: "primary/bad-runtime-model",
+					cause: { origin: "provider", kind: "overloaded" },
+					trigger: "turn",
+				},
+			},
+		]);
+		expect(fallbackEvents).toMatchObject([
+			{
+				from: "primary/bad-runtime-model",
+				to: "fallback/working-model",
+				cause: { origin: "provider", kind: "overloaded" },
+				trigger: "turn",
+			},
+		]);
 	});
 });

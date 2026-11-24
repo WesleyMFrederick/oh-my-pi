@@ -70,6 +70,10 @@ Beyond `isRetryableError(...)`, empty generic aborts may enter the same retry en
 
 Non-retryable hard errors may consult a configured fallback chain when switching models is the recovery; without a successful switch they do not back off and retry the same failing model. `retry.fallbackOn` narrows which errors consult a chain: `usage-limit` keeps every other error on the current model (retryable ones back off and retry until the budget runs out, hard errors surface), and `except-usage-limit` keeps usage limits off the chain. Fireworks Fast-to-base degradation is an intrinsic one-shot safety net and can run even when `retry.enabled` is false.
 
+Model fallback additionally requires a non-harness cause. Turn/account rate limits (including Codex `turn_rate_limit_exceeded`), steering collisions, invalid-request HTTP 400s, unknown-model HTTP 404s, aborts, and WebSocket lifetime limits never switch models. Transient harness faults can retry the same model within the retry budget; deterministic faults or exhausted retries surface as `HarnessFaultNoFallback (<kind>)` and write `omp:model-switch-refused`. Usage limits, server errors, overload, capacity, payload rejection, refusals, and account-policy failures remain provider causes. Unknown causes must spend the same-model retry budget before switching.
+
+Fallback events and persisted switch records carry the cause and originating trigger. A pending steer belongs to the failing turn even before delivery; advisor fallback records identify the advisor and must not be reported as the primary session's or a task child's own model switch.
+
 Malformed-function failures that cannot replay their committed text preserve the turn and append a corrective developer reminder, capped at three continuations per prompt. These terminal-stop continuations are separate from the standard retry lifecycle.
 
 Retry state is owned by `TurnRecovery`:

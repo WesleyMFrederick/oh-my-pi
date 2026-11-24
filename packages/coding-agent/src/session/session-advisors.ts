@@ -1688,7 +1688,7 @@ export class SessionAdvisors {
 					await this.#host.emitSessionEvent({
 						type: "retry_fallback_succeeded",
 						model: formatRetryFallbackSelector(advisorRef.agent.state.model, advisorRef.thinkingLevel),
-						role: fallback.role,
+						role: "advisor",
 					});
 				},
 				onTurnAbandoned: () => {
@@ -2362,7 +2362,8 @@ export class SessionAdvisors {
 					type: "retry_fallback_applied",
 					from: currentSelector,
 					to: selector.raw,
-					role,
+					// The event identifies the actor; retryFallback.role retains the chain owner.
+					role: "advisor",
 					cause,
 					trigger: "turn",
 					reason: `Advisor request failed: ${message}`,

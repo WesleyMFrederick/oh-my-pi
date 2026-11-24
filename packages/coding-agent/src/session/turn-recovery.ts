@@ -2888,12 +2888,15 @@ export class TurnRecovery {
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
 		const cause = classifyFallbackCause(message, id);
+		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const trigger =
 			this.#host.agent.peekSteeringQueue().length || this.#host.agent.peekUndeliveredQueuedMessages().length
 				? "steer"
 				: "turn";
 		const deterministicHarness =
 			cause.origin === "harness" &&
+			// Stale replay state has an existing same-model reset, not a deterministic request fault.
+			!staleOpenAIResponsesReplayError &&
 			cause.kind !== "rate_limit" &&
 			cause.kind !== "abort" &&
 			cause.kind !== "steer_collision";
@@ -2930,7 +2933,6 @@ export class TurnRecovery {
 		const sourceRateLimited =
 			retrySettings.rateLimitWalksChain &&
 			(message.errorStatus === 429 || rateLimitReason === "RATE_LIMIT_EXCEEDED");
-		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
 		let recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		let staleUsageLimit = oldProviderLimitFor(this.#host.model());

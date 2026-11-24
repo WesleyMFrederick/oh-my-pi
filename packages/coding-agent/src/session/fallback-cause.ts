@@ -16,6 +16,10 @@ const RULES: readonly Rule[] = [
 		matches: f =>
 			f.code === "turn_rate_limit_exceeded" ||
 			(f.status === 429 &&
+				f.message.provider === "openai-codex" &&
+				(f.code === undefined || f.code === "rate_limit_error" || f.code === "rate_limit_exceeded") &&
+				/^ChatGPT rate limit exceeded\b/i.test(f.text)) ||
+			(f.status === 429 &&
 				/rate_limit_error/i.test(f.text) &&
 				(f.message.provider === "anthropic" || /anthropic|"type"\s*:\s*"error"/i.test(f.text))),
 	},
@@ -32,12 +36,6 @@ const RULES: readonly Rule[] = [
 			f.message.stopReason === "aborted" ||
 			AIError.is(f.errorId, AIError.Flag.Abort) ||
 			/\babort(?:ed)?\b/i.test(f.text),
-	},
-	{
-		origin: "harness",
-		kind: "request_invalid",
-		matches: f =>
-			f.status === 400 && /unsupported|invalid.*(?:value|parameter)|(?:value|parameter).*invalid/i.test(f.text),
 	},
 	{ origin: "harness", kind: "unknown_model", matches: f => f.status === 404 && /model|not found/i.test(f.text) },
 	{
@@ -74,6 +72,8 @@ const RULES: readonly Rule[] = [
 			/refus(?:al|ed|es)|content.filter|safety.classifier/i.test(f.text) ||
 			AIError.is(f.errorId, AIError.Flag.ContentBlocked),
 	},
+	// Specific provider rejections keep their taxonomy even when returned as HTTP 400.
+	{ origin: "harness", kind: "request_invalid", matches: f => f.status === 400 },
 	{ origin: "provider", kind: "overloaded", matches: f => f.status === 529 || /overload/i.test(f.text) },
 	{
 		origin: "provider",

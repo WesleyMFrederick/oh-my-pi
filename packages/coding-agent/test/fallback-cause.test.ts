@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { CodexApiError } from "@oh-my-pi/pi-ai/providers/openai-codex/response-handler";
 import { classifyFallbackCause } from "../src/session/fallback-cause";
 
 describe("fallback causes", () => {
@@ -13,6 +14,37 @@ describe("fallback causes", () => {
 			AIError.Flag.UsageLimit,
 		);
 		expect(cause).toEqual({ origin: "harness", kind: "rate_limit" });
+	});
+
+	it("Given a real Codex HTTP turn limit, When finalized and classified, Then it remains a harness rate limit", async () => {
+		// Given the provider's parsed HTTP representation, not a synthetic code= suffix.
+		const error = await CodexApiError.fromResponse(
+			new Response(
+				JSON.stringify({
+					error: {
+						type: "rate_limit_error",
+						code: "turn_rate_limit_exceeded",
+						message: "Codex is at capacity, please try again later",
+					},
+				}),
+				{ status: 429 },
+			),
+		);
+		const failure = await AIError.finalize(error, { api: "openai-codex-responses", provider: "openai-codex" });
+
+		// When the session classifies exactly the fields exposed by provider streams.
+		const cause = classifyFallbackCause(
+			{
+				provider: "openai-codex",
+				errorMessage: failure.message,
+				errorStatus: failure.status,
+				errorId: failure.id,
+			} as AssistantMessage,
+			failure.id,
+		);
+
+		// Then the capacity wording cannot turn a turn throttle into provider fallback.
+		expect(cause).toMatchObject({ origin: "harness", kind: "rate_limit" });
 	});
 
 	it("Given a decorated error, When stable evidence exists, Then decoration does not change the cause", () => {
@@ -47,6 +79,7 @@ describe("fallback causes", () => {
 		["503 Service Unavailable", "provider", "server_error"],
 		["Request failed: 503 Hosted inference is temporarily unavailable", "provider", "server_error"],
 		["Request failed: 400 Unsupported value: reasoning 'none'", "harness", "request_invalid"],
+		["400 Invalid request: messages must alternate between user and assistant roles", "harness", "request_invalid"],
 		["529 overloaded", "provider", "overloaded"],
 		["server at capacity", "provider", "capacity"],
 		["model refused the request", "provider", "refusal"],
