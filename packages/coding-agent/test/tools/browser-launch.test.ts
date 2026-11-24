@@ -239,6 +239,51 @@ describe("system Chromium candidates", () => {
 });
 
 describe("browser executable selection", () => {
+	it.skipIf(process.platform === "win32")(
+		"Given Linux arm64 system Chromium, headless and previews resolve it just like headed launches",
+		async () => {
+			// Given an unsupported managed platform with a usable system Chromium.
+			const tempDir = TempDir.createSync("@browser-linux-arm64-");
+			try {
+				for (const root of ["cache", "data", "state"]) {
+					fs.mkdirSync(path.join(tempDir.path(), root, APP_NAME), { recursive: true });
+				}
+				const systemChrome = path.join(tempDir.path(), "google-chrome-stable");
+				await Bun.write(systemChrome, "#!/bin/sh\necho 'Chromium 151'\n");
+				fs.chmodSync(systemChrome, 0o755);
+				const probe = (purpose: string) => {
+					const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
+						env: {
+							...probeEnv(),
+							HOME: path.join(tempDir.path(), "home"),
+							XDG_CACHE_HOME: path.join(tempDir.path(), "cache"),
+							XDG_DATA_HOME: path.join(tempDir.path(), "data"),
+							XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+							PATH: tempDir.path(),
+							OMP_BROWSER_PROBE_PLATFORM: "linux",
+							OMP_BROWSER_PROBE_ARCH: "arm64",
+							OMP_BROWSER_PROBE_PURPOSE: purpose,
+						},
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
+					return JSON.parse(new TextDecoder().decode(result.stdout));
+				};
+				// When ordinary launches and the no-download preview gate resolve.
+				expect(probe("selection")).toEqual({
+					headless: systemChrome,
+					headed: systemChrome,
+					default: systemChrome,
+				});
+				// Then all use system Chromium without attempting an unsupported download.
+				expect(probe("preview")).toEqual({ needsDownload: false, executable: systemChrome, installAttempts: 0 });
+			} finally {
+				await tempDir.remove();
+			}
+		},
+	);
+
 	// Match the existing subprocess cache isolation: native Windows does not honor XDG_CACHE_HOME.
 	for (const platform of ["linux", "win32"] as const) {
 		it.skipIf(process.platform === "win32")(

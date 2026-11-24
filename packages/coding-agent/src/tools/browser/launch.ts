@@ -460,11 +460,11 @@ export async function chromiumNeedsDownload(options: { headless?: boolean } = {}
 	return true;
 }
 
-/** Where this host's managed browser build lives under ~/.omp/puppeteer; undefined when platform detection fails. */
+/** Where this host's managed browser build lives; undefined when Chrome for Testing does not support the platform. */
 async function managedChromiumLocation(product: BrowsersNs.Browser) {
 	const browsers = await loadBrowsers();
 	const platform = browsers.detectBrowserPlatform();
-	if (!platform) return undefined;
+	if (!platform || platform === browsers.BrowserPlatform.LINUX_ARM) return undefined;
 	const cacheDir = getPuppeteerDir();
 	const { PUPPETEER_REVISIONS } = await import("puppeteer-core/internal/revisions.js");
 	const buildId =

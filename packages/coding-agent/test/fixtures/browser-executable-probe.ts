@@ -16,8 +16,10 @@ if (platform === "darwin" || platform === "win32" || platform === "linux") {
 } else if (platform) {
 	throw new Error(`Unsupported OMP_BROWSER_PROBE_PLATFORM: ${platform}`);
 }
-// Chrome for Testing publishes Linux x64 builds only; match the parent fixture's seeded path.
-if (platform === "linux") spyOn(os, "arch").mockReturnValue("x64");
+// Default Linux probes match the x64 cache fixture; arm64 probes exercise system-only fallback.
+if (platform === "linux") {
+	spyOn(os, "arch").mockReturnValue(process.env.OMP_BROWSER_PROBE_ARCH === "arm64" ? "arm64" : "x64");
+}
 
 // Never reach the network. Some probes allow the resolver to recover from an unavailable
 // shell download; the preview probe additionally checks that no install was attempted.
