@@ -347,13 +347,26 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  * preference and fall back to Chrome for Testing. The managed browser is
  * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
  * platform detection fails (puppeteer default resolution takes over).
+ *
+ * Headless callers prefer an installed managed chrome-headless-shell on every
+ * platform, then cached full Chrome, before the platform selection above.
+ * When installation is needed, they download the shell instead of full Chrome,
+ * whose --headless=new can hang screenshots on macOS arm64. Headed callers
+ * and interactive sign-in continue to use full Chrome.
  * Exported so real-browser tests can probe launchability and skip on hosts
  * missing Chrome's system libraries.
  */
-let chromiumExecutablePromise: Promise<string | undefined> | undefined;
-export async function ensureChromiumExecutable(): Promise<string | undefined> {
+const chromiumExecutablePromises = new Map<BrowsersNs.Browser, Promise<string | undefined>>();
+export async function ensureChromiumExecutable(options: { headless?: boolean } = {}): Promise<string | undefined> {
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
+	if (options.headless) {
+		const browsers = await loadBrowsers();
+		const shell = await managedChromiumLocation(browsers.Browser.CHROME_HEADLESS_SHELL);
+		if (shell && fs.existsSync(shell.executablePath)) return shell.executablePath;
+		const chrome = await managedChromiumLocation(browsers.Browser.CHROME);
+		if (chrome && fs.existsSync(chrome.executablePath)) return chrome.executablePath;
+	}
 	// macOS: never route a background daemon through the user's GUI Chrome
 	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
 	const preferManagedChromium = process.platform === "darwin";
@@ -362,7 +375,10 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 		if (sysChrome) return sysChrome;
 	}
 
-	chromiumExecutablePromise ??= ensureManagedChromium().catch(async err => {
+	const browsers = await loadBrowsers();
+	const product = options.headless ? browsers.Browser.CHROME_HEADLESS_SHELL : browsers.Browser.CHROME;
+	let pending = chromiumExecutablePromises.get(product);
+	pending ??= ensureManagedChromium(product).catch(async err => {
 		// Cache a successful fallback too: the open preflight and the actual
 		// launch both resolve the executable. Otherwise an unavailable download
 		// is retried inside the open deadline immediately after preflight.
@@ -378,14 +394,28 @@ export async function ensureChromiumExecutable(): Promise<string | undefined> {
 				return sysChrome;
 			}
 		}
-		chromiumExecutablePromise = undefined;
+		chromiumExecutablePromises.delete(product);
 		throw new ToolError(
 			`Failed to install Chromium for puppeteer: ${(err as Error).message}. ` +
 				"Set PUPPETEER_EXECUTABLE_PATH to use an existing Chrome/Chromium binary, or install one manually.",
 		);
 	});
 
-	return await chromiumExecutablePromise;
+	chromiumExecutablePromises.set(product, pending);
+	return await pending;
+}
+
+/**
+ * Use Puppeteer's legacy headless flag for chrome-headless-shell, which does
+ * not support the full Chrome --headless=new mode.
+ */
+export function puppeteerHeadlessMode(headless: boolean, executablePath: string | undefined): boolean | "shell" {
+	if (!headless) return false;
+	const name = executablePath
+		?.split(/[\\/]/)
+		.pop()
+		?.replace(/\.exe$/i, "");
+	return name === "chrome-headless-shell" ? "shell" : true;
 }
 
 /**
@@ -400,7 +430,7 @@ export async function ensureSignInChromiumExecutable(): Promise<string | undefin
 	const executablePath = await ensureChromiumExecutable();
 	if (!isMicrosoftEdgeExecutable(executablePath)) return executablePath;
 	try {
-		return await ensureManagedChromium();
+		return await ensureManagedChromium((await loadBrowsers()).Browser.CHROME);
 	} catch (err) {
 		throw new Error(
 			`Browser sign-in cannot use Microsoft Edge and Chrome for Testing is unavailable: ${(err as Error).message}. ` +
@@ -410,35 +440,47 @@ export async function ensureSignInChromiumExecutable(): Promise<string | undefin
 }
 
 /**
- * Whether launching managed Chromium would first download Chrome for Testing,
+ * Whether launching managed Chromium would first download the selected product,
  * as {@link ensureChromiumExecutable} decides: no `PUPPETEER_EXECUTABLE_PATH`,
  * no usable system Chrome where one is preferred (every platform but macOS),
- * and no Chrome for Testing under ~/.omp/puppeteer yet.
+ * and no selected managed build under ~/.omp/puppeteer yet. Headless launches
+ * can also use cached full Chrome without downloading. Defaults to full Chrome.
  */
-export async function chromiumNeedsDownload(): Promise<boolean> {
+export async function chromiumNeedsDownload(options: { headless?: boolean } = {}): Promise<boolean> {
 	if (process.env.PUPPETEER_EXECUTABLE_PATH) return false;
 	if (process.platform !== "darwin" && (await resolveSystemChromium())) return false;
-	const managed = await managedChromiumLocation();
-	return managed !== undefined && !fs.existsSync(managed.executablePath);
+	const browsers = await loadBrowsers();
+	const product = options.headless ? browsers.Browser.CHROME_HEADLESS_SHELL : browsers.Browser.CHROME;
+	const managed = await managedChromiumLocation(product);
+	if (!managed || fs.existsSync(managed.executablePath)) return false;
+	if (options.headless) {
+		const chrome = await managedChromiumLocation(browsers.Browser.CHROME);
+		if (chrome && fs.existsSync(chrome.executablePath)) return false;
+	}
+	return true;
 }
 
-/** Where this host's Chrome for Testing build lives under ~/.omp/puppeteer; undefined when platform detection fails. */
-async function managedChromiumLocation() {
+/** Where this host's managed browser build lives; undefined when Chrome for Testing does not support the platform. */
+async function managedChromiumLocation(product: BrowsersNs.Browser) {
 	const browsers = await loadBrowsers();
 	const platform = browsers.detectBrowserPlatform();
-	if (!platform) return undefined;
+	if (!platform || platform === browsers.BrowserPlatform.LINUX_ARM) return undefined;
 	const cacheDir = getPuppeteerDir();
 	const { PUPPETEER_REVISIONS } = await import("puppeteer-core/internal/revisions.js");
-	const buildId = PUPPETEER_REVISIONS.chrome;
-	const executablePath = browsers.computeExecutablePath({ buildId, cacheDir, platform });
+	const buildId =
+		product === browsers.Browser.CHROME_HEADLESS_SHELL
+			? PUPPETEER_REVISIONS["chrome-headless-shell"]
+			: PUPPETEER_REVISIONS.chrome;
+	const executablePath = browsers.computeExecutablePath({ buildId, cacheDir, platform, browser: product });
 	return { browsers, platform, cacheDir, buildId, executablePath };
 }
 
-let managedChromiumPromise: Promise<string | undefined> | undefined;
-/** Chrome for Testing under ~/.omp/puppeteer, downloaded on first use; undefined when platform detection fails. */
-function ensureManagedChromium(): Promise<string | undefined> {
-	managedChromiumPromise ??= (async () => {
-		const managed = await managedChromiumLocation();
+const managedChromiumPromises = new Map<BrowsersNs.Browser, Promise<string | undefined>>();
+/** Managed Chrome or headless shell, downloaded on first use; undefined when platform detection fails. */
+function ensureManagedChromium(product: BrowsersNs.Browser): Promise<string | undefined> {
+	let pending = managedChromiumPromises.get(product);
+	pending ??= (async () => {
+		const managed = await managedChromiumLocation(product);
 		if (!managed) {
 			logger.warn("Could not detect browser platform; relying on puppeteer default resolution");
 			return undefined;
@@ -446,16 +488,18 @@ function ensureManagedChromium(): Promise<string | undefined> {
 		const { browsers, platform, cacheDir, buildId, executablePath } = managed;
 		if (fs.existsSync(executablePath)) return executablePath;
 
-		logger.warn("Downloading Chromium for puppeteer (first browser use)", {
+		const label = product === browsers.Browser.CHROME_HEADLESS_SHELL ? "Chrome headless shell" : "Chromium";
+		logger.warn(`Downloading ${label} for puppeteer (first browser use)`, {
 			buildId,
 			platform,
 			cacheDir,
 		});
-		await withDownload("Chromium", tracker =>
+		await withDownload(label, tracker =>
 			browsers.install({
 				buildId,
 				cacheDir,
 				platform,
+				browser: product,
 				downloadProgressCallback: ({ downloadedBytes, totalBytes }) => {
 					if (totalBytes <= 0) {
 						tracker.update({ loaded: downloadedBytes });
@@ -472,10 +516,11 @@ function ensureManagedChromium(): Promise<string | undefined> {
 		);
 		return executablePath;
 	})().catch(err => {
-		managedChromiumPromise = undefined;
+		managedChromiumPromises.delete(product);
 		throw err;
 	});
-	return managedChromiumPromise;
+	managedChromiumPromises.set(product, pending);
+	return pending;
 }
 
 let resolvedChromium: string | null | undefined; // undefined = unchecked; null = not found
@@ -732,9 +777,9 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		// A reused profile can hold the file of a browser that was killed.
 		const staleActivePort = pipe ? await readActivePort(activePortFile) : undefined;
 		if (userDataDir) await seedOwnedProfilePreferences(userDataDir);
-		const executablePath = await ensureChromiumExecutable();
+		const executablePath = await ensureChromiumExecutable({ headless: opts.headless });
 		const browser = await puppeteer.launch({
-			headless: opts.headless,
+			headless: puppeteerHeadlessMode(opts.headless, executablePath),
 			defaultViewport: opts.headless ? initialViewport : null,
 			executablePath,
 			args: launchArgs,
@@ -902,13 +947,13 @@ export async function resolveSharedBrowserLaunchSpec(opts: {
 	userDataDir: string;
 	viewport?: { width: number; height: number };
 }): Promise<SharedBrowserLaunchSpec | null> {
-	const executablePath = await ensureChromiumExecutable();
+	const executablePath = await ensureChromiumExecutable({ headless: opts.headless });
 	if (!executablePath) return null;
 	const puppeteer = await loadPuppeteer();
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
 	const ignored = new Set(stealthIgnoreDefaultArgs(executablePath));
 	const defaults = await puppeteer.defaultArgs({
-		headless: opts.headless,
+		headless: puppeteerHeadlessMode(opts.headless, executablePath),
 		args: buildHeadlessLaunchArgs(vp),
 		userDataDir: opts.userDataDir,
 	});
@@ -1216,6 +1261,7 @@ const STEALTH_PATCH_SCRIPTS = [
 ];
 
 function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_SCRIPTS): string {
+	const nativeIframeAttribute = "data-omp-stealth-natives";
 	const joint = scripts
 		.map(
 			script => `
@@ -1227,6 +1273,9 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 		.join(";\n");
 
 	return `(() => {
+				try {
+					if (window.frameElement?.hasAttribute("${nativeIframeAttribute}")) return;
+				} catch {}
 				const Page_Function_toString = Function.prototype.toString;
 				const Page_FunctionToStringDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, "toString");
 				const Page_Proxy = Proxy;
@@ -1244,6 +1293,7 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 				const container = document.head ?? document.documentElement;
 				if (container) {
 					iframe = document.createElement("iframe");
+					iframe.setAttribute("${nativeIframeAttribute}", "");
 					iframe.style.display = "none";
 					container.appendChild(iframe);
 					if (!iframe.contentWindow) iframe = null;

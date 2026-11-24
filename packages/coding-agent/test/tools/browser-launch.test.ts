@@ -3,19 +3,28 @@ import { describe, expect, it, onTestFinished } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { runInNewContext } from "node:vm";
 import { findFreeCdpPort, gracefulKillTreeOnce } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import {
+	buildStealthInjectionScriptForTest,
 	chromiumExecutableProbeForTest,
+	chromiumNeedsDownload,
 	closeLaunchedBrowser,
 	launchHeadlessBrowser,
 	loadPuppeteer,
+	puppeteerHeadlessMode,
 	removeUserDataDir,
 	resolveSharedBrowserLaunchSpec,
 	stealthIgnoreDefaultArgs,
 	systemChromiumCandidatesForTest,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { readJsonl, TempDir } from "@oh-my-pi/pi-utils";
-import { BrowserPlatform, computeExecutablePath, detectBrowserPlatform } from "@oh-my-pi/pi-utils/browsers";
+import {
+	Browser as ManagedBrowser,
+	BrowserPlatform,
+	computeExecutablePath,
+	detectBrowserPlatform,
+} from "@oh-my-pi/pi-utils/browsers";
 import { APP_NAME } from "@oh-my-pi/pi-utils/dirs";
 import type { Browser } from "puppeteer-core";
 import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
@@ -89,6 +98,25 @@ describe("shared browser launch", () => {
 			});
 
 			expect(launch?.args).toContain("--no-startup-window");
+		} finally {
+			if (previousExecutable === undefined) delete process.env.PUPPETEER_EXECUTABLE_PATH;
+			else process.env.PUPPETEER_EXECUTABLE_PATH = previousExecutable;
+		}
+	});
+
+	it("uses the shell headless flag for an explicitly selected headless shell", async () => {
+		// Given an explicit headless-shell executable.
+		const previousExecutable = process.env.PUPPETEER_EXECUTABLE_PATH;
+		process.env.PUPPETEER_EXECUTABLE_PATH = "/test/chrome-headless-shell";
+		try {
+			expect(await chromiumNeedsDownload({ headless: true })).toBe(false);
+			// When resolving the daemon's complete launch arguments.
+			const launch = await resolveSharedBrowserLaunchSpec({ headless: true, userDataDir: "/test/profile" });
+
+			// Then Puppeteer uses the shell's supported flag, not full Chrome's mode.
+			expect(launch?.executablePath).toBe("/test/chrome-headless-shell");
+			expect(launch?.args).toContain("--headless");
+			expect(launch?.args).not.toContain("--headless=new");
 		} finally {
 			if (previousExecutable === undefined) delete process.env.PUPPETEER_EXECUTABLE_PATH;
 			else process.env.PUPPETEER_EXECUTABLE_PATH = previousExecutable;
@@ -211,6 +239,208 @@ describe("system Chromium candidates", () => {
 });
 
 describe("browser executable selection", () => {
+	it.skipIf(process.platform === "win32")(
+		"Given Linux arm64 system Chromium, headless and previews resolve it just like headed launches",
+		async () => {
+			// Given an unsupported managed platform with a usable system Chromium.
+			const tempDir = TempDir.createSync("@browser-linux-arm64-");
+			try {
+				for (const root of ["cache", "data", "state"]) {
+					fs.mkdirSync(path.join(tempDir.path(), root, APP_NAME), { recursive: true });
+				}
+				const systemChrome = path.join(tempDir.path(), "google-chrome-stable");
+				await Bun.write(systemChrome, "#!/bin/sh\necho 'Chromium 151'\n");
+				fs.chmodSync(systemChrome, 0o755);
+				const probe = (purpose: string) => {
+					const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
+						env: {
+							...probeEnv(),
+							HOME: path.join(tempDir.path(), "home"),
+							XDG_CACHE_HOME: path.join(tempDir.path(), "cache"),
+							XDG_DATA_HOME: path.join(tempDir.path(), "data"),
+							XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+							PATH: tempDir.path(),
+							OMP_BROWSER_PROBE_PLATFORM: "linux",
+							OMP_BROWSER_PROBE_ARCH: "arm64",
+							OMP_BROWSER_PROBE_PURPOSE: purpose,
+						},
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
+					return JSON.parse(new TextDecoder().decode(result.stdout));
+				};
+				// When ordinary launches and the no-download preview gate resolve.
+				expect(probe("selection")).toEqual({
+					headless: systemChrome,
+					headed: systemChrome,
+					default: systemChrome,
+				});
+				// Then all use system Chromium without attempting an unsupported download.
+				expect(probe("preview")).toEqual({ needsDownload: false, executable: systemChrome, installAttempts: 0 });
+			} finally {
+				await tempDir.remove();
+			}
+		},
+	);
+
+	// Match the existing subprocess cache isolation: native Windows does not honor XDG_CACHE_HOME.
+	for (const platform of ["linux", "win32"] as const) {
+		it.skipIf(process.platform === "win32")(
+			`Given installed shell and system Chrome on ${platform}, headless prefers shell while headed keeps system Chrome`,
+			async () => {
+				// Given both products are installed and a valid system Chrome is discoverable.
+				const tempDir = TempDir.createSync("@browser-shell-precedence-");
+				try {
+					const xdgCache = path.join(tempDir.path(), "cache");
+					for (const root of ["cache", "data", "state"]) {
+						fs.mkdirSync(path.join(tempDir.path(), root, APP_NAME), { recursive: true });
+					}
+					const browserPlatform =
+						platform === "win32"
+							? os.arch() === "ia32"
+								? BrowserPlatform.WIN32
+								: BrowserPlatform.WIN64
+							: BrowserPlatform.LINUX;
+					const cacheDir = path.join(xdgCache, APP_NAME, "puppeteer");
+					const shell = computeExecutablePath({
+						cacheDir,
+						platform: browserPlatform,
+						buildId: PUPPETEER_REVISIONS["chrome-headless-shell"],
+						browser: ManagedBrowser.CHROME_HEADLESS_SHELL,
+					});
+					const systemChrome = path.join(
+						tempDir.path(),
+						platform === "win32" ? "Google\\Chrome\\Application\\chrome.exe" : "google-chrome-stable",
+					);
+					for (const executable of [shell, systemChrome]) {
+						await Bun.write(executable, "#!/bin/sh\necho 'Google Chrome 151'\n");
+						fs.chmodSync(executable, 0o755);
+					}
+
+					// When both headless and headed callers resolve in the same process.
+					const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
+						env: {
+							...probeEnv(),
+							HOME: path.join(tempDir.path(), "home"),
+							XDG_CACHE_HOME: xdgCache,
+							XDG_DATA_HOME: path.join(tempDir.path(), "data"),
+							XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+							PATH: tempDir.path(),
+							ProgramFiles: tempDir.path(),
+							"ProgramFiles(x86)": path.join(tempDir.path(), "missing-x86"),
+							LOCALAPPDATA: path.join(tempDir.path(), "missing-local"),
+							OMP_BROWSER_PROBE_PLATFORM: platform,
+							OMP_BROWSER_PROBE_PURPOSE: "selection",
+						},
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+
+					// Then shell wins only for headless; the default remains headed.
+					expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
+					expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual({
+						headless: shell,
+						headed: systemChrome,
+						default: systemChrome,
+					});
+				} finally {
+					await tempDir.remove();
+				}
+			},
+		);
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"Given only cached full Chrome and no system browser, headless resolution survives unavailable shell downloads",
+		async () => {
+			// Given an isolated Windows cache without shell or any system Chrome.
+			const tempDir = TempDir.createSync("@browser-full-chrome-fallback-");
+			try {
+				for (const root of ["cache", "data", "state"]) {
+					fs.mkdirSync(path.join(tempDir.path(), root, APP_NAME), { recursive: true });
+				}
+				const chrome = computeExecutablePath({
+					cacheDir: path.join(tempDir.path(), "cache", APP_NAME, "puppeteer"),
+					platform: os.arch() === "ia32" ? BrowserPlatform.WIN32 : BrowserPlatform.WIN64,
+					buildId: PUPPETEER_REVISIONS.chrome,
+					browser: ManagedBrowser.CHROME,
+				});
+				await Bun.write(chrome, "cached full Chrome");
+				const env = {
+					...probeEnv(),
+					HOME: path.join(tempDir.path(), "home"),
+					XDG_CACHE_HOME: path.join(tempDir.path(), "cache"),
+					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
+					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+					ProgramFiles: path.join(tempDir.path(), "missing-program-files"),
+					"ProgramFiles(x86)": path.join(tempDir.path(), "missing-x86"),
+					LOCALAPPDATA: path.join(tempDir.path(), "missing-local"),
+					OMP_BROWSER_PROBE_PLATFORM: "win32",
+				};
+
+				// When headless resolution runs with all downloads rejected by the fixture.
+				const selected = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
+					env: { ...env, OMP_BROWSER_PROBE_HEADLESS: "1" },
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+
+				// Then the already installed full browser remains usable.
+				expect(selected.exitCode, new TextDecoder().decode(selected.stderr)).toBe(0);
+				expect(new TextDecoder().decode(selected.stdout)).toBe(chrome);
+			} finally {
+				await tempDir.remove();
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"Given only cached full Chrome, the page preview availability gate and headless selection need no download",
+		async () => {
+			// Given a macOS managed cache with full Chrome but no shell.
+			const tempDir = TempDir.createSync("@browser-preview-full-chrome-");
+			try {
+				for (const root of ["cache", "data", "state"]) {
+					fs.mkdirSync(path.join(tempDir.path(), root, APP_NAME), { recursive: true });
+				}
+				const chrome = computeExecutablePath({
+					cacheDir: path.join(tempDir.path(), "cache", APP_NAME, "puppeteer"),
+					platform: os.arch() === "arm64" ? BrowserPlatform.MAC_ARM : BrowserPlatform.MAC,
+					buildId: PUPPETEER_REVISIONS.chrome,
+					browser: ManagedBrowser.CHROME,
+				});
+				await Bun.write(chrome, "#!/bin/sh\necho 'Chrome for Testing'\n");
+				fs.chmodSync(chrome, 0o755);
+
+				// When the preview gate is followed by the actual headless executable resolution.
+				const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
+					env: {
+						...probeEnv(),
+						HOME: path.join(tempDir.path(), "home"),
+						XDG_CACHE_HOME: path.join(tempDir.path(), "cache"),
+						XDG_DATA_HOME: path.join(tempDir.path(), "data"),
+						XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+						OMP_BROWSER_PROBE_PLATFORM: "darwin",
+						OMP_BROWSER_PROBE_PURPOSE: "preview",
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+
+				// Then preview is permitted and resolves the cached binary without attempting installation.
+				expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
+				expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual({
+					needsDownload: false,
+					executable: chrome,
+					installAttempts: 0,
+				});
+			} finally {
+				await tempDir.remove();
+			}
+		},
+	);
+
 	it.skipIf(process.platform !== "linux")(
 		"rejects executable wrappers that are not Chromium-family browsers",
 		async () => {
@@ -392,4 +622,128 @@ describe("browser executable selection", () => {
 			}
 		},
 	);
+
+	it.skipIf(process.platform === "win32")(
+		"selects and caches managed Chrome and headless shell independently, including sign-in",
+		async () => {
+			// Given an isolated macOS managed cache containing only the headless shell.
+			const tempDir = TempDir.createSync("@browser-managed-products-");
+			try {
+				const xdgCache = path.join(tempDir.path(), "cache");
+				for (const xdg of [xdgCache, path.join(tempDir.path(), "data"), path.join(tempDir.path(), "state")]) {
+					fs.mkdirSync(path.join(xdg, APP_NAME), { recursive: true });
+				}
+				const env = {
+					...probeEnv(),
+					HOME: path.join(tempDir.path(), "home"),
+					XDG_CACHE_HOME: xdgCache,
+					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
+					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+					OMP_BROWSER_PROBE_PLATFORM: "darwin",
+					PUPPETEER_EXECUTABLE_PATH: "",
+				};
+				const cacheDir = path.join(xdgCache, APP_NAME, "puppeteer");
+				const platform = os.arch() === "arm64" ? BrowserPlatform.MAC_ARM : BrowserPlatform.MAC;
+				const shell = computeExecutablePath({
+					buildId: PUPPETEER_REVISIONS["chrome-headless-shell"],
+					cacheDir,
+					platform,
+					browser: ManagedBrowser.CHROME_HEADLESS_SHELL,
+				});
+				const chrome = computeExecutablePath({
+					buildId: PUPPETEER_REVISIONS.chrome,
+					cacheDir,
+					platform,
+					browser: ManagedBrowser.CHROME,
+				});
+				await Bun.write(shell, "#!/bin/sh\necho 'chrome-headless-shell'\n");
+				fs.chmodSync(shell, 0o755);
+
+				// When only the shell is present, download checks must distinguish products.
+				const probe = (purpose: string) => {
+					const result = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
+						env: { ...env, OMP_BROWSER_PROBE_PURPOSE: purpose },
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
+					return new TextDecoder().decode(result.stdout);
+				};
+
+				// Then only headed/default launches would need a download.
+				expect(JSON.parse(probe("needs-download"))).toEqual({ headless: false, headed: true, default: true });
+				const selected = Bun.spawnSync([process.execPath, EXECUTABLE_PROBE], {
+					env: { ...env, OMP_BROWSER_PROBE_HEADLESS: "1" },
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				expect(selected.exitCode, new TextDecoder().decode(selected.stderr)).toBe(0);
+				expect(new TextDecoder().decode(selected.stdout)).toBe(shell);
+
+				// Given full Chrome is also available, concurrent resolutions and sign-in stay independent.
+				await Bun.write(chrome, "#!/bin/sh\necho 'Chrome for Testing'\n");
+				fs.chmodSync(chrome, 0o755);
+				expect(JSON.parse(probe("products"))).toEqual({
+					shell,
+					chrome,
+					signIn: chrome,
+					shellAgain: shell,
+					chromeAgain: chrome,
+				});
+				expect(JSON.parse(probe("needs-download"))).toEqual({ headless: false, headed: false, default: false });
+
+				// Removing only the shell still leaves full Chrome usable for every launch mode.
+				fs.unlinkSync(shell);
+				expect(JSON.parse(probe("needs-download"))).toEqual({ headless: false, headed: false, default: false });
+			} finally {
+				await tempDir.remove();
+			}
+		},
+		30_000,
+	);
+});
+
+describe("puppeteerHeadlessMode", () => {
+	it("uses shell mode only for a headless chrome-headless-shell executable", () => {
+		// Given full Chrome, shell, and unresolved executable paths.
+		// When choosing Puppeteer's headless mode, then headed mode always wins.
+		expect(puppeteerHeadlessMode(false, "/x/chrome-headless-shell")).toBe(false);
+		expect(puppeteerHeadlessMode(false, "/x/chrome")).toBe(false);
+		expect(puppeteerHeadlessMode(true, "/x/chrome-headless-shell")).toBe("shell");
+		expect(puppeteerHeadlessMode(true, "C:\\x\\chrome-headless-shell.exe")).toBe("shell");
+		expect(puppeteerHeadlessMode(true, "/x/Google Chrome for Testing")).toBe(true);
+		expect(puppeteerHeadlessMode(true, undefined)).toBe(true);
+	});
+});
+
+describe("stealth native iframe", () => {
+	it("marks the helper iframe before insertion and skips its recursive preload", () => {
+		// Given a helper iframe that runs the same preload synchronously when inserted.
+		const script = buildStealthInjectionScriptForTest(["window.patched = true"]);
+		const attributes = new Set<string>();
+		const iframe = {
+			style: {},
+			setAttribute: (name: string) => attributes.add(name),
+			hasAttribute: (name: string) => attributes.has(name),
+			contentWindow: null,
+		};
+		const child = {
+			window: { frameElement: iframe },
+			document: {
+				createElement: () => {
+					throw new Error("Stealth preload recursed into its native iframe");
+				},
+			},
+		};
+		const container = { appendChild: () => runInNewContext(script, child) };
+		const context = { document: { head: container, createElement: () => iframe } };
+
+		// When the page's preload creates the helper.
+		runInNewContext(`globalThis.window = globalThis; ${script}`, context);
+
+		// Then the page is patched but the helper's pristine natives are left alone.
+		expect(attributes.has("data-omp-stealth-natives")).toBe(true);
+		expect("patched" in child.window).toBe(false);
+		expect("patched" in context).toBe(true);
+	});
 });

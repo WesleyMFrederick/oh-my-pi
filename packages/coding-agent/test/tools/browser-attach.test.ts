@@ -19,6 +19,7 @@ import {
 	findFreeCdpPort,
 	findReusableCdp,
 	gracefulKillTreeOnce,
+	isChromiumBrowserExecutable,
 	pickElectronTarget,
 	probeCdpStatus,
 	resolveSpawnArgs,
@@ -34,6 +35,7 @@ import {
 import {
 	acquireBrowser,
 	type BrowserHandle,
+	holdBrowser,
 	normalizeConnectedCdpUrl,
 	releaseBrowser,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
@@ -51,6 +53,10 @@ import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
+const HEADLESS_EXECUTABLE = CHROMIUM_AVAILABLE ? await ensureChromiumExecutable({ headless: true }) : undefined;
+const HEADLESS_SHELL_AVAILABLE =
+	HEADLESS_EXECUTABLE !== undefined &&
+	path.basename(HEADLESS_EXECUTABLE).replace(/\.exe$/i, "") === "chrome-headless-shell";
 let sharedHeadless: BrowserHandle | undefined;
 
 function makeSession(): ToolSession {
@@ -637,6 +643,65 @@ describe("pickElectronTarget", () => {
 		30_000,
 	);
 
+	test.skipIf(!HEADLESS_SHELL_AVAILABLE)(
+		"Given a page-less spawned headless shell, When opened, Then owns a usable page and closes it",
+		async () => {
+			// Given
+			if (!HEADLESS_EXECUTABLE) throw new Error("Expected a headless shell executable");
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-empty-shell-"));
+			const flags = [
+				"--headless",
+				"--no-sandbox",
+				"--no-startup-window",
+				"--no-first-run",
+				"--use-mock-keychain",
+				"--password-store=basic",
+				"--allow-file-access-from-files",
+				...RENDERER_PRIORITY_ARGS,
+				`--user-data-dir=${root}`,
+			];
+			const session = makeSession();
+			const prelude = createBrowserPrelude(session);
+			const invoke = (parameters: unknown) =>
+				prelude.invoke(parameters, { session, toolCallId: "empty-headless-shell" });
+			const name = `empty-shell-${crypto.randomUUID()}`;
+			let handle: BrowserHandle | undefined;
+			try {
+				handle = await acquireBrowser(
+					{ kind: "spawned", path: HEADLESS_EXECUTABLE, args: flags },
+					{ cwd: session.cwd },
+				);
+				holdBrowser(handle);
+				if (!("browser" in handle)) throw new Error("Expected a Puppeteer browser");
+				expect(await handle.browser.pages()).toHaveLength(0);
+
+				// When
+				await invoke({
+					action: "open",
+					name,
+					app: HEADLESS_EXECUTABLE,
+					argv: flags,
+					url: "data:text/html,<title>Spawned shell page</title>",
+				});
+
+				// Then
+				const tab = getTab(name);
+				if (tab?.backend !== "worker") throw new Error("Expected Chromium worker tab");
+				expect(tab.ownsPage).toBe(true);
+				expect((await invoke({ action: "run", name, code: "return await tab.title();" })).details).toMatchObject({
+					value: "Spawned shell page",
+				});
+				await invoke({ action: "close", name });
+				expect(await handle.browser.pages()).toHaveLength(0);
+			} finally {
+				await invoke({ action: "close", name }).catch(() => {});
+				if (handle) await releaseBrowser(handle, { kill: true });
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
+
 	test.skipIf(!CHROMIUM_AVAILABLE)(
 		"reports a connected browser's own viewport on open and observe, and applies one an open asks for",
 		async () => {
@@ -735,8 +800,7 @@ describe("pickElectronTarget", () => {
 			let opened = false;
 			const tabName = `attach-navigation-${process.pid}-${Math.random().toString(36).slice(2)}`;
 			const requested = "data:text/html,<title>attached-navigation-target</title>";
-			const targetPage = (await launched.browser.pages())[0];
-			if (!targetPage) throw new Error("Expected the launched browser to expose a page target");
+			const targetPage = await launched.browser.newPage();
 
 			try {
 				// Without a target the open makes its own page, leaving the endpoint's page alone, and closing closes it.
@@ -766,6 +830,7 @@ describe("pickElectronTarget", () => {
 				expect(targetPage.url()).toBe(requested);
 			} finally {
 				if (opened) await invokeBrowser({ action: "close", name: tabName });
+				await targetPage.close();
 			}
 		},
 		30_000,
@@ -785,8 +850,7 @@ describe("pickElectronTarget", () => {
 			const launched = sharedHeadless;
 			if (!launched || !("browser" in launched)) throw new Error("Expected a shared Puppeteer browser");
 			const endpoint = new URL(launched.wsEndpoint);
-			const targetPage = (await launched.browser.pages())[0];
-			if (!targetPage) throw new Error("Expected the launched browser to expose a page target");
+			const targetPage = await launched.browser.newPage();
 
 			// Count navigations only: after the abort Chrome renders its error page,
 			// whose inline data: icons also surface as intercepted requests.
@@ -833,6 +897,7 @@ describe("pickElectronTarget", () => {
 				targetPage.off("request", onRequest);
 				await targetPage.setRequestInterception(false);
 				if (attached && !attempted) await releaseBrowser(attached, { kill: false });
+				await targetPage.close();
 			}
 		},
 		30_000,
@@ -871,6 +936,22 @@ describe("pickElectronTarget", () => {
 			cdp.stop(true);
 		}
 	});
+});
+
+describe("isChromiumBrowserExecutable", () => {
+	test.each(["chrome-headless-shell", "chrome-headless-shell.exe"])(
+		"recognizes %s as a Chromium browser",
+		executable => {
+			expect(isChromiumBrowserExecutable(executable)).toBe(true);
+		},
+	);
+
+	test.each(["electron", "electron.exe", "/Applications/Electron.app/Contents/MacOS/Electron"])(
+		"does not classify %s as a Chromium browser",
+		executable => {
+			expect(isChromiumBrowserExecutable(executable)).toBe(false);
+		},
+	);
 });
 
 describe("resolveSpawnArgs", () => {

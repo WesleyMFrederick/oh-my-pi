@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Chrome headless shell downloads and executable paths in a separate managed-browser cache.
+
 ## [19.0.0] - 2026-11-18
 
 ### Added

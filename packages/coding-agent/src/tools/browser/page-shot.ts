@@ -19,7 +19,7 @@ const SETTLE_TIMEOUT_MS = 15_000;
  * `signal` aborts.
  */
 export async function capturePage(url: string, signal: AbortSignal): Promise<Uint8Array> {
-	if (await chromiumNeedsDownload()) throw new Error("no Chromium installed");
+	if (await chromiumNeedsDownload({ headless: true })) throw new Error("no Chromium installed");
 	return withScratchPage(signal, async (page, handle) => {
 		await untilAborted(signal, () => applyViewport(page));
 		await untilAborted(signal, () => applyStealthPatches(handle.browser, page, handle.stealth));

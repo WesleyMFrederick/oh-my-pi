@@ -353,9 +353,10 @@ describe("browser open — an abandoned browser acquisition does not hold up the
 describe("browser open — failed spawned-app acquisition reaps its owned process (#9537)", () => {
 	it("kills the OMP-spawned process when no page target can be published", async () => {
 		const disconnectSpy = vi.fn();
+		// Electron adopts an app window; Chromium creates its own page in a worker.
 		const browser = {
-			key: "spawned:/tmp/chrome-headless-shell",
-			kind: { kind: "spawned", path: "/tmp/chrome-headless-shell" },
+			key: "spawned:/tmp/electron",
+			kind: { kind: "spawned", path: "/tmp/electron" },
 			refCount: 0,
 			wsEndpoint: "ws://127.0.0.1/devtools/browser/test",
 			browser: {
@@ -379,7 +380,7 @@ describe("browser open — failed spawned-app acquisition reaps its owned proces
 			invokeBrowser({
 				action: "open",
 				name: "failed-open",
-				app: "/tmp/chrome-headless-shell",
+				app: "/tmp/electron",
 				timeout: 1,
 			}),
 		).rejects.toBeInstanceOf(ToolError);

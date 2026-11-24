@@ -231,13 +231,115 @@ async function attachShared(): Promise<SharedBrowserEndpoint> {
 }
 
 describe("ensureSharedBrowser", () => {
+	describe("legacy headless profile upgrade", () => {
+		it("preserves existing cookies and localStorage when launching after the legacy owner exits", async () => {
+			// Given an exited full-Chrome owner with persisted login and application state.
+			const legacyName = "omp.browser.headless";
+			stub.units.set(
+				legacyName,
+				snapshot({
+					key: legacyName,
+					scope: { kind: "project", dir: projectDir },
+					generation: "legacy-exited",
+					state: "exited",
+					pids: [],
+				}),
+			);
+			const legacyProfile = path.join(runtimeDir, `${legacyName}.profile`);
+			const persisted = [
+				["Default/Network/Cookies", "existing login cookies"],
+				["Default/Local Storage/leveldb/000003.log", "existing localStorage"],
+			] as const;
+			for (const [relative, contents] of persisted) {
+				const file = path.join(legacyProfile, relative);
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, contents);
+			}
+			let launchProfile = "";
+			spyOn(launch, "resolveSharedBrowserLaunchSpec").mockImplementation(async options => {
+				launchProfile = options.userDataDir;
+				return { executablePath: "/opt/fake/chrome", args: ["--remote-debugging-port=0"] };
+			});
+			let stateAtLaunch: (string | null)[] = [];
+			stub.beforeOpen = () => {
+				stateAtLaunch = persisted.map(([relative]) => {
+					const file = path.join(launchProfile, relative);
+					return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+				});
+			};
+			answering.add(9501);
+			stub.launch = () => ({ readyMatch: devtools(9501) });
+
+			// When the shell starts with either the reused or migrated profile.
+			const endpoint = await attachShared();
+			try {
+				// Then its first launch sees the old persisted state, not an empty profile.
+				expect(stateAtLaunch).toEqual(persisted.map(([, contents]) => contents));
+				expect(new URL(endpoint.wsEndpoint).port).toBe("9501");
+			} finally {
+				await endpoint.lease.release();
+			}
+		});
+
+		it("refuses a second profile writer while the legacy headless owner is live, then launches after it exits", async () => {
+			// Given a legacy browser that outlived its startup claim and still owns the profile.
+			const legacyName = "omp.browser.headless";
+			const legacyUnit = snapshot({
+				key: legacyName,
+				scope: { kind: "project", dir: projectDir },
+				generation: "legacy-live",
+				readyMatch: devtools(9502),
+			});
+			stub.units.set(legacyName, legacyUnit);
+			answering.add(9502);
+			answering.add(9503);
+			stub.launch = () => ({ readyMatch: devtools(9503) });
+			const profile = path.join(runtimeDir, `${legacyName}.profile`);
+			const sessions = path.join(profile, "Default", "Sessions");
+			const preferences = path.join(profile, "Default", "Preferences");
+			fs.mkdirSync(sessions, { recursive: true });
+			fs.writeFileSync(path.join(sessions, "Session_1"), "live browser tabs");
+			fs.writeFileSync(preferences, '{"custom":"live browser preferences"}');
+
+			// When a new shell client attempts to attach before the old owner releases the profile.
+			const result = await attachShared().then(
+				endpoint => endpoint,
+				(error: unknown) => error,
+			);
+			try {
+				// Then it reports unavailability without launching, stopping, or editing the live owner's profile.
+				expect(result).toBeInstanceOf(Error);
+				expect(stub.opens).toHaveLength(0);
+				expect(stub.stops).toHaveLength(0);
+				expect(fs.readFileSync(path.join(sessions, "Session_1"), "utf8")).toBe("live browser tabs");
+				expect(fs.readFileSync(preferences, "utf8")).toBe('{"custom":"live browser preferences"}');
+			} finally {
+				if (result && typeof result === "object" && "lease" in result) {
+					await (result as SharedBrowserEndpoint).lease.release();
+				}
+			}
+
+			// When the legacy owner subsequently exits, the same caller can launch the shell.
+			legacyUnit.state = "exited";
+			legacyUnit.pids = [];
+			const endpoint = await attachShared();
+			try {
+				// Then the previous refusal has not poisoned future startup.
+				expect(new URL(endpoint.wsEndpoint).port).toBe("9503");
+				expect(stub.opens).toHaveLength(1);
+			} finally {
+				await endpoint.lease.release();
+			}
+		});
+	});
+
 	it("replaces a live Chrome that stops answering CDP exactly once, on a profile cleared of its stale session", async () => {
 		// Regression: adopting a wedged Chrome handed every session a dead endpoint; replacing it on
 		// the unprepared profile restored the stale session's tabs.
 		seedLiveUnit(9101);
 		answering.add(9102);
 		stub.launch = () => ({ readyMatch: devtools(9102), pids: [5151] });
-		const profile = path.join(runtimeDir, `${NAME}.profile`);
+		const profile = path.join(runtimeDir, "omp.browser.headless.profile");
 		const sessions = path.join(profile, "Default", "Sessions");
 		fs.mkdirSync(sessions, { recursive: true });
 		fs.writeFileSync(path.join(sessions, "Session_1"), "stale tabs");

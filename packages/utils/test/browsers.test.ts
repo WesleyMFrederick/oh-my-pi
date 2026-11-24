@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { encodeArchive } from "../src/ar";
 import {
+	Browser,
 	BrowserPlatform,
 	computeExecutablePath,
 	detectBrowserPlatform,
@@ -85,6 +86,82 @@ describe("Chrome-for-Testing layout goldens", () => {
 	}
 });
 
+describe("chrome-headless-shell layout goldens", () => {
+	const goldens = [
+		{
+			platform: BrowserPlatform.LINUX,
+			url: `https://storage.googleapis.com/chrome-for-testing-public/${BUILD_ID}/linux64/chrome-headless-shell-linux64.zip`,
+			executable: path.join(
+				"/cache",
+				"chrome-headless-shell",
+				`linux-${BUILD_ID}`,
+				"chrome-headless-shell-linux64",
+				"chrome-headless-shell",
+			),
+		},
+		{
+			platform: BrowserPlatform.MAC,
+			url: `https://storage.googleapis.com/chrome-for-testing-public/${BUILD_ID}/mac-x64/chrome-headless-shell-mac-x64.zip`,
+			executable: path.join(
+				"/cache",
+				"chrome-headless-shell",
+				`mac-${BUILD_ID}`,
+				"chrome-headless-shell-mac-x64",
+				"chrome-headless-shell",
+			),
+		},
+		{
+			platform: BrowserPlatform.MAC_ARM,
+			url: `https://storage.googleapis.com/chrome-for-testing-public/${BUILD_ID}/mac-arm64/chrome-headless-shell-mac-arm64.zip`,
+			executable: path.join(
+				"/cache",
+				"chrome-headless-shell",
+				`mac_arm-${BUILD_ID}`,
+				"chrome-headless-shell-mac-arm64",
+				"chrome-headless-shell",
+			),
+		},
+		{
+			platform: BrowserPlatform.WIN32,
+			url: `https://storage.googleapis.com/chrome-for-testing-public/${BUILD_ID}/win32/chrome-headless-shell-win32.zip`,
+			executable: path.join(
+				"/cache",
+				"chrome-headless-shell",
+				`win32-${BUILD_ID}`,
+				"chrome-headless-shell-win32",
+				"chrome-headless-shell.exe",
+			),
+		},
+		{
+			platform: BrowserPlatform.WIN64,
+			url: `https://storage.googleapis.com/chrome-for-testing-public/${BUILD_ID}/win64/chrome-headless-shell-win64.zip`,
+			executable: path.join(
+				"/cache",
+				"chrome-headless-shell",
+				`win64-${BUILD_ID}`,
+				"chrome-headless-shell-win64",
+				"chrome-headless-shell.exe",
+			),
+		},
+	] as const;
+
+	for (const golden of goldens) {
+		test(golden.platform, () => {
+			expect(String(getDownloadUrl(golden.platform, BUILD_ID, undefined, Browser.CHROME_HEADLESS_SHELL))).toBe(
+				golden.url,
+			);
+			expect(
+				computeExecutablePath({
+					platform: golden.platform,
+					buildId: BUILD_ID,
+					cacheDir: "/cache",
+					browser: Browser.CHROME_HEADLESS_SHELL,
+				}),
+			).toBe(golden.executable);
+		});
+	}
+});
+
 test("Chrome-for-Testing rejects linux/arm64 before producing archive or cache paths", async () => {
 	const unsupported = "Chrome for Testing does not provide linux/arm64 builds";
 	expect(() => getDownloadUrl(BrowserPlatform.LINUX_ARM, BUILD_ID)).toThrow(unsupported);
@@ -149,6 +226,35 @@ test("install extracts a member larger than the default 64 MiB archive cap", asy
 			baseUrl: String(server.url),
 		});
 		expect((await fs.stat(installed.executablePath)).size).toBe(bigSize);
+	} finally {
+		server.stop(true);
+	}
+});
+
+test("install fetches and unpacks chrome-headless-shell into its own cache directory", async () => {
+	const root = await makeRoot();
+	const zip = await encodeArchive("zip", [
+		["chrome-headless-shell-linux64/chrome-headless-shell", new TextEncoder().encode("#!/bin/sh\necho shell\n")],
+	]);
+	const requested: string[] = [];
+	const server = Bun.serve({
+		port: 0,
+		fetch(request) {
+			requested.push(new URL(request.url).pathname);
+			return new Response(new Blob([zip]));
+		},
+	});
+	try {
+		const installed = await install({
+			platform: BrowserPlatform.LINUX,
+			buildId: BUILD_ID,
+			cacheDir: root,
+			baseUrl: String(server.url),
+			browser: Browser.CHROME_HEADLESS_SHELL,
+		});
+		expect(requested).toEqual([`/${BUILD_ID}/linux64/chrome-headless-shell-linux64.zip`]);
+		expect(installed.path).toBe(path.join(root, "chrome-headless-shell", `linux-${BUILD_ID}`));
+		expect(await Bun.file(installed.executablePath).text()).toBe("#!/bin/sh\necho shell\n");
 	} finally {
 		server.stop(true);
 	}

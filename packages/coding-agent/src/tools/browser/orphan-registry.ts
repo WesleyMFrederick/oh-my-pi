@@ -1,6 +1,6 @@
 /**
  * Durable ownership registry for targets in the project-shared daemon-owned
- * Chromium (`omp.browser.headless`/`omp.browser.headed`).
+ * Chromium (`omp.browser.headless-shell`/`omp.browser.headed`).
  *
  * The shared browser outlives any single omp process, but tab ownership is
  * otherwise tracked only in that process's memory (`tab-supervisor`'s `tabs`
@@ -33,7 +33,7 @@ import { processStartTime } from "./launch-ledger";
 export interface SharedTargetScope {
 	/** Canonical project directory whose scope holds the browser unit (as stamped on the handle). */
 	projectDir: string;
-	/** Key of the browser's `proc` unit, e.g. `omp.browser.headless`. */
+	/** Key of the browser's `proc` unit, e.g. `omp.browser.headless-shell`. */
 	daemonName: string;
 }
 
