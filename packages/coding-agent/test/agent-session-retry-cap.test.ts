@@ -1887,13 +1887,15 @@ describe("AgentSession retry delay cap", () => {
 			`${exhaustedModel.provider}/${exhaustedModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
-		expect(fallbackEvents).toContainEqual({
-			type: "retry_fallback_applied",
-			from: `${exhaustedModel.provider}/${exhaustedModel.id}`,
-			to: `${fallbackModel.provider}/${fallbackModel.id}`,
-			role: "default",
-			reason: expect.stringContaining("429 Weekly usage limit reached"),
-		});
+		expect(fallbackEvents).toContainEqual(
+			expect.objectContaining({
+				type: "retry_fallback_applied",
+				from: `${exhaustedModel.provider}/${exhaustedModel.id}`,
+				to: `${fallbackModel.provider}/${fallbackModel.id}`,
+				role: "default",
+				reason: expect.stringContaining("429 Weekly usage limit reached"),
+			}),
+		);
 		for (const call of waitSpy.mock.calls) {
 			expect(call[0]).toBeLessThan(300_000);
 		}
@@ -2934,8 +2936,7 @@ describe("AgentSession retry delay cap", () => {
 		const blocked = await authStorage.limits.markReached("anthropic", "other-session", { retryAfterMs: 2_000 });
 		expect(blocked.switched).toBe(true);
 
-		const rateLimitError =
-			'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}} retry-after-ms=11180000';
+		const rateLimitError = "429 usage_limit_reached retry-after-ms=11180000";
 		const mock = createMockModel();
 		let attempts = 0;
 		const agent = new Agent({
@@ -4212,7 +4213,7 @@ describe("AgentSession retry delay cap", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: false, attempt: 2 });
 		expect(fallbackEvents).toHaveLength(0);
 		const last = lastAssistant(session);
-		expect(last.errorMessage).toBe("Retry budget exhausted after 2 retries: Request was aborted");
+		expect(last.errorMessage).toBe("HarnessFaultNoFallback (abort): Request was aborted");
 		expect(session.isRetrying).toBe(false);
 	});
 
@@ -4272,8 +4273,7 @@ describe("AgentSession retry delay cap", () => {
 			throw new Error("Expected bundled Anthropic test model to exist");
 		}
 
-		const usageLimitError =
-			'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}';
+		const usageLimitError = "429 usage_limit_reached";
 		const mock = createMockModel({
 			responses: [{ content: ["Already visible"], stopReason: "error", errorMessage: usageLimitError }],
 		});

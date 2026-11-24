@@ -1540,6 +1540,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						progress.resolvedModelIsFallback = nextProgress.resolvedModel
 							? nextProgress.resolvedModelIsFallback
 							: undefined;
+						progress.fallback = nextProgress.fallback;
 						progress.advisor = nextProgress.advisor ?? progress.advisor;
 						progress.completionPercent = nextProgress.completionPercent ?? progress.completionPercent;
 						progress.stage = nextProgress.stage ?? progress.stage;
@@ -1637,6 +1638,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.retryState = undefined;
 					progress.modelRole = singleResult?.modelRole ?? progress.modelRole;
 					progress.advisor = singleResult?.advisor ?? progress.advisor;
+					progress.fallback = singleResult?.fallback;
 					progress.resolvedModelRoute = singleResult?.resolvedModelRoute ?? progress.resolvedModelRoute;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;

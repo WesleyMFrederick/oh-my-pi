@@ -217,6 +217,8 @@ export function extensionEventFromSessionEvent(
 				to: event.to,
 				role: event.role,
 				reason: event.reason,
+				cause: event.cause,
+				trigger: event.trigger,
 			};
 		case "retry_fallback_succeeded":
 			return { type: "retry_fallback_succeeded", model: event.model, role: event.role };

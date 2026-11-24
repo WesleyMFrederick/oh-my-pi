@@ -5590,17 +5590,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				endLoop({ continuing: true });
 				return;
 			} else if (!requestBodyTimeoutTerminal && this.#recovery.isHardErrorFallbackEligible(msg)) {
-				// A non-retryable hard error on a model covered by a configured
-				// fallback chain: retrying the SAME model is pointless, but a
-				// DIFFERENT model is a fresh chance — consult the chain before
-				// surfacing the failure. #handleRetryableError bails out (no
-				// backoff-retry of the failing model) when no switch happens.
+				// Consult the chain for provider hard errors. Unknown failures first
+				// spend bounded same-model retries; harness failures never switch models.
 				const didRetry = await this.#recovery.handleRetryableError(msg, { hardErrorFallback: true });
 				if (didRetry) {
 					endLoop({ continuing: true });
 					return;
 				}
 			}
+			this.#recovery.recordTerminalHarnessFault(msg);
 			// Classifier refusals are persisted-skipped above; also prune the trailing
 			// stub from active context so the next turn's prompt does not replay it.
 			// Keep a reference for post-settle readers (print mode, task executor via

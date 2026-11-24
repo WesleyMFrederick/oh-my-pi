@@ -2887,7 +2887,9 @@ export class EventController {
 		const reason = event.reason
 			? `\n${previewLine(sanitizeText(event.reason), TRUNCATE_LENGTHS.LINE * PREVIEW_LIMITS.COLLAPSED_LINES)}`
 			: "";
-		this.ctx.showWarning(`Fallback: ${event.from} -> ${event.to}${reason}`);
+		this.ctx.showWarning(
+			`Fallback: ${event.from} -> ${event.to}: ${event.cause.kind}${event.cause.code ? ` (${event.cause.code})` : ""}${reason}`,
+		);
 	}
 
 	async #handleRetryFallbackSucceeded(

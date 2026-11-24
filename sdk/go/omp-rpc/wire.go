@@ -4266,11 +4266,57 @@ func (v CacheWarmingEndEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"cache_warming_end"`, nil)
 }
 
+type FallbackCause struct {
+	Origin FallbackCauseOrigin `json:"origin"`
+	Kind   string              `json:"kind"`
+	Code   *string             `json:"code,omitempty"`
+}
+
+func (v *FallbackCause) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "FallbackCause", v.decodeFrom)
+}
+
+func (v *FallbackCause) decodeFrom(raw map[string]json.RawMessage) error {
+	var out FallbackCause
+	d := fieldDecoder{raw: raw, owner: "FallbackCause"}
+	d.required("origin", &out.Origin)
+	d.required("kind", &out.Kind)
+	d.optional("code", &out.Code)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type FallbackCauseOrigin string
+
+const (
+	FallbackCauseOriginHarness  FallbackCauseOrigin = "harness"
+	FallbackCauseOriginProvider FallbackCauseOrigin = "provider"
+	FallbackCauseOriginUnknown  FallbackCauseOrigin = "unknown"
+)
+
+func (v *FallbackCauseOrigin) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "FallbackCauseOrigin")
+	if err != nil {
+		return err
+	}
+	switch value := FallbackCauseOrigin(s); value {
+	case FallbackCauseOriginHarness, FallbackCauseOriginProvider, FallbackCauseOriginUnknown:
+		*v = value
+		return nil
+	}
+	return unknownValue("FallbackCauseOrigin", s)
+}
+
 type RetryFallbackAppliedEvent struct {
-	From   string  `json:"from"`
-	To     string  `json:"to"`
-	Role   string  `json:"role"`
-	Reason *string `json:"reason,omitempty"`
+	From    string                           `json:"from"`
+	To      string                           `json:"to"`
+	Role    string                           `json:"role"`
+	Cause   FallbackCause                    `json:"cause"`
+	Trigger RetryFallbackAppliedEventTrigger `json:"trigger"`
+	Reason  *string                          `json:"reason,omitempty"`
 }
 
 func (v *RetryFallbackAppliedEvent) UnmarshalJSON(data []byte) error {
@@ -4284,6 +4330,8 @@ func (v *RetryFallbackAppliedEvent) decodeFrom(raw map[string]json.RawMessage) e
 	d.required("from", &out.From)
 	d.required("to", &out.To)
 	d.required("role", &out.Role)
+	d.required("cause", &out.Cause)
+	d.required("trigger", &out.Trigger)
 	d.optional("reason", &out.Reason)
 	if d.err != nil {
 		return d.err
@@ -4295,6 +4343,26 @@ func (v *RetryFallbackAppliedEvent) decodeFrom(raw map[string]json.RawMessage) e
 func (v RetryFallbackAppliedEvent) MarshalJSON() ([]byte, error) {
 	type plain RetryFallbackAppliedEvent
 	return encodeObject(plain(v), `"type":"retry_fallback_applied"`, nil)
+}
+
+type RetryFallbackAppliedEventTrigger string
+
+const (
+	RetryFallbackAppliedEventTriggerTurn  RetryFallbackAppliedEventTrigger = "turn"
+	RetryFallbackAppliedEventTriggerSteer RetryFallbackAppliedEventTrigger = "steer"
+)
+
+func (v *RetryFallbackAppliedEventTrigger) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "RetryFallbackAppliedEventTrigger")
+	if err != nil {
+		return err
+	}
+	switch value := RetryFallbackAppliedEventTrigger(s); value {
+	case RetryFallbackAppliedEventTriggerTurn, RetryFallbackAppliedEventTriggerSteer:
+		*v = value
+		return nil
+	}
+	return unknownValue("RetryFallbackAppliedEventTrigger", s)
 }
 
 type RetryFallbackSucceededEvent struct {

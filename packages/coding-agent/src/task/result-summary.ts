@@ -79,6 +79,7 @@ export function formatTaskResultSummary(
 			duration: formatDuration(options.totalDurationMs),
 			abortReason: result.aborted ? escapeHarnessTags(result.abortReason ?? "") || undefined : undefined,
 			error: error === undefined ? undefined : escapeHarnessTags(error),
+			fallback: result.fallback,
 			resumable,
 			preview: escapeHarnessTags(truncated ? previewHead(output) : output),
 			truncated,

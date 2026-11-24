@@ -39,6 +39,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { completeSimple, isUsageLimitOutcome, resolveModelServiceTier, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { classifyFallbackCause } from "./fallback-cause";
 import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { extractHttpStatusFromError, logger, prompt } from "@oh-my-pi/pi-utils";
@@ -358,6 +359,7 @@ interface ActiveAdvisor {
 	pendingCoveredTurn: number;
 	retryFallback?: AdvisorRetryFallbackState;
 	retryFallbackPendingSuccess: boolean;
+	recoveryRetries: number;
 	/**
 	 * Consecutive provider-block waits (usage limit or timed rate limit), bounded
 	 * by retry.maxRetries. Reset on turn success, abandonment, and conversation
@@ -1686,7 +1688,7 @@ export class SessionAdvisors {
 					await this.#host.emitSessionEvent({
 						type: "retry_fallback_succeeded",
 						model: formatRetryFallbackSelector(advisorRef.agent.state.model, advisorRef.thinkingLevel),
-						role: fallback.role,
+						role: "advisor",
 					});
 				},
 				onTurnAbandoned: () => {
@@ -1744,6 +1746,7 @@ export class SessionAdvisors {
 				reviewOwed: carried?.get(slug)?.reviewOwed ?? false,
 				pendingCoveredTurn: 0,
 				retryFallbackPendingSuccess: false,
+				recoveryRetries: 0,
 				providerWaitRetries: 0,
 				credentialSwitches: undefined,
 				signature,
@@ -2172,7 +2175,8 @@ export class SessionAdvisors {
 					errorStatus: assistantFailure.errorStatus,
 				})
 			: AIError.classify(error, currentModel.api);
-		if (AIError.is(errorId, AIError.Flag.Abort) || AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
+		const cause = classifyFallbackCause(assistantFailure ?? ({ errorMessage: message } as AssistantMessage), errorId);
+		if (AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
 		// Text-ambiguous overflows waive the veto; usage-backed do not — see AIError.isTextAmbiguousContextOverflow (#9235).
 		const contextWindow = currentModel.contextWindow ?? 0;
 		const overflowVeto =
@@ -2180,6 +2184,39 @@ export class SessionAdvisors {
 				(assistantFailure !== undefined && AIError.isContextOverflow(assistantFailure, contextWindow))) &&
 			!AIError.isTextAmbiguousContextOverflow(errorId, assistantFailure, contextWindow);
 		if (overflowVeto) {
+			return false;
+		}
+
+		const retrySettings = cfgRetry.get(this.#host.settings);
+		const retryAfterMs = extractProviderRetryHint(currentModel.provider, message, currentModel.baseUrl);
+		const timedTransient = retryAfterMs !== undefined && AIError.is(errorId, AIError.Flag.Transient);
+		if (
+			cause.origin === "harness" &&
+			cause.kind === "rate_limit" &&
+			(await this.#waitOutAdvisorProviderBlock(advisor, retrySettings, false, { retryAfterMs }, signal))
+		) {
+			advisor.recoveryRetries++;
+			return true;
+		}
+		// Timed transient errors already consume the provider-wait budget below.
+		const boundedRetry =
+			(cause.origin === "unknown" && !timedTransient) || (cause.origin === "harness" && cause.kind === "abort");
+		if (boundedRetry && retrySettings.enabled && advisor.recoveryRetries < retrySettings.maxRetries) {
+			const delayMs = Math.max(retrySettings.baseDelayMs, retryAfterMs ?? 0);
+			if (retrySettings.maxDelayMs <= 0 || delayMs <= retrySettings.maxDelayMs) {
+				await scheduler.wait(delayMs, { signal });
+				advisor.recoveryRetries++;
+				return true;
+			}
+		}
+		if (cause.origin === "harness") {
+			this.#host.sessionManager.appendCustomEntry("omp:model-switch-refused", {
+				advisor: advisor.name,
+				model: formatRetryFallbackSelector(currentModel, advisor.thinkingLevel),
+				cause,
+				trigger: "turn",
+				attempt: advisor.recoveryRetries + 1,
+			});
 			return false;
 		}
 
@@ -2193,7 +2230,6 @@ export class SessionAdvisors {
 			if (rotation.switched && this.#spendCredentialSwitch(advisor, currentModel.provider)) return true;
 		}
 
-		const retryAfterMs = extractProviderRetryHint(currentModel.provider, message, currentModel.baseUrl);
 		const usageLimit =
 			AIError.is(errorId, AIError.Flag.UsageLimit) ||
 			isUsageLimitOutcome(extractHttpStatusFromError(error), message);
@@ -2227,12 +2263,11 @@ export class SessionAdvisors {
 		// "Codex is at capacity" with Retry-After) clears on its own: wait out the
 		// stated window like the primary retry loop instead of burning the
 		// runtime's three 1s retries and dropping the batch.
-		const timedRateLimit = !usageLimit && retryAfterMs !== undefined && AIError.is(errorId, AIError.Flag.Transient);
+		const timedRateLimit = !usageLimit && timedTransient;
 		if (!assistantFailure && !accountPolicyDenial && !usageLimit && !timedRateLimit) return false;
 
 		const currentSelector = formatRetryFallbackSelector(currentModel, advisor.thinkingLevel);
 
-		const retrySettings = cfgRetry.get(this.#host.settings);
 		// A usage-limit or timed rate-limit error with no sibling credential and no
 		// usable model fallback is not automatically fatal: wait out the block and
 		// retry, mirroring the primary turn-recovery. Only a wait past
@@ -2314,11 +2349,23 @@ export class SessionAdvisors {
 				}
 				advisor.retryFallbackPendingSuccess = true;
 				this.#host.settings.getStorage()?.recordModelUsage(formatModelStringWithRouting(candidate));
+				this.#host.sessionManager.appendCustomEntry("omp:advisor-model-switch", {
+					advisor: advisor.name,
+					from: currentSelector,
+					to: selector.raw,
+					cause,
+					trigger: "turn",
+					attempt: advisor.recoveryRetries + 1,
+				});
+				advisor.recoveryRetries = 0;
 				await this.#host.emitSessionEvent({
 					type: "retry_fallback_applied",
 					from: currentSelector,
 					to: selector.raw,
-					role,
+					// The event identifies the actor; retryFallback.role retains the chain owner.
+					role: "advisor",
+					cause,
+					trigger: "turn",
 					reason: `Advisor request failed: ${message}`,
 				});
 				return true;
@@ -2345,6 +2392,7 @@ export class SessionAdvisors {
 	#resetRecoveryBudgets(advisor: ActiveAdvisor): void {
 		advisor.providerWaitRetries = 0;
 		advisor.credentialSwitches = undefined;
+		advisor.recoveryRetries = 0;
 	}
 
 	/**

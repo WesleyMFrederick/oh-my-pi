@@ -51,6 +51,7 @@ import {
 import type { EditModeSetting } from "../edit/settings";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ResetRecoveryResult } from "./codex-auto-reset";
+import { classifyFallbackCause, type FallbackCause } from "./fallback-cause";
 import type {
 	InitialRetryFallbackState,
 	UsageFallbackConfirmation,
@@ -118,6 +119,13 @@ const USAGE_LIMIT_BOOKKEEPING_TIMEOUT_MS = 3_000;
 const NON_WHITESPACE_RE = /\S/;
 const USAGE_PREFLIGHT_BLOCKED_PREFIX = "Usage preflight blocked:";
 const STREAM_STALL_ERROR_RE = /stream stall/i;
+export class HarnessCausedModelChangeError extends Error {
+	constructor() {
+		super("Harness-caused failures cannot change models");
+		this.name = "HarnessCausedModelChangeError";
+	}
+}
+
 const HTTP2_STREAM_RESET_ERROR_RE =
 	/stream closed with error code\s+nghttp2_(?:internal_error|refused_stream)|nghttp2_(?:internal_error|refused_stream)|HTTP2(?:StreamReset|RefusedStream)/i;
 // Gateway/provider closes a stream mid-generation without its terminal chunk
@@ -861,6 +869,24 @@ export class TurnRecovery {
 		return this.#handleRetryableError(message, options);
 	}
 
+	recordTerminalHarnessFault(message: AssistantMessage): void {
+		if (message.stopReason !== "error" || message.errorMessage?.startsWith("HarnessFaultNoFallback (")) return;
+		const cause = classifyFallbackCause(message, this.#classifyRetryMessage(message));
+		if (cause.origin !== "harness") return;
+		const model = this.#host.model();
+		const trigger =
+			this.#host.agent.peekSteeringQueue().length || this.#host.agent.peekUndeliveredQueuedMessages().length
+				? "steer"
+				: "turn";
+		this.#host.sessionManager.appendCustomEntry("omp:model-switch-refused", {
+			cause,
+			trigger,
+			attempt: this.#retryAttempt || 1,
+			model: model ? formatModelStringWithRouting(model) : undefined,
+		});
+		message.errorMessage = `HarnessFaultNoFallback (${cause.kind}): ${message.errorMessage ?? "Unknown error"}`;
+	}
+
 	/**
 	 * Records a usage-limit failure before replay eligibility decides whether the
 	 * failed turn may be discarded. Returns whether credential recovery switched
@@ -869,6 +895,7 @@ export class TurnRecovery {
 	async recordUsageLimitOutcome(message: AssistantMessage): Promise<boolean> {
 		if (message.stopReason !== "error") return false;
 		const id = this.#classifyRetryMessage(message);
+		if (classifyFallbackCause(message, id).origin === "harness") return false;
 		const activeModel = this.#host.model();
 		if (!activeModel || !AIError.is(id, AIError.Flag.UsageLimit)) return false;
 		// Only the request-time provider proves a delayed error belongs to the old pool.
@@ -2163,6 +2190,9 @@ export class TurnRecovery {
 		}
 		this.#usageReserveApproval = undefined;
 		return this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
+			cause: { origin: "provider", kind: "usage_limit" },
+			trigger: "turn",
+			attempt: 0,
 			pinFallback: true,
 			apiKey: fallback.apiKey,
 			signal,
@@ -2183,6 +2213,9 @@ export class TurnRecovery {
 		const fallback = await this.#findKeyedRetryFallback(currentSelector, currentModel, signal);
 		if (!fallback) return false;
 		return this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
+			cause: { origin: "provider", kind: "credential_unavailable" },
+			trigger: "turn",
+			attempt: 0,
 			apiKey: fallback.apiKey,
 			signal,
 			reason: `no credential for ${currentModel.provider}`,
@@ -2296,8 +2329,17 @@ export class TurnRecovery {
 		role: string,
 		selector: RetryFallbackSelector,
 		currentSelector: string,
-		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
+		options: {
+			cause: FallbackCause;
+			trigger: "turn" | "steer";
+			attempt: number;
+			pinFallback?: boolean;
+			apiKey?: string;
+			signal?: AbortSignal;
+			reason?: string;
+		},
 	): Promise<boolean> {
+		if (options.cause.origin === "harness") throw new HarnessCausedModelChangeError();
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 		if (!candidate) {
@@ -2353,7 +2395,12 @@ export class TurnRecovery {
 			if (this.#activeRetryFallback) this.#activeRetryFallback.served = servedBeforeSwap;
 			return false;
 		}
-		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
+		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true, {
+			from: currentSelector,
+			cause: options.cause,
+			trigger: options.trigger,
+			attempt: options.attempt,
+		});
 		this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
 		this.#host.setThinkingLevel(nextThinkingLevel);
 		if (!this.#activeRetryFallback) {
@@ -2374,6 +2421,8 @@ export class TurnRecovery {
 			from: currentSelector,
 			to: selector.raw,
 			role,
+			cause: options.cause,
+			trigger: options.trigger,
 			reason: options?.reason,
 		});
 		return true;
@@ -2382,7 +2431,10 @@ export class TurnRecovery {
 	async #tryRetryModelFallback(
 		currentSelector: string,
 		failedMessage: AssistantMessage,
-		options?: {
+		options: {
+			cause: FallbackCause;
+			trigger: "turn" | "steer";
+			attempt: number;
 			excludeProvider?: string;
 			pinFallback?: boolean;
 			preserveFailedTurn?: boolean;
@@ -2623,6 +2675,8 @@ export class TurnRecovery {
 			return false;
 		}
 		if (this.#hasReplayUnsafeOutput(message)) return false;
+		const cause = classifyFallbackCause(message, id);
+		if (cause.origin === "harness" || cause.origin === "unknown") return true;
 		const currentSelector = formatRetryFallbackSelector(model, this.#host.thinkingLevel());
 		return this.retryFallbackChainKeys(currentSelector).some(
 			role => this.findRetryFallbackCandidates(role, currentSelector).length > 0,
@@ -2654,7 +2708,11 @@ export class TurnRecovery {
 	 * fallback that makes Fast a safe default. Returns false when the current
 	 * model is not a fast variant, the base id is missing, or it has no key.
 	 */
-	async #tryFireworksFastFallback(currentSelector: string): Promise<boolean> {
+	async #tryFireworksFastFallback(
+		currentSelector: string,
+		cause: FallbackCause,
+		trigger: "turn" | "steer",
+	): Promise<boolean> {
 		const model = this.#activeFireworksFastModel();
 		if (!model) return false;
 		const baseModel = this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id));
@@ -2667,7 +2725,12 @@ export class TurnRecovery {
 		// chain: the base model must not be reported as the configured primary.
 		this.#markFallbackRouted();
 		await this.#host.setModelWithProviderSessionReset(baseModel);
-		this.#host.sessionManager.appendModelChange(baseSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
+		this.#host.sessionManager.appendModelChange(baseSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true, {
+			from: currentSelector,
+			cause,
+			trigger,
+			attempt: this.#retryAttempt,
+		});
 		this.#host.settings.getStorage()?.recordModelUsage(baseSelector);
 		await this.#host.syncAfterModelChange(previousEditMode, { retryFallback: true });
 		await this.#host.emitSessionEvent({
@@ -2675,6 +2738,8 @@ export class TurnRecovery {
 			from: currentSelector,
 			to: baseSelector,
 			role: "fireworks-fast",
+			cause,
+			trigger,
 			reason: "Request rejected by the Fast tier. Retrying on the Standard tier.",
 		});
 		return true;
@@ -2755,10 +2820,9 @@ export class TurnRecovery {
 
 	/**
 	 * Handle retryable errors with exponential backoff, credential rotation, and
-	 * model-fallback chains. Also entered for NON-retryable errors when a switch
-	 * is the recovery (`fireworksFastFallback`, `hardErrorFallback`): then a
-	 * successful model switch retries immediately, and a failed switch surfaces
-	 * the error without a same-model backoff retry.
+	 * model-fallback chains. Also entered for hard errors: provider failures may
+	 * switch immediately, unknown failures spend bounded same-model retries,
+	 * and harness failures never switch models.
 	 * @returns true if retry was initiated, false if max retries exceeded or disabled
 	 */
 	async #handleRetryableError(message: AssistantMessage, options?: RetryPolicyOptions): Promise<boolean> {
@@ -2823,6 +2887,33 @@ export class TurnRecovery {
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
+		const cause = classifyFallbackCause(message, id);
+		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
+		const trigger =
+			this.#host.agent.peekSteeringQueue().length || this.#host.agent.peekUndeliveredQueuedMessages().length
+				? "steer"
+				: "turn";
+		const deterministicHarness =
+			cause.origin === "harness" &&
+			// Stale replay state has an existing same-model reset, not a deterministic request fault.
+			!staleOpenAIResponsesReplayError &&
+			cause.kind !== "rate_limit" &&
+			cause.kind !== "abort" &&
+			cause.kind !== "steer_collision";
+		if (cause.origin === "harness" && (retryBudgetExhausted || deterministicHarness)) {
+			this.#host.sessionManager.appendCustomEntry("omp:model-switch-refused", {
+				cause,
+				trigger,
+				attempt: this.#retryAttempt,
+				model: this.#host.model() ? formatModelStringWithRouting(this.#host.model()!) : "",
+			});
+			message.errorMessage = `HarnessFaultNoFallback (${cause.kind}): ${errorMessage}`;
+			await this.#closeRetrySaga(
+				{ success: false, attempt: Math.max(0, this.#retryAttempt - 1), finalError: message.errorMessage },
+				{ terminalTurn: message, retryErrors: { status: "superseded" } },
+			);
+			return false;
+		}
 		const requestProvider = (message as IssuedProviderAssistantMessage)[kUsageLimitRequestProvider];
 		const oldProviderLimitFor = (model: Model | undefined): boolean =>
 			requestProvider !== undefined &&
@@ -2842,7 +2933,6 @@ export class TurnRecovery {
 		const sourceRateLimited =
 			retrySettings.rateLimitWalksChain &&
 			(message.errorStatus === 429 || rateLimitReason === "RATE_LIMIT_EXCEEDED");
-		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
 		let recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		let staleUsageLimit = oldProviderLimitFor(this.#host.model());
@@ -3053,8 +3143,8 @@ export class TurnRecovery {
 		const thinkingLoop = AIError.is(id, AIError.Flag.ThinkingLoop);
 		// A Codex steering rejection answers our own `response.steer`, not the
 		// model's health, and the provider already stopped steering the session:
-		// replay on the same model while same-model retries remain. Once the
-		// budget is spent, the chain keeps its last-resort consult.
+		// replay on the same model while same-model retries remain. Harness failures
+		// never use the chain's last-resort consult.
 		const sameModelSteerReplay =
 			!retryBudgetExhausted && AIError.isCodexSteerRejection({ api: currentModel?.api, errorMessage });
 		const effectiveUsageLimitWaitMs =
@@ -3189,6 +3279,7 @@ export class TurnRecovery {
 				retryFallbackAdmits(retrySettings.fallbackOn, AIError.is(id, AIError.Flag.UsageLimit)) &&
 				!staleUsageLimit &&
 				!thinkingLoop &&
+				(cause.origin === "provider" || (cause.origin === "unknown" && retryBudgetExhausted)) &&
 				!sameModelSteerReplay &&
 				!waitForSiblingCredential &&
 				!refusalWalkRepeats &&
@@ -3206,6 +3297,9 @@ export class TurnRecovery {
 					this.noteRetryFallbackCooldown(currentSelector, usageCooldownMs ?? parsedRetryAfterMs, errorMessage);
 				}
 				switchedModel = await this.#tryRetryModelFallback(currentSelector, message, {
+					cause,
+					trigger,
+					attempt: this.#retryAttempt,
 					excludeProvider: longUsageLimitFallback ? currentModel.provider : undefined,
 					pinFallback: classifierRefusal,
 					refusalWalk: classifierRefusal,
@@ -3238,8 +3332,13 @@ export class TurnRecovery {
 			// of the role-fallback setting: it's intrinsic to the Fast contract (speed
 			// best-effort, degrade to Standard on failure) and triggers on hard router
 			// errors the generic retry classifier would otherwise reject.
-			if (!switchedModel && allowModelFallback && options?.fireworksFastFallback) {
-				switchedModel = await this.#tryFireworksFastFallback(currentSelector);
+			if (
+				!switchedModel &&
+				allowModelFallback &&
+				options?.fireworksFastFallback &&
+				(cause.origin === "provider" || (cause.origin === "unknown" && retryBudgetExhausted))
+			) {
+				switchedModel = await this.#tryFireworksFastFallback(currentSelector, cause, trigger);
 			}
 			if (switchedModel) {
 				delayMs = 0;
@@ -3303,6 +3402,7 @@ export class TurnRecovery {
 		// surface it instead.
 		if (
 			(options?.fireworksFastFallback || options?.hardErrorFallback) &&
+			cause.origin === "provider" &&
 			!switchedModel &&
 			!this.isRetryableError(message)
 		) {
@@ -3320,6 +3420,7 @@ export class TurnRecovery {
 
 		// The fail-fast cap (`exceedsDelayCap`, defined above the chain consult).
 		if (exceedsDelayCap(delayMs) && !switchedCredential && !switchedModel) {
+			if (cause.origin === "harness") this.recordTerminalHarnessFault(message);
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
 			await this.#closeRetrySaga(

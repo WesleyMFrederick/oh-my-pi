@@ -3761,6 +3761,7 @@ interface CodexSteerWaiter {
 
 interface CodexWebSocketConnectionOptions {
 	onHandshakeHeaders?: (headers: Headers) => void;
+	onSteeringUnsupported?: () => void;
 	proxy?: string;
 }
 
@@ -3769,6 +3770,8 @@ class CodexWebSocketConnection {
 	#channel: ResponsesWebSocketConnection;
 	#headers: Record<string, string>;
 	#pendingRequests = 0;
+	/** A rejected steer may leave the response running; retain its error if the lane closes instead. */
+	#nativeSteerRejection?: CodexProviderStreamError;
 	#steerWaiters: CodexSteerWaiter[] = [];
 	#acceptedSteers = new Set<string>();
 	#failedSteers = new Set<string>();
@@ -3793,9 +3796,15 @@ class CodexWebSocketConnection {
 					if (typeof frame.type === "string" && frame.type.startsWith("response.steer.")) {
 						return this.#handleSteerEvent(frame) ?? true;
 					}
-					// The native lane refuses the submission and ends the response.
-					if (frame.type === "error" && frame.code === AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE) {
+					if (
+						frame.type === "error" &&
+						frame.code === AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE &&
+						this.#steerWaiters.length > 0
+					) {
+						this.#nativeSteerRejection = createCodexProviderStreamError(frame);
+						options.onSteeringUnsupported?.();
 						this.#refuseSteerWaiters(frame.code, typeof frame.message === "string" ? frame.message : undefined);
+						return true;
 					}
 					return false;
 				},
@@ -3918,9 +3927,15 @@ class CodexWebSocketConnection {
 				logger.debug("[codex] codex websocket transport failure", {
 					error: error instanceof Error ? error.message : String(error),
 				});
+			if (owned && this.#nativeSteerRejection && error instanceof ResponsesWebSocketTransportError) {
+				throw this.#nativeSteerRejection;
+			}
 			throw translateCodexWebSocketError(error);
 		} finally {
-			if (owned) this.#attachSteerIds = undefined;
+			if (owned) {
+				this.#attachSteerIds = undefined;
+				this.#nativeSteerRejection = undefined;
+			}
 		}
 	}
 
@@ -4053,6 +4068,9 @@ async function getOrCreateCodexWebSocketConnection(
 	state.connection = new CodexWebSocketConnection(url, headerRecord, {
 		onHandshakeHeaders: handshakeHeaders => {
 			updateCodexSessionMetadataFromHeaders(turnState, state, handshakeHeaders);
+		},
+		onSteeringUnsupported: () => {
+			state.steeringUnsupported = true;
 		},
 		proxy,
 	});

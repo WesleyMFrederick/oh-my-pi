@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Defer Codex steering rejected during an active native turn instead of failing the response, and avoid live steering again in that provider session.
 - Codex responses now record the server-reported model as `upstreamModel`, so callers can see which model served a turn instead of only the requested id.
 
 ## [19.0.0] - 2026-11-18

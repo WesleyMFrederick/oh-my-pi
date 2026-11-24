@@ -1182,11 +1182,20 @@ class CacheWarmingEndEvent:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class FallbackCause:
+    origin: Literal["harness", "provider", "unknown"]
+    kind: str
+    code: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class RetryFallbackAppliedEvent:
     type: Literal["retry_fallback_applied"] = "retry_fallback_applied"
     from_model: str
     to_model: str
     role: str
+    cause: FallbackCause
+    trigger: Literal["turn", "steer"]
     reason: str | None = None
 
 
@@ -2639,6 +2648,15 @@ def parse_cache_warming_end_event(value: object, path: str = "CacheWarmingEndEve
     )
 
 
+def parse_fallback_cause(value: object, path: str = "FallbackCause") -> FallbackCause:
+    payload = expect_object(value, path)
+    return FallbackCause(
+        origin=required(payload, "origin", cast('Decoder[Literal["harness", "provider", "unknown"]]', literal(frozenset({"harness", "provider", "unknown"}))), path),
+        kind=required(payload, "kind", decode_str, path),
+        code=optional(payload, "code", decode_str, path),
+    )
+
+
 def parse_retry_fallback_applied_event(value: object, path: str = "RetryFallbackAppliedEvent") -> RetryFallbackAppliedEvent:
     payload = expect_object(value, path)
     required(payload, "type", cast('Decoder[Literal["retry_fallback_applied"]]', literal(frozenset({"retry_fallback_applied"}))), path)
@@ -2646,6 +2664,8 @@ def parse_retry_fallback_applied_event(value: object, path: str = "RetryFallback
         from_model=required(payload, "from", decode_str, path),
         to_model=required(payload, "to", decode_str, path),
         role=required(payload, "role", decode_str, path),
+        cause=required(payload, "cause", parse_fallback_cause, path),
+        trigger=required(payload, "trigger", cast('Decoder[Literal["turn", "steer"]]', literal(frozenset({"turn", "steer"}))), path),
         reason=optional(payload, "reason", decode_str, path),
     )
 
@@ -4123,6 +4143,7 @@ __all__ = [
     "ExtensionError",
     "ExtensionUiMethod",
     "ExtensionUiRequest",
+    "FallbackCause",
     "FallbackContent",
     "FastModeResult",
     "FileMentionItem",
@@ -4315,6 +4336,7 @@ __all__ = [
     "parse_editor_ui_request",
     "parse_extension_error",
     "parse_extension_ui_request",
+    "parse_fallback_cause",
     "parse_fallback_content",
     "parse_fast_mode_result",
     "parse_file_mention_item",

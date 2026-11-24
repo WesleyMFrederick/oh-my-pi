@@ -10,6 +10,7 @@ import type {
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { CompactionMethod } from "./compaction-methods";
+import type { FallbackCause } from "./fallback-cause";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import type { RuntimeIdentity } from "./runtime-identity";
@@ -211,6 +212,7 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	role?: string;
 	/** True when this transition selected a retry-fallback model rather than the configured model. */
 	resolvedModelIsFallback?: boolean;
+	fallback?: { from: string; cause: FallbackCause; trigger: "turn" | "steer"; attempt: number };
 }
 
 export interface ServiceTierChangeEntry extends SessionEntryBase {

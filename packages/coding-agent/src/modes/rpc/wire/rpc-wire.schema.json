@@ -4197,6 +4197,29 @@
 			],
 			"description": "Outcome of the refresh announced by the matching `cache_warming_start`."
 		},
+		"FallbackCause": {
+			"type": "object",
+			"properties": {
+				"origin": {
+					"enum": [
+						"harness",
+						"provider",
+						"unknown"
+					],
+					"type": "string"
+				},
+				"kind": {
+					"type": "string"
+				},
+				"code": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"origin",
+				"kind"
+			]
+		},
 		"RetryFallbackAppliedEvent": {
 			"type": "object",
 			"properties": {
@@ -4212,6 +4235,16 @@
 				"role": {
 					"type": "string"
 				},
+				"cause": {
+					"$ref": "#/$defs/FallbackCause"
+				},
+				"trigger": {
+					"enum": [
+						"turn",
+						"steer"
+					],
+					"type": "string"
+				},
 				"reason": {
 					"type": "string"
 				}
@@ -4220,7 +4253,9 @@
 				"type",
 				"from",
 				"to",
-				"role"
+				"role",
+				"cause",
+				"trigger"
 			]
 		},
 		"RetryFallbackSucceededEvent": {

@@ -986,11 +986,19 @@ export interface CacheWarmingEndEvent {
 	warmingStopReason?: string;
 }
 
+export interface FallbackCause {
+	origin: "harness" | "provider" | "unknown";
+	kind: string;
+	code?: string;
+}
+
 export interface RetryFallbackAppliedEvent {
 	type: "retry_fallback_applied";
 	from: string;
 	to: string;
 	role: string;
+	cause: FallbackCause;
+	trigger: "turn" | "steer";
 	reason?: string;
 }
 

@@ -618,6 +618,34 @@ describe("collab guest extension lifecycle mirror", () => {
 			resetSettingsForTest();
 		}
 	});
+
+	it("given a fallback decision, when mirrored, then extensions receive its cause, trigger, target and reason", async () => {
+		// Given
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+		const harness = await makeHarness("lifecycle-mirror-fallback");
+		const fallback: Extract<AgentSessionEvent, { type: "retry_fallback_applied" }> = {
+			type: "retry_fallback_applied",
+			from: "anthropic/claude-opus",
+			to: "openai/gpt-5",
+			role: "default",
+			cause: { origin: "provider", kind: "overloaded" },
+			trigger: "steer",
+			reason: "Provider overloaded; switching to the configured fallback.",
+		};
+		try {
+			// When
+			harness.hostSocket.send({ t: "event", event: fallback } as CollabFrame);
+			await harness.barrier();
+
+			// Then
+			expect(harness.emitted.filter(event => event.type === "retry_fallback_applied")).toEqual([fallback]);
+		} finally {
+			writeSpy.mockRestore();
+			renameSpy.mockRestore();
+			await harness.cleanup();
+		}
+	});
 });
 
 function makeAssistant(text: string): AgentMessage {

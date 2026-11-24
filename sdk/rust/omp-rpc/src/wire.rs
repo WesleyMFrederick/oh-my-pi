@@ -3937,10 +3937,20 @@ pub struct CacheWarmingEndEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FallbackCause {
+	pub origin: FallbackCauseOrigin,
+	pub kind: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetryFallbackAppliedEvent {
 	pub from: String,
 	pub to: String,
 	pub role: String,
+	pub cause: FallbackCause,
+	pub trigger: RetryFallbackAppliedEventTrigger,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reason: Option<String>,
 }
@@ -6020,6 +6030,45 @@ impl LogoutAccountType {
 		match self {
 			Self::ApiKey => "api_key",
 			Self::Oauth => "oauth",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FallbackCauseOrigin {
+	#[serde(rename = "harness")]
+	Harness,
+	#[serde(rename = "provider")]
+	Provider,
+	#[serde(rename = "unknown")]
+	Unknown,
+}
+
+impl FallbackCauseOrigin {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Harness => "harness",
+			Self::Provider => "provider",
+			Self::Unknown => "unknown",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RetryFallbackAppliedEventTrigger {
+	#[serde(rename = "turn")]
+	Turn,
+	#[serde(rename = "steer")]
+	Steer,
+}
+
+impl RetryFallbackAppliedEventTrigger {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Turn => "turn",
+			Self::Steer => "steer",
 		}
 	}
 }

@@ -18,6 +18,8 @@
 
 ### Fixed
 
+- Prevent harness-caused failures from switching models; retry overload and unknown failures on the same model, and record fallback causes and triggers in session history, advisor switch records, warnings, and parent task results.
+- Fixed finalized Codex turn-rate limits and generic invalid requests bypassing the harness fallback gate, preserved same-model stale replay repair, and kept advisor model switches out of child task fallback results even when an exact-model or provider chain owns the advisor's fallback.
 - Fixed the shell's `dirname` builtin on Windows ignoring `\` separators and drive prefixes (`dirname 'C:\a\b'` printed `.`), which broke scripts like VS Code's `code` launcher (`./Code.exe: No such file or directory`)
 - Fixed bash output minimizing being skipped on Windows when a command is named by a `\` path or with `.exe` (`"C:\Program Files\Git\cmd\git.exe" status`, `git.exe log`)
 - Fixed the bundled `omp://tools` docs still describing the removed `ida` tool; `tools/dsm.md` now documents eval's `dsm` namespace and `disassembler.*` settings, and `tools/read.md` documents metadata-only executable reads ([#19608](https://github.com/can1357/oh-my-pi/issues/19608))
