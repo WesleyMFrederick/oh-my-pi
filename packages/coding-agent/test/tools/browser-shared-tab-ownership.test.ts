@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { daemonRuntimeDir } from "../../src/launch/paths";
+import { getDaemonRuntimeDir } from "@oh-my-pi/pi-utils";
 import { processStartTime } from "../../src/tools/browser/launch-ledger";
 import * as orphanRegistry from "../../src/tools/browser/orphan-registry";
 import { resetOrphanRegistryForTest } from "../../src/tools/browser/orphan-registry";
@@ -43,6 +43,7 @@ function fakeWorker(): WorkerHandle {
 			return () => handlers.delete(handler);
 		},
 		onError: () => () => undefined,
+		onExit: () => () => undefined,
 		terminate: async () => undefined,
 	};
 }
@@ -55,7 +56,7 @@ describe("acquireTab on the shared browser", () => {
 		getTabsMapForTest().clear();
 		resetOrphanRegistryForTest();
 		for (const dir of projectDirs.splice(0)) {
-			await fs.rm(daemonRuntimeDir(dir), { recursive: true, force: true }).catch(() => undefined);
+			await fs.rm(getDaemonRuntimeDir(dir), { recursive: true, force: true }).catch(() => undefined);
 		}
 	});
 
@@ -68,6 +69,7 @@ describe("acquireTab on the shared browser", () => {
 			kind: { kind: "headless", headless: true },
 			// Only the pieces the open path touches: a connection that reports an endpoint and stays connected.
 			browser: { connected: true, wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub" } as never,
+			wsEndpoint: "ws://127.0.0.1/devtools/browser/stub",
 			sharedDaemon: { name: DAEMON, projectDir },
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
@@ -77,7 +79,7 @@ describe("acquireTab on the shared browser", () => {
 		const { tab } = await acquireTab("shared-tab", handle, { timeoutMs: 5_000 });
 		expect(tab.targetId).toBe(TARGET_ID);
 
-		const file = path.join(daemonRuntimeDir(projectDir), `${DAEMON}.targets`, `${process.pid}.json`);
+		const file = path.join(getDaemonRuntimeDir(projectDir), `${DAEMON}.targets`, `${process.pid}.json`);
 		const record = (await Bun.file(file).json()) as { targets: string[]; startTime?: string };
 		expect(record.targets).toEqual([TARGET_ID]);
 		expect(record.startTime).toBe(await processStartTime(process.pid));
@@ -88,10 +90,23 @@ describe("acquireTab on the shared browser", () => {
 		projectDirs.push(projectDir);
 		setTabWorkerSpawnerForTest(async () => fakeWorker());
 		const closedTargets: string[] = [];
-		const session = {
+		const destroyedHandlers = new Set<(event: { targetId: string }) => void>();
+		// Closes go over the browser's root CDP connection, never a per-call target session.
+		const connection = {
 			send: async (method: string, params?: { targetId: string }) => {
-				if (method === "Target.closeTarget" && params) closedTargets.push(params.targetId);
+				if (method === "Target.closeTarget" && params) {
+					closedTargets.push(params.targetId);
+					const { targetId } = params;
+					queueMicrotask(() => {
+						for (const handler of destroyedHandlers) handler({ targetId });
+					});
+				}
 				return { success: true, targetInfos: [] };
+			},
+			on: (_event: string, handler: (event: { targetId: string }) => void) => destroyedHandlers.add(handler),
+			off: (_event: string, handler: (event: { targetId: string }) => void) => destroyedHandlers.delete(handler),
+			createSession: async () => {
+				throw new Error("closes must not attach to targets");
 			},
 		};
 		const handle: PuppeteerBrowserHandle = {
@@ -100,8 +115,9 @@ describe("acquireTab on the shared browser", () => {
 			browser: {
 				connected: true,
 				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub",
-				_connection: session,
+				_connection: connection,
 			} as never,
+			wsEndpoint: "ws://127.0.0.1/devtools/browser/stub",
 			sharedDaemon: { name: DAEMON, projectDir },
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
@@ -128,11 +144,16 @@ describe("acquireTab on the shared browser", () => {
 		projectDirs.push(projectDir);
 		setTabWorkerSpawnerForTest(async () => fakeWorker());
 		const closedTargets: string[] = [];
-		const session = {
+		const connection = {
 			send: async (method: string, params?: { targetId: string }) => {
 				if (method === "Target.closeTarget" && params) closedTargets.push(params.targetId);
 				// Dropped connection: neither the close nor the confirming target listing succeeds.
 				throw new Error("Connection closed");
+			},
+			on: () => undefined,
+			off: () => undefined,
+			createSession: async () => {
+				throw new Error("closes must not attach to targets");
 			},
 		};
 		const handle: PuppeteerBrowserHandle = {
@@ -141,8 +162,9 @@ describe("acquireTab on the shared browser", () => {
 			browser: {
 				connected: true,
 				wsEndpoint: () => "ws://127.0.0.1/devtools/browser/stub",
-				_connection: session,
+				_connection: connection,
 			} as never,
+			wsEndpoint: "ws://127.0.0.1/devtools/browser/stub",
 			sharedDaemon: { name: DAEMON, projectDir },
 			refCount: 0,
 			stealth: { browserSession: null, override: null },

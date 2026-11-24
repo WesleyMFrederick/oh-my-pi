@@ -1,6 +1,6 @@
-# Porting Hot Paths to `pi-natives`
+# Porting Hot Paths to `omp-natives`
 
-This is the contributor path for moving a measured JS/TS hot path into `crates/pi-natives` and exposing it through `@oh-my-pi/pi-natives`.
+This is the contributor path for moving a measured JS/TS hot path into `crates/natives` and exposing it through `@oh-my-pi/pi-natives`.
 
 ## Decide whether to port
 
@@ -33,7 +33,7 @@ Release builds use Bazel targets and publish `.node` files in platform leaf pack
 
 ## Design the N-API boundary
 
-1. Put implementation in the owning `crates/pi-natives/src/<module>.rs`; register new modules in `lib.rs`.
+1. Put implementation in the owning `crates/natives/src/<module>.rs`; register new modules in `lib.rs`.
 2. Keep the computation in a plain Rust function where practical, then expose a thin `#[napi]` boundary.
 3. Prefer owned N-API-compatible values: `String`, vectors, typed arrays, and `#[napi(object)]` option/result structs. Avoid borrowed public inputs whose lifetime cannot cross N-API work.
 4. Let napi-rs apply the default snake_case-to-camelCase name unless a deliberate public name requires `js_name`.
@@ -54,8 +54,8 @@ Match an existing export with the same scheduling/error shape rather than introd
 
 - Add the Rust logic and focused Rust tests for pure invariants when needed.
 - Add the `#[napi]` item and object/enum types.
-- Register a new module in `crates/pi-natives/src/lib.rs`.
-- If the port uses another first-party crate, add the dependency to `crates/pi-natives/Cargo.toml` and its build-system inputs as required by the native build.
+- Register a new module in `crates/natives/src/lib.rs`.
+- If the port uses another first-party crate, add the dependency to `crates/natives/Cargo.toml` and its build-system inputs as required by the native build.
 
 ### 2. Regenerate and inspect the binding
 
@@ -98,13 +98,11 @@ Place a durable benchmark with the owning package (`packages/natives/bench`, `pa
 const ITERATIONS = 2_000;
 
 function bench(name: string, fn: () => void): number {
-  const start = Bun.nanoseconds();
-  for (let i = 0; i < ITERATIONS; i++) fn();
-  const elapsedMs = (Bun.nanoseconds() - start) / 1e6;
-  console.log(
-    `${name}: ${elapsedMs.toFixed(2)}ms (${(elapsedMs / ITERATIONS).toFixed(6)}ms/op)`,
-  );
-  return elapsedMs;
+	const start = Bun.nanoseconds();
+	for (let i = 0; i < ITERATIONS; i++) fn();
+	const elapsedMs = (Bun.nanoseconds() - start) / 1e6;
+	console.log(`${name}: ${elapsedMs.toFixed(2)}ms (${(elapsedMs / ITERATIONS).toFixed(6)}ms/op)`);
+	return elapsedMs;
 }
 
 bench("feature/js", () => jsImpl(sample));
@@ -127,7 +125,7 @@ Confirm the export is present and `__piNativesBuildVersion()` reports the packag
 
 ### Stale variant or cache wins
 
-x64 candidate order is modern → baseline → unsuffixed for a modern host, and baseline → unsuffixed for a baseline host. Compiled and staged Windows loads can also win from `<getNativesDir()>/<version>` before package paths.
+x64 candidate order is modern → baseline → unsuffixed for a modern host, and baseline → unsuffixed for a baseline host. Compiled and staged Windows loads can also win from `<getNativesDir()>/<version>` before package paths. The root honors `PI_NATIVES_DIR` first (trimmed, `~`-expanded, and normalized; empty or relative values are ignored), then `$XDG_DATA_HOME/omp/natives` when `$XDG_DATA_HOME/omp` exists, otherwise `~/.omp/natives`.
 
 Remove only the stale local artifacts/cache identified by loader diagnostics, then rebuild. The loader best-effort deletes older `major.minor.patch` cache directories after a successful load only when their mtime is at least ten minutes old; it preserves the current-version directory.
 

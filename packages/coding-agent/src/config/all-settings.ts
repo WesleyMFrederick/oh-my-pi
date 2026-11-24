@@ -24,10 +24,13 @@ import * as evalSettings from "../eval/settings";
 import * as taskSettings from "../task/settings";
 import * as planModeSettings from "../plan-mode/settings";
 import * as goalsSettings from "../goals/settings";
+import * as titleSettings from "../utils/title-settings";
 import * as extensibilitySettings from "../extensibility/settings";
 import * as webSettings from "../web/settings";
 import * as toolsBrowserSettings from "../tools/browser/settings";
+import * as disasmSettings from "../disasm/settings";
 import * as idaSettings from "../ida/settings";
+import * as ghidraSettings from "../ghidra/settings";
 import * as mcpSettings from "../mcp/settings";
 import * as blobBrokerSettings from "../blob-broker/settings";
 import * as secretsSettings from "../secrets/settings";
@@ -40,6 +43,8 @@ import * as streamSettings from "../stream/settings";
 import * as commitSettings from "../commit/settings";
 import * as cliGcSettings from "../cli/gc-settings";
 import * as telemetrySettings from "../telemetry-settings";
+import * as spotlightSettings from "../spotlight/settings";
+import * as auxiliaryModelPolicy from "./auxiliary-model-policy";
 
 const DOMAINS: readonly Readonly<Record<string, unknown>>[] = [
 	configModelSettings,
@@ -63,10 +68,13 @@ const DOMAINS: readonly Readonly<Record<string, unknown>>[] = [
 	taskSettings,
 	planModeSettings,
 	goalsSettings,
+	titleSettings,
 	extensibilitySettings,
 	webSettings,
 	toolsBrowserSettings,
+	disasmSettings,
 	idaSettings,
+	ghidraSettings,
 	mcpSettings,
 	blobBrokerSettings,
 	secretsSettings,
@@ -76,6 +84,8 @@ const DOMAINS: readonly Readonly<Record<string, unknown>>[] = [
 	streamSettings,
 	commitSettings,
 	cliGcSettings,
+	spotlightSettings,
+	auxiliaryModelPolicy,
 ];
 
 /** Domains listed immediately before `before` (a setting of a DOMAINS entry) instead of in DOMAINS order. */

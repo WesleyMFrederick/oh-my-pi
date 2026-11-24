@@ -51,6 +51,7 @@ import type {
 	AssistantMessage,
 	Context,
 	Model,
+	ServiceTier,
 	SimpleStreamOptions,
 	StopDetails,
 	StopReason,
@@ -89,10 +90,14 @@ export interface MockResponse {
 	stopDetails?: StopDetails | null;
 	/** In-memory fallback credit handle attached when a refusal response carries a fallback credit token. */
 	fallbackCreditHandle?: AnthropicFallbackCreditHandle;
+	/** On a refusal: how many of other models' reasoning blocks the refused request replayed as text. */
+	demotedReasoningBlocks?: number;
 	/** Error text paired with an explicit `"error"` stop reason. */
 	errorMessage?: string;
 	/** Usage stats. Missing fields default to 0; missing `cost.total` is recomputed from components. */
 	usage?: Partial<Omit<Usage, "cost">> & { cost?: Partial<Usage["cost"]> };
+	/** Service tier the mock reports serving the turn, as a real provider's response echo would. */
+	serviceTier?: ServiceTier;
 	/** Pre-set responseId. */
 	responseId?: string;
 	/** If set, the stream emits a terminal error event instead of completing. */
@@ -407,8 +412,10 @@ async function runMock(
 	partial.stopReason = reason;
 	partial.stopDetails = response.stopDetails;
 	partial.fallbackCreditHandle = response.fallbackCreditHandle;
+	partial.demotedReasoningBlocks = response.demotedReasoningBlocks;
 	partial.errorMessage = response.errorMessage;
 	partial.usage = mergeUsage(response.usage);
+	partial.serviceTier = response.serviceTier;
 	partial.duration = performance.now() - perfStart;
 
 	if (reason === "aborted" || reason === "error") {

@@ -39,7 +39,6 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			},
 			ui: { requestRender: vi.fn() },
 			skillCommands: new Map<string, string>(),
-			sessionManager: { appendCustomEntry: vi.fn() },
 			session: {
 				isStreaming: true,
 				isCompacting: false,
@@ -54,6 +53,7 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
 			withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+			sessionManager: { appendCustomEntry: vi.fn(), getSessionId: () => "session", getLeafId: () => null },
 		} as unknown as InteractiveModeContext;
 
 		await new InputController(ctx).handleFollowUp();
@@ -87,7 +87,6 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			},
 			ui: { requestRender: vi.fn() },
 			skillCommands: new Map<string, string>(),
-			sessionManager: { appendCustomEntry: vi.fn() },
 			session: {
 				isStreaming: false,
 				isCompacting: false,
@@ -102,6 +101,7 @@ describe("InputController.handleFollowUp paste-marker expansion", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
 			withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+			sessionManager: { appendCustomEntry: vi.fn(), getSessionId: () => "session", getLeafId: () => null },
 		} as unknown as InteractiveModeContext;
 
 		await new InputController(ctx).handleFollowUp();

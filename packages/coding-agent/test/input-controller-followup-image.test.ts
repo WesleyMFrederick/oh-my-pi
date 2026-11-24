@@ -72,7 +72,6 @@ function createContext(opts: {
 		editor,
 		ui: { requestRender },
 		skillCommands: new Map<string, string>(),
-		sessionManager: { appendCustomEntry: vi.fn() },
 		session: {
 			isStreaming: opts.isStreaming,
 			isCompacting: false,
@@ -95,6 +94,7 @@ function createContext(opts: {
 		handlePlanModeCommand,
 		handleVibeModeCommand,
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+		sessionManager: { appendCustomEntry: vi.fn(), getSessionId: () => "session", getLeafId: () => null },
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, editor, handleGoalModeCommand, handlePlanModeCommand, handleVibeModeCommand, prompt, showError };

@@ -442,6 +442,18 @@ describe("Perplexity OAuth request shape", () => {
 		expect(response.sources).toHaveLength(1);
 	});
 
+	it("fails a source-less signed-out answer so the chain advances past a stale session", async () => {
+		// A session cookie the service no longer honors degrades to the signed-out
+		// signup wall: HTTP 200, a wall answer, no web_results.
+		const fetchMock = mockOAuth(() => {}, {
+			blocks: [{ intended_usage: "ask_text", markdown_block: { answer: "Sign up and repeat your request." } }],
+		});
+
+		await expect(
+			searchPerplexity({ query: '"CVE-2026-109618"', authStorage: oauthAuthStorage, fetch: fetchMock }),
+		).rejects.toThrow(/stored session is signed out/);
+	});
+
 	it("maps directives onto ask-endpoint native filters and rewrites query_str", async () => {
 		let body: Record<string, unknown> | undefined;
 		const fetchMock = mockOAuth(b => (body = b));
@@ -502,7 +514,13 @@ describe("Perplexity OAuth transport failure (issue #5315)", () => {
 			final: true,
 			display_model: "pplx_pro",
 			uuid: "req-oauth",
-			blocks: [{ intended_usage: "ask_text", markdown_block: { answer: "OAuth answer" } }],
+			blocks: [
+				{ intended_usage: "ask_text", markdown_block: { answer: "OAuth answer" } },
+				{
+					intended_usage: "web_results",
+					web_result_block: { web_results: [{ name: "OpenAI", url: "https://openai.com" }] },
+				},
+			],
 		};
 		const askBody = `data: ${JSON.stringify(event)}\n\n`;
 		const fetchMock: FetchImpl = async input => {
@@ -603,6 +621,34 @@ describe("Perplexity anonymous fallback", () => {
 				ageSeconds: undefined,
 			},
 		]);
+	});
+
+	it("classifies the source-less anonymous signup wall as a provider failure (issue #12756)", async () => {
+		// Anonymous quota exhausted: HTTP 200, a (localized) signup-wall answer, no web_results.
+		const answerPayload = { answer: "Sign up and repeat your request." };
+		const event = {
+			final: true,
+			display_model: "turbo",
+			uuid: "req-wall",
+			text: JSON.stringify([{ step_type: "FINAL", content: { answer: JSON.stringify(answerPayload) }, uuid: "" }]),
+		};
+		const sseBody = `data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`;
+		const fetchMock: FetchImpl = async input => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+			if (url === OAUTH_ASK_URL) {
+				return new Response(sseBody, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+			}
+			return new Response("not mocked", { status: 500 });
+		};
+
+		await expect(
+			searchPerplexity({
+				query: "Zen Browser version",
+				authStorage: anonymousAuthStorage,
+				fetch: fetchMock,
+				explicit: true,
+			}),
+		).rejects.toThrow(/anonymous ask returned no sources \(likely signup wall or exhausted anonymous quota\)/);
 	});
 
 	it("rejects an automatic authless request before using the anonymous transport", async () => {

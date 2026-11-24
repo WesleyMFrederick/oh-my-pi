@@ -1,4 +1,5 @@
 import { formatContextUsage } from "../chrome/context-thresholds";
+import { agentColored } from "../overlays/agent-identity";
 import {
 	FEED_MODEL_BADGE_WIDTH,
 	formatBadge,
@@ -49,6 +50,8 @@ export interface AgentTreeRowOptions {
 	presentation: "task" | "eval";
 	prefix: string;
 	id: string;
+	/** Registry id of the agent; when set, its name takes the agent's identity colour. */
+	agentId?: string;
 	width: number;
 	model?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
@@ -60,6 +63,8 @@ export interface AgentTreeRowOptions {
 	description?: string;
 	preview?: string;
 	stats?: AgentStats;
+	/** The agent's own completion estimate (0–100); shown only while live. */
+	completionPercent?: number;
 	durationMs?: number;
 }
 
@@ -72,20 +77,22 @@ export function renderAgentTreeRow(
 	const task = options.presentation === "task";
 	const live = status === "pending" || status === "running";
 	const failed = status === "failed" || status === "aborted";
-	const iconColor = status === "completed" ? "success" : failed ? "error" : "accent";
 	const nameColor = task && live && options.frozen ? "dim" : task && status === "completed" ? "text" : "accent";
-	const iconStatus = status === "failed" ? "error" : status === "completed" ? "done" : status;
+	const iconStatus = status === "failed" ? "error" : status === "completed" ? "success" : status;
+	// Task rows draw a static glyph, so their bytes hold across spinner frames; eval rows animate.
+	const spinnerFrame = !task && status === "running" ? options.spinnerFrame : undefined;
+	// formatStatusIcon colors every glyph except a raw spinner frame, which eval rows paint accent.
+	// A frozen snapshot of a live Task row dims its glyph with its name, so it stops reading as in flight.
 	const icon =
-		task && !failed
-			? theme.styledSymbol("status.done", nameColor)
-			: !task && status === "completed"
-				? theme.styledSymbol("tool.eval", "accent")
-				: theme.fg(
-						iconColor,
-						formatStatusIcon(iconStatus, theme, status === "running" ? options.spinnerFrame : undefined),
-					);
+		!task && status === "completed"
+			? theme.styledSymbol("tool.eval", "accent")
+			: task && live && options.frozen
+				? theme.fg("dim", status === "running" ? theme.status.running : theme.status.pending)
+				: spinnerFrame === undefined
+					? formatStatusIcon(iconStatus, theme)
+					: theme.fg("accent", formatStatusIcon(iconStatus, theme, spinnerFrame));
 	const lead = `${options.prefix}${options.prefix || !task ? " " : ""}${icon} `;
-	const statusBadge = options.statusBadge ?? (failed ? ` ${formatBadge(status, iconColor, theme)}` : "");
+	const statusBadge = options.statusBadge ?? (failed ? ` ${formatBadge(status, "error", theme)}` : "");
 	const id = Number.isFinite(width)
 		? truncateToWidth(options.id, Math.max(0, width - visibleWidth(lead) - visibleWidth(statusBadge)))
 		: options.id;
@@ -112,14 +119,22 @@ export function renderAgentTreeRow(
 	const descriptionShown = Boolean(
 		description && visibleWidth(`${lead}${modelLead}${id}: ${description}${badges}`) <= width,
 	);
-	let title = descriptionShown ? `${theme.bold(id)}: ${description}` : task ? id : theme.bold(id);
-	if (task && live && descriptionShown) {
+	// A frozen snapshot of a live row stays dim, so it stops reading as in flight.
+	const identity = task && live && options.frozen ? undefined : options.agentId;
+	let title: string;
+	if (identity !== undefined) {
+		const name = agentColored(theme, identity, descriptionShown || !task ? theme.bold(id) : id);
+		title = descriptionShown ? `${name}${theme.fg(nameColor, ":")} ${theme.fg(nameColor, description!)}` : name;
+	} else if (task && live && descriptionShown) {
 		title = `${theme.fg(nameColor, theme.bold(id))}${theme.fg(nameColor, ":")} ${theme.fg(nameColor, description!)}`;
 	} else {
-		title = theme.fg(nameColor, title);
+		title = theme.fg(nameColor, descriptionShown ? `${theme.bold(id)}: ${description}` : task ? id : theme.bold(id));
 	}
 	let line = `${lead}${modelLead}${title}${badges}`;
 	if (options.preview) line += options.preview;
+	if (live && options.completionPercent !== undefined) {
+		line += `${theme.sep.dot}${theme.fg("accent", `${options.completionPercent}%`)}`;
+	}
 	if (options.stats) line += formatAgentStatRun(options.stats, theme);
 	if (options.durationMs !== undefined && options.durationMs > 0) {
 		line += `${theme.sep.dot}${theme.fg("dim", formatDuration(options.durationMs))}`;

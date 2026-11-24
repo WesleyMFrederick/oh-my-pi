@@ -5,19 +5,31 @@ import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import type { DesktopCapabilities } from "@oh-my-pi/pi-natives";
 import { once } from "@oh-my-pi/pi-utils";
 import { callSessionTool } from "../eval/js/tool-bridge";
-import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
+import type { EvalPreludeContext, HostEvalPreludeDefinition } from "../eval/preludes";
 import computerUsePrompt from "../prompts/system/computer-use.md" with { type: "text" };
 import { enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type ComputerCallStep, isReadOnlyComputerCall, renderComputerCall } from "./computer/call";
-import type { ComputerScreenshot, ComputerSessionSnapshot } from "./computer/protocol";
-import { type ComputerController, ComputerSupervisor, registerComputerController } from "./computer/supervisor";
+import {
+	type ComputerScreenshot,
+	type ComputerSessionSnapshot,
+	type RunErrorPayload,
+	screenStateNotice,
+	secureInputNotice,
+} from "./computer/protocol";
+import {
+	type ComputerController,
+	ComputerSupervisor,
+	computerTurnInFlight,
+	registerComputerController,
+} from "./computer/supervisor";
 import type { ToolSession } from "./index";
-import { renderCallChain, renderFunctionRun } from "./run-code";
+import { renderFunctionRun, renderStatusCallChain } from "./run-code";
 import { throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { clampTimeout } from "./tool-timeouts";
 
 import {
+	cfgComputerBackgroundFallback,
 	cfgComputerDisplay,
 	cfgComputerEnabled,
 	cfgComputerMaxHeight,
@@ -92,6 +104,7 @@ interface ComputerPreludeDetails {
 	code?: string;
 	readOnly?: boolean;
 	screenshots: ComputerScreenshot[];
+	error?: RunErrorPayload;
 	value?: unknown;
 	backend?: string;
 	capturePermission?: string;
@@ -122,30 +135,24 @@ export function createComputerPrelude(
 	session: ToolSession,
 	createController: ComputerControllerFactory = currentSession =>
 		new ComputerSupervisor(currentSession, undefined, undefined, callSessionTool),
-): EvalPreludeDefinition {
+): HostEvalPreludeDefinition {
 	const controller = createController(session);
 	const unregisterOwner = registerComputerController(session.getEvalKernelOwnerId?.() ?? undefined, controller);
 	// Eval-first-use boundary: source/declaration assets stay unloaded until a
 	// JavaScript or Python kernel actually asks for its enabled preludes.
 	const { computerPreludeAssets } = require("./computer/prelude-definition");
-	let closed = false;
-	const lifetime: ComputerLifetime = {
-		isClosed: () => closed,
-		close: async () => {
-			if (closed) return;
-			closed = true;
-			unregisterOwner();
-			await controller.close();
-		},
-	};
+	session.registerDisposeCallback?.(() => {
+		unregisterOwner();
+		void controller.close();
+	});
 
 	return {
 		name: "computer",
 		documentation: computerPreludeAssets.documentation,
+		inlineDocumentation: true,
 		javascript: computerPreludeAssets.javascript,
 		python: computerPreludeAssets.python,
 		exports: ["computer"],
-		codeModeDeclarations: computerPreludeAssets.codeModeDeclarations,
 		guidance: computerUsePrompt,
 		approval: computerApproval,
 		enabled: () => cfgComputerEnabled.get(session.settings) === true,
@@ -154,7 +161,7 @@ export function createComputerPrelude(
 			if (parsed instanceof type.errors) {
 				throw new ToolError(`computer received invalid arguments: ${parsed.summary}`);
 			}
-			return await invokeComputer(session, controller, parsed, context, lifetime);
+			return await invokeComputer(session, controller, parsed, context);
 		},
 		status: describeComputerCall,
 	};
@@ -166,7 +173,10 @@ function describeComputerCall(parameters: unknown): string | undefined {
 	if (parsed instanceof type.errors) return undefined;
 	switch (parsed.action) {
 		case "call":
-			return `desktop.${renderCallChain(parsed.chain)}`;
+			// Text `type`, `setValue` and `clipboard.write` enter is their first argument.
+			return `desktop.${renderStatusCallChain(parsed.chain, step =>
+				step.method === "type" || step.method === "setValue" || step.method === "clipboard.write" ? 0 : undefined,
+			)}`;
 		case "run":
 			return `run(${parsed.fn !== undefined ? "fn" : (parsed.code?.trim().split("\n", 1)[0] ?? "")})`;
 		case "capabilities":
@@ -175,29 +185,20 @@ function describeComputerCall(parameters: unknown): string | undefined {
 	}
 }
 
-interface ComputerLifetime {
-	isClosed(): boolean;
-	close(): Promise<void>;
-}
-
 async function invokeComputer(
 	session: ToolSession,
 	controller: ComputerController,
 	params: ComputerParams,
 	context: EvalPreludeContext,
-	lifetime: ComputerLifetime,
 ): Promise<AgentToolResult<unknown>> {
 	throwIfAborted(context.signal);
 
 	switch (params.action) {
 		case "run":
 		case "call":
-			if (lifetime.isClosed()) throw new ToolError("Computer session is closed");
-			return await runComputer(session, controller, params, context.signal);
+			return await runComputer(session, controller, params, context);
 		case "capabilities": {
-			const capabilities = lifetime.isClosed()
-				? undefined
-				: await controller.capabilities(buildComputerSnapshot(session, true), context.signal);
+			const capabilities = await controller.capabilities(buildComputerSnapshot(session, true), context.signal);
 			throwIfAborted(context.signal);
 			return {
 				content: [
@@ -210,7 +211,7 @@ async function invokeComputer(
 			};
 		}
 		case "close":
-			await lifetime.close();
+			await controller.reset();
 			throwIfAborted(context.signal);
 			return { content: [{ type: "text", text: "Closed computer session" }] };
 	}
@@ -242,6 +243,7 @@ function buildComputerSnapshot(session: ToolSession, readOnly: boolean): Compute
 	return {
 		cwd: session.cwd,
 		sessionId: session.getEvalSessionId?.() ?? session.getSessionId?.() ?? "computer",
+		agentId: session.getAgentId?.() ?? undefined,
 		captureMaxWidth: coordinateSafe
 			? Math.min(configuredMaxWidth, COORDINATE_SAFE_MAX_CAPTURE_WIDTH)
 			: configuredMaxWidth,
@@ -250,6 +252,8 @@ function buildComputerSnapshot(session: ToolSession, readOnly: boolean): Compute
 			: configuredMaxHeight,
 		display: cfgComputerDisplay.get(session.settings),
 		readOnly,
+		backgroundFallback: cfgComputerBackgroundFallback.get(session.settings),
+		displayTurn: computerTurnInFlight(session.getEvalKernelOwnerId?.() ?? undefined),
 	};
 }
 
@@ -257,20 +261,22 @@ async function runComputer(
 	session: ToolSession,
 	controller: ComputerController,
 	params: ComputerRunParams | ComputerCallParams,
-	signal?: AbortSignal,
+	context: EvalPreludeContext,
 ): Promise<AgentToolResult<unknown>> {
+	const signal = context.signal;
 	const code = resolveComputerRunCode(params);
 	// Direct inspection calls run read-only so the desktop guard backs the read approval tier.
 	const readOnly = params.action === "call" ? isReadOnlyComputerCall(params.chain) : (params.read_only ?? false);
 	const timeoutSeconds = clampTimeout("computer", params.timeout, cfgToolsMaxTimeout.get(session.settings));
 	const snapshot = buildComputerSnapshot(session, readOnly);
-	const run = await controller.run(code, timeoutSeconds * 1000, snapshot, signal);
+	const run = await controller.run(code, timeoutSeconds * 1000, snapshot, signal, context.context);
 	throwIfAborted(signal);
 
 	const details: ComputerPreludeDetails = {
 		code,
 		readOnly: snapshot.readOnly,
 		screenshots: run.screenshots,
+		error: run.error,
 	};
 	if (run.returnValue !== undefined) details.value = run.returnValue;
 	populateCapabilityDetails(details, run.capabilities);
@@ -283,11 +289,16 @@ async function runComputer(
 		saveArtifact: full => saveComputerOutputArtifact(session, full),
 	});
 	const content: AgentToolResult<ComputerPreludeDetails>["content"] = [];
+	const notice = screenStateNotice(run.capabilities);
+	if (notice) content.push({ type: "text", text: notice });
+	const secure = secureInputNotice(run.capabilities);
+	if (secure) content.push({ type: "text", text: secure });
 	if (cappedText) content.push({ type: "text", text: cappedText });
 	for (const image of run.displays) {
 		if (image.type === "image") content.push({ ...image, detail: "original" });
 	}
-	return { content, details };
+	if (run.error) content.push({ type: "text", text: `${run.error.name}: ${run.error.message}` });
+	return { content, details, ...(run.error ? { isError: true } : {}) };
 }
 
 function stringifyReturnValue(value: unknown): string {
@@ -313,7 +324,7 @@ function populateCapabilityDetails(
 /** Persist over-cap computer run output as a session artifact; mirrors the browser run save path. */
 async function saveComputerOutputArtifact(session: ToolSession, fullText: string): Promise<string | undefined> {
 	try {
-		const alloc = await session.allocateOutputArtifact?.("computer-original");
+		const alloc = await session.allocateOutputArtifact?.();
 		if (!alloc?.path || !alloc.id) return undefined;
 		await Bun.write(alloc.path, fullText);
 		return alloc.id;

@@ -1,12 +1,19 @@
 # OMP Coding Agent Installer for Windows
-# Usage: irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1 | iex
+# Usage: irm https://omp.sh/install.ps1 | iex
 #
 # Or with options:
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Source
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Binary
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Source -Ref v3.20.1
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Source -Ref main
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.ps1))) -Binary -Ref v3.20.1
+#   & ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Source
+#   & ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary
+#   & ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Source -Ref v18.8.9
+#   & ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Source -Ref main
+#   & ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary -Ref v18.8.9
+#
+# The prebuilt binary is the default, since it updates itself with delta
+# patches; -Source installs the package via bun and is implied by a bare -Ref.
+# -Ref takes any tag/commit/branch with -Source; binary installs take a release
+# tag (v<version>). Prebuilt binaries come from the build service
+# ($env:PI_BUILD_URL, default https://build.stencil.so) and are checked against
+# its sha256 before install.
 
 param(
     [switch]$Source,
@@ -27,6 +34,7 @@ if ($PSVersionTable.PSVersion -lt [version]"5.1") {
 $Repo = "can1357/oh-my-pi"
 $Package = "@oh-my-pi/pi-coding-agent"
 $InstallDir = if ($env:PI_INSTALL_DIR) { $env:PI_INSTALL_DIR } else { "$env:LOCALAPPDATA\omp" }
+$BuildUrl = if ($env:PI_BUILD_URL) { $env:PI_BUILD_URL.TrimEnd("/") } else { "https://build.stencil.so" }
 # Windows PowerShell 5.1 (.NET Framework) does not reliably resolve
 # [System.Runtime.InteropServices.RuntimeInformation] without an
 # assembly-qualified name, while PowerShell 7+ (Core) loads that type from a
@@ -41,13 +49,12 @@ $RawArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW643
 if (-not $RawArchitecture) {
     throw "Unable to determine Windows architecture"
 }
-$NativeArchitecture = switch ($RawArchitecture.ToUpperInvariant()) {
-    "AMD64" { "x64" }
-    "ARM64" { "arm64" }
+$BuildTarget = switch ($RawArchitecture.ToUpperInvariant()) {
+    "AMD64" { "windows-x86_64" }
+    "ARM64" { "windows-arm64" }
     default { throw "Unsupported Windows architecture: $RawArchitecture" }
 }
-$BinaryName = "omp-windows-$NativeArchitecture.exe"
-$MinimumBunVersion = "1.3.14"
+$MinimumBunVersion = "1.4.4"
 
 # PowerShell 5.1 raises a terminating NativeCommandError for any line a native
 # executable writes to stderr while $ErrorActionPreference is "Stop", regardless
@@ -283,30 +290,48 @@ function Install-ViaBun {
 
 function Install-Binary {
     if ($Ref) {
-        Write-Host "Fetching release $Ref..."
-        try {
-            $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$Ref" -TimeoutSec 60
-        } catch {
-            throw "Release tag not found: $Ref`nFor branch/commit installs, use -Source with -Ref."
+        if ($Ref -notmatch '^v(\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') {
+            throw "Binary installs take a release tag (v<version>) for -Ref, got: $Ref`nFor branch/commit installs, use -Source with -Ref."
         }
+        $RequestedVersion = $Matches[1]
+        Write-Host "Fetching omp $RequestedVersion..."
+        $ApiUrl = "$BuildUrl/api/products/omp/versions/$RequestedVersion/$BuildTarget"
     } else {
         Write-Host "Fetching latest release..."
-        $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -TimeoutSec 60
+        $ApiUrl = "$BuildUrl/api/products/omp/latest/${BuildTarget}?channel=stable"
+    }
+    try {
+        $Answer = Invoke-RestMethod -Uri $ApiUrl -TimeoutSec 60
+    } catch {
+        throw "Failed to resolve an omp build for $BuildTarget from ${ApiUrl}: $_"
     }
 
-    $Latest = $Release.tag_name
-    if (-not $Latest) {
-        throw "Failed to fetch release tag"
+    $Version = $Answer.build.version
+    $BinaryName = $Answer.file.name
+    $ExpectedSha256 = "$($Answer.file.sha256)".ToLowerInvariant()
+    $DownloadUrl = $Answer.download
+    if (-not $Version -or -not $BinaryName -or -not $DownloadUrl -or $ExpectedSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "Unexpected answer from $ApiUrl"
     }
-    Write-Host "Using version: $Latest"
+    Write-Host "Using version: $Version"
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-    # Download binary
-    $BinaryUrl = "https://github.com/$Repo/releases/download/$Latest/$BinaryName"
+    # Download next to the destination and move it into place only once the
+    # checksum matches, so a bad download never replaces a working omp.
     Write-Host "Downloading $BinaryName..."
     $OutPath = Join-Path $InstallDir "omp.exe"
-    Invoke-WebRequest -Uri $BinaryUrl -OutFile $OutPath -TimeoutSec 900
+    $DownloadPath = Join-Path $InstallDir ".omp.download.exe"
+    try {
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $DownloadPath -TimeoutSec 900
+        $ActualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $DownloadPath).Hash.ToLowerInvariant()
+        if ($ActualSha256 -ne $ExpectedSha256) {
+            throw "Checksum mismatch for ${BinaryName}: expected $ExpectedSha256, got $ActualSha256"
+        }
+        Move-Item -Force -LiteralPath $DownloadPath -Destination $OutPath
+    } finally {
+        Remove-Item -Force -LiteralPath $DownloadPath -ErrorAction SilentlyContinue
+    }
 
     Write-Host ""
     Write-Host "[OK] Installed omp to $OutPath" -ForegroundColor Green
@@ -321,6 +346,13 @@ function Install-Binary {
 
     Configure-BashShell
 
+    # An omp earlier on PATH (a previous `bun install -g`, Scoop, ...) keeps
+    # winning over this install: $InstallDir is appended to PATH, not prepended.
+    $Active = Get-Command omp -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Active -and $Active.Source -ne [System.IO.Path]::GetFullPath($OutPath)) {
+        Write-Host "[WARN] 'omp' still resolves to $($Active.Source); remove that install or move $InstallDir ahead of it on PATH." -ForegroundColor Yellow
+    }
+
     if ($needsRestart) {
         Write-Host "Restart your terminal, then run 'omp' to get started!"
     } else {
@@ -328,8 +360,9 @@ function Install-Binary {
     }
 }
 
-# Main logic
-if ($Ref -and -not $Source -and -not $Binary) {
+# Main logic. A ref can name a branch or commit, which only a source install
+# can build, so a bare -Ref selects source.
+if ($Ref -and -not $Binary) {
     $Source = $true
 }
 
@@ -339,14 +372,6 @@ if ($Source) {
     }
     Assert-BunVersion $MinimumBunVersion
     Install-ViaBun
-} elseif ($Binary) {
-    Install-Binary
 } else {
-    # Default: use bun if available, otherwise binary
-    if (Test-BunInstalled) {
-        Assert-BunVersion $MinimumBunVersion
-        Install-ViaBun
-    } else {
-        Install-Binary
-    }
+    Install-Binary
 }

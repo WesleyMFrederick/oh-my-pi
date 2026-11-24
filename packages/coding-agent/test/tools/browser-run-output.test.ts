@@ -7,31 +7,25 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 import type { ElementHandle } from "puppeteer-core";
 
-// Regression coverage for the invisible-output failure mode: `display("string")`,
-// `console.log`, and `print` reach the runtime as `onText` chunks, which the browser
+// Regression coverage for the invisible-output failure mode: `console.log` and
+// `print` reach the runtime as `onText` chunks, which the browser
 // embedders used to route to the debug log only — the tool result showed a bare
 // "Ran code on tab" while the displayed text vanished.
 describe("browser run output — stream text reaches the tool result", () => {
 	it("surfaces buffered stream text as a display entry on finish", () => {
 		const output = new RunOutput();
-		output.pushText("plain string via display()\n");
+		output.pushText("plain string via print()\n");
 		output.pushText("console.log line\n");
 
-		expect(output.finish()).toEqual([{ type: "text", text: "plain string via display()\nconsole.log line" }]);
+		expect(output.finish()).toEqual([{ type: "text", text: "plain string via print()\nconsole.log line" }]);
 	});
 
-	it("keeps stream text ordered around display() payloads", () => {
+	it("adds nothing for views, whose text is already in the stream", () => {
 		const output = new RunOutput();
-		output.pushText("before\n");
-		output.pushDisplay({ type: "json", data: { a: 1 } });
-		output.pushText("after\n");
+		output.pushText("{ a: 1 }\n");
+		output.pushDisplay({ type: "view", text: "{ a: 1 }\n", view: { kind: "json", value: { a: 1 } } });
 
-		const entries = output.finish();
-		expect(entries.map(e => (e.type === "text" ? e.text : e.type))).toEqual([
-			"before",
-			JSON.stringify({ a: 1 }, null, 2),
-			"after",
-		]);
+		expect(output.finish()).toEqual([{ type: "text", text: "{ a: 1 }" }]);
 	});
 
 	it("flushes pending text before pre-built entries (screenshot captions) and emits images verbatim", () => {
@@ -56,12 +50,10 @@ describe("browser run output — stream text reaches the tool result", () => {
 // raw puppeteer ElementHandles only expose `.type()`. `input.fill is not a function`
 // was a live failure.
 describe("browser handle enrichment — fill()", () => {
-	it("adds a fill() that clears the current value before typing", async () => {
-		const calls: string[] = [];
+	it("adds a fill() that clears the current value before inserting the new one", async () => {
 		const node = { value: "old", focused: false };
 		const stub = {
-			evaluate: async (fn: (el: unknown) => unknown) => {
-				calls.push("evaluate");
+			evaluate: async (fn: (el: unknown) => unknown) =>
 				fn({
 					get value() {
 						return node.value;
@@ -72,17 +64,24 @@ describe("browser handle enrichment — fill()", () => {
 					focus: () => {
 						node.focused = true;
 					},
-				});
-			},
-			type: async (text: string) => {
-				calls.push("type");
-				node.value += text;
+					matches: () => false,
+					getRootNode() {
+						return { activeElement: this };
+					},
+				}),
+			frame: {
+				page: () => ({
+					keyboard: {
+						sendCharacter: async (text: string) => {
+							node.value += text;
+						},
+					},
+				}),
 			},
 		} as unknown as ElementHandle;
 
 		await toActionableHandle(stub).fill("fresh");
 
-		expect(calls).toEqual(["evaluate", "type"]);
 		expect(node.focused).toBe(true);
 		expect(node.value).toBe("fresh");
 	});
@@ -109,17 +108,32 @@ describe("browser handle enrichment — guarded actions", () => {
 	};
 
 	// handle.click() resolves a stable, unoccluded click point (boundingBox + the
-	// actionability probe) and then dispatches through the page mouse, so a stub
-	// stands in for those three seams rather than a raw `click` method.
-	const clickableStub = (mouseClick: () => Promise<void>, extra: Record<string, unknown> = {}): ElementHandle =>
-		({
+	// actionability probe), checks the page has not replaced the element, watches
+	// for the page receiving the click, and then dispatches through the page mouse,
+	// so a stub stands in for those seams rather than a raw `click` method. The
+	// watch's in-page state reports the element attached and the click delivered.
+	// The element sits in the main frame, which outlives any press.
+	/** A clickable handle whose page's mouse press is `mousePress`; the move before it and the release succeed. */
+	const clickableStub = (mousePress: () => Promise<void>, extra: Record<string, unknown> = {}): ElementHandle => {
+		const page = {
+			mouse: { move: async () => {}, down: mousePress, up: async () => {} },
+			mainFrame: () => frame,
+		};
+		const frame = { page: () => page };
+		return {
 			boundingBox: async () => ({ x: 10, y: 10, width: 20, height: 20 }),
 			evaluate: async () => ({ ok: true, x: 20, y: 20 }),
-			frame: { page: () => ({ mouse: { click: mouseClick } }) },
+			evaluateHandle: async () => ({
+				evaluate: async (fn: (state: unknown) => unknown) =>
+					fn({ detached: false, delivered: () => true, stop: () => {} }),
+				dispose: async () => {},
+			}),
+			frame,
 			type: async () => {},
 			dispose: async () => {},
 			...extra,
-		}) as unknown as ElementHandle;
+		} as unknown as ElementHandle;
+	};
 
 	it("fails a stalled handle.click() fast with a named error instead of hanging", async () => {
 		const stalled = Promise.withResolvers<void>();
@@ -167,7 +181,13 @@ describe("browser handle enrichment — guarded actions", () => {
 		const stub = {
 			type: async () => {},
 			evaluate: async (fn: (el: unknown) => unknown) => {
-				fn({ focus: () => {} });
+				fn({
+					focus: () => {},
+					matches: () => false,
+					getRootNode() {
+						return { activeElement: this };
+					},
+				});
 			},
 			frame: {
 				page: () => ({
@@ -197,20 +217,20 @@ describe("browser handle enrichment — guarded actions", () => {
 	});
 
 	it("passes arguments and return values through the guarded method unchanged", async () => {
-		let calls = 0;
+		const received: unknown[][] = [];
 		const stub = {
-			select: async (...values: string[]) => {
-				calls++;
-				return values;
+			drag: async (...args: unknown[]) => {
+				received.push(args);
+				return { items: [], dragOperationsMask: 1 };
 			},
 			type: async () => {},
 			evaluate: async () => {},
 		} as unknown as ElementHandle;
 		const { guard, labels } = makeGuard(1_000);
 
-		expect(await toActionableHandle(stub, guard).select("a", "b")).toEqual(["a", "b"]);
-		expect(calls).toBe(1);
-		expect(labels).toEqual(["handle.select()"]);
+		expect(await toActionableHandle(stub, guard).drag({ x: 1, y: 2 })).toEqual({ items: [], dragOperationsMask: 1 });
+		expect(received).toEqual([[{ x: 1, y: 2 }]]);
+		expect(labels).toEqual(["handle.drag()"]);
 	});
 
 	it("guards drag and touch input methods, not just click/type", async () => {
@@ -236,7 +256,7 @@ describe("browser handle enrichment — guarded actions", () => {
 	it("runs the guarded fill as a single op without re-entering the wrapped type()", async () => {
 		const node = { value: "old", focused: false };
 		const stub = {
-			evaluate: async (fn: (el: unknown) => unknown) => {
+			evaluate: async (fn: (el: unknown) => unknown) =>
 				fn({
 					get value() {
 						return node.value;
@@ -247,13 +267,16 @@ describe("browser handle enrichment — guarded actions", () => {
 					focus: () => {
 						node.focused = true;
 					},
-				});
-			},
+					matches: () => false,
+					getRootNode() {
+						return { activeElement: this };
+					},
+				}),
 			type: async () => {},
 			frame: {
 				page: () => ({
 					keyboard: {
-						type: async (text: string) => {
+						sendCharacter: async (text: string) => {
 							node.value += text;
 						},
 					},
@@ -266,7 +289,7 @@ describe("browser handle enrichment — guarded actions", () => {
 
 		expect(node.value).toBe("fresh");
 		expect(node.focused).toBe(true);
-		// fill() drives the signal-aware typer internally, so it is guarded once, not nested.
+		// fill() inserts the value itself, so it is guarded once, not nested.
 		expect(labels).toEqual(["handle.fill()"]);
 	});
 

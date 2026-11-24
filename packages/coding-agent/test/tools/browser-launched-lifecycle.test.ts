@@ -3,6 +3,7 @@
 // browser is never killed by the idle sweep. Outcomes are observed as real fixture-process liveness. The
 // fixture is a real process standing in for the browser; tabs are seeded exactly as `open` leaves them.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as os from "node:os";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
@@ -95,6 +96,7 @@ describe("launched browser lifecycle", () => {
 			kind: { kind: "spawned", path: "/fixture", args: [] },
 			// Closing a stand-in connection is a no-op; the process kill is what is under test.
 			browser: { connected: false, disconnect: async () => undefined, close: async () => undefined } as never,
+			wsEndpoint: "ws://127.0.0.1/devtools/browser/fixture",
 			refCount: 1,
 			pid: proc.pid,
 			subprocess: proc,
@@ -119,10 +121,12 @@ describe("launched browser lifecycle", () => {
 				send: () => undefined,
 				onMessage: () => () => undefined,
 				onError: () => () => undefined,
+				onExit: () => () => undefined,
 				terminate: async () => undefined,
 				mode: "inline",
 			},
-			activateForScreenshot: false,
+			ownsPage: true,
+			uploadDir: path.join(os.tmpdir(), `omp-fixture-upload-${proc.pid}`),
 		};
 		getTabsMapForTest().set(name, tab);
 		return { pid: proc.pid, proc };
@@ -173,7 +177,8 @@ describe("launched browser lifecycle", () => {
 
 		it("given an aborted session owning a launched browser, when disposed, then that browser dies and another session's browser survives (M3, M21)", async () => {
 			const session = createSession(() => ({ content: ["ok"] }));
-			const id = session.sessionManager.getSessionId();
+			// Tabs are owned by the agent's stable kernel owner id, not the rotating conversation id.
+			const id = session.getEvalKernelOwnerId();
 			const mine = await seedTab({ owner: id, headless: false });
 			const theirs = await seedTab({ owner: "someone-else" });
 			await session.abort();
@@ -186,7 +191,7 @@ describe("launched browser lifecycle", () => {
 			const session = createSession(() => {
 				throw new Error("provider exploded");
 			});
-			const id = session.sessionManager.getSessionId();
+			const id = session.getEvalKernelOwnerId();
 			const mine = await seedTab({ owner: id });
 			await session.prompt("hi").catch(() => undefined);
 			await session.dispose();

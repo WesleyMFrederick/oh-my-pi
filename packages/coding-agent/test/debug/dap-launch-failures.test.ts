@@ -453,6 +453,76 @@ describe("DAP launch failure handling", () => {
 		}
 	});
 
+	it("rejects the request instead of emitting an unhandled rejection when a pending stdin write fails", async () => {
+		const exited = Promise.withResolvers<number>();
+		const proc = {
+			exited: exited.promise,
+			exitCode: null,
+			stdin: { write: () => 0, flush: () => undefined },
+			stdout: new ReadableStream<Uint8Array>(),
+			stderr: new ReadableStream<Uint8Array>(),
+			peekStderr: () => "",
+			kill: () => true,
+		} as unknown as DapClientState["proc"];
+		// A pending FileSink write returns a promise; on Windows it rejects with
+		// EPIPE once the adapter's end of the pipe is gone.
+		const writeSink = {
+			write: (_data: string | Uint8Array) => Promise.reject(new Error("EPIPE: broken pipe, write")),
+			flush: () => undefined,
+		};
+		const client = new DapClient(TEST_ADAPTER, process.cwd(), proc, {
+			readable: new ReadableStream<Uint8Array>(),
+			writeSink,
+		});
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			// A failed write marks the client broken, so the request fails well before its own timeout.
+			const start = Date.now();
+			await expect(client.sendRequest("evaluate", {}, undefined, 5_000)).rejects.toThrow();
+			expect(Date.now() - start).toBeLessThan(1_000);
+			// Unhandled rejections are reported once the microtask queue drains; one macrotask turn suffices.
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			await client.dispose();
+		}
+	});
+
+	it("disposes the client when the stdin flush throws synchronously", async () => {
+		const proc = {
+			exited: Promise.withResolvers<number>().promise,
+			exitCode: null,
+			stdin: { write: () => 0, flush: () => undefined },
+			stdout: new ReadableStream<Uint8Array>(),
+			stderr: new ReadableStream<Uint8Array>(),
+			peekStderr: () => "",
+			kill: () => true,
+		} as unknown as DapClientState["proc"];
+		const writeSink = {
+			write: (_data: string | Uint8Array) => 0,
+			flush: () => {
+				throw new Error("EPIPE: broken pipe, write");
+			},
+		};
+		const client = new DapClient(TEST_ADAPTER, process.cwd(), proc, {
+			readable: new ReadableStream<Uint8Array>(),
+			writeSink,
+		});
+		try {
+			await expect(client.sendRequest("evaluate", {}, undefined, 5_000)).rejects.toThrow();
+			// The broken pipe is terminal: later requests fail fast instead of reusing the dead sink.
+			await expect(client.sendRequest("evaluate", {}, undefined, 5_000)).rejects.toThrow(/not running/);
+		} finally {
+			await client.dispose();
+		}
+	});
+
 	it("kills the detached adapter process when the Unix socket never appears (Linux)", async () => {
 		if (process.platform !== "linux") return;
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-unix-leak-"));
@@ -853,7 +923,7 @@ describe("DebugTool launch validation", () => {
 	});
 
 	it("validates missing attach targets before adapter discovery", async () => {
-		const selectAttachSpy = spyOn(dapModule, "selectAttachAdapter").mockReturnValue(null);
+		const selectAttachSpy = spyOn(dapModule, "selectAttachAdapter").mockResolvedValue(null);
 		const session: ToolSession = {
 			cwd: process.cwd(),
 			hasUI: false,
@@ -873,7 +943,7 @@ describe("DebugTool launch validation", () => {
 			name: "pico-openocd",
 			attachDefaults: { target: ":3334" },
 		};
-		const selectAttachSpy = spyOn(dapModule, "selectAttachAdapter").mockReturnValue(adapter);
+		const selectAttachSpy = spyOn(dapModule, "selectAttachAdapter").mockResolvedValue(adapter);
 		const sessionAttachSpy = spyOn(dapModule.dapSessionManager, "attach").mockImplementation(async opts => {
 			throw Object.assign(new Error("captured attach"), { capturedOptions: opts });
 		});
@@ -890,7 +960,11 @@ describe("DebugTool launch validation", () => {
 			await expect(tool.execute("call", { action: "attach", adapter: "pico-openocd" })).rejects.toThrow(
 				/captured attach/,
 			);
-			expect(selectAttachSpy).toHaveBeenCalledWith(process.cwd(), "pico-openocd", undefined);
+			expect(selectAttachSpy).toHaveBeenCalledWith(process.cwd(), "pico-openocd", {
+				pid: undefined,
+				port: undefined,
+				host: undefined,
+			});
 			expect(sessionAttachSpy).toHaveBeenCalledTimes(1);
 			const [opts] = sessionAttachSpy.mock.calls[0]!;
 			expect(opts.adapter).toBe(adapter);
@@ -904,7 +978,7 @@ describe("DebugTool launch validation", () => {
 	});
 
 	it("throws targeted 'python not found in PATH' when adapter:'debugpy' is unresolvable for attach", async () => {
-		const attachSpy = spyOn(dapModule, "selectAttachAdapter").mockReturnValue(null);
+		const attachSpy = spyOn(dapModule, "selectAttachAdapter").mockResolvedValue(null);
 		try {
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-debugpy-attach-"));
 			try {

@@ -1,7 +1,9 @@
 import type { Settings } from "../config/settings";
 import type { SlashCommandIconName } from "@oh-my-pi/pi-tui/theme/symbols";
-import type { GoalModeController } from "../goals/mode-controller";
 import type { InteractiveModeContext, SubmittedUserInput } from "../modes/types";
+import type { ConversationPosition } from "../modes/utils/conversation-position";
+import type { MCPManager } from "../mcp/manager";
+import type { MCPServerConfig } from "../mcp/types";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionManager } from "../session/session-manager";
 
@@ -24,6 +26,12 @@ export interface BuiltinSlashCommand {
 	allowArgs?: boolean;
 	/** Subcommands for dropdown completion (e.g. /mcp add, /mcp list). */
 	subcommands?: SubcommandDef[];
+	/**
+	 * The bare command is a complete invocation (`/fork`). Subcommand completion
+	 * then waits for a typed prefix, so Enter on `/name ` submits the bare command
+	 * instead of accepting the first subcommand from the dropdown.
+	 */
+	subcommandOptional?: boolean;
 	/** Static inline hint when command takes a simple argument (no subcommands). */
 	inlineHint?: string;
 	/** TUI-only dynamic status text for command-name autocomplete. Static `description` remains canonical for ACP/help. */
@@ -48,13 +56,11 @@ export interface ParsedSlashCommand {
  * - `{ consumed: true }` — explicit equivalent of the above (ACP shape).
  * - `{ prompt: string }` — command handled, pass `prompt` through as the new
  *   user input (e.g. `/force <tool> <prompt>` keeps `<prompt>` as the message).
- *   `synthetic: true` makes text/ACP hosts send the prompt as a hidden developer
- *   message for command-built kickoffs the user did not type.
  */
 export type SlashCommandResult =
 	| undefined
-	| { consumed: true; agentInvoked?: boolean }
-	| { prompt: string; synthetic?: boolean };
+	| { consumed: true; agentInvoked?: boolean; failed?: boolean }
+	| { prompt: string };
 
 /**
  * Runtime visible to slash-command handlers that run in text/ACP mode.
@@ -76,9 +82,9 @@ export interface SlashCommandRuntime {
 	refreshCommands: () => Promise<void> | void;
 	/**
 	 * Reload plugin state (caches, skills, slash command registry, project
-	 * registries) and re-emit available commands. Used by `/reload-plugins`,
-	 * `/move`, and `/marketplace`/`/plugins` mutations so the session sees a
-	 * consistent view after plugin or project-scope changes.
+	 * registries) and re-emit available commands. Used by `/reload-plugins`
+	 * and `/marketplace`/`/plugins` mutations so the session sees a consistent
+	 * view after plugin changes. `/move` re-scopes through `rescopeSessionToCwd`.
 	 */
 	reloadPlugins: () => Promise<void>;
 	/**
@@ -103,13 +109,39 @@ export interface SlashCommandRuntime {
 	 * return immediately and leave the serialized queue free for `abort`.
 	 */
 	runCommandInBackground?: (task: () => Promise<void>) => void;
-	notifyTitleChanged?: () => Promise<void> | void;
-	notifyConfigChanged?: () => Promise<void> | void;
 	/**
-	 * Goal-mode controller owned by the host (RPC, ACP). Absent in hosts that do not own one;
-	 * `/goal` then reports that goal mode is unavailable instead of silently doing nothing.
+	 * Ask the host to reconnect one live-manager MCP server by name after its
+	 * credentials changed (e.g. `/mcp reauth`), and report the post-reconnect
+	 * state. Returns `undefined` when this host keeps no live manager for the
+	 * server; callers then fall back to restart guidance. `selected` is the
+	 * definition the reauth refreshed; hosts match it against their manager
+	 * entry so a name collision never reconnects an unrelated server.
 	 */
-	goalMode?: GoalModeController;
+	reconnectMcpServer?: (
+		name: string,
+		/** The server definition the reauth actually refreshed, for ownership matching. */
+		selected: MCPServerConfig,
+	) => Promise<"connected" | "connecting" | "disconnected" | undefined>;
+	/**
+	 * The host's live MCP manager when it keeps one. ACP sessions keep one for
+	 * client-declared servers (`session/new`/`load_session` `mcpServers`), whose
+	 * definitions live in no writable config file; `/mcp` lookups consult it so
+	 * those servers resolve like configured ones.
+	 */
+	mcpManager?: MCPManager | undefined;
+	notifyTitleChanged?: () => Promise<void> | void;
+	notifySessionPinChanged?: (sessionId: string, pinned: boolean) => Promise<void> | void;
+	/**
+	 * Push the host's view of the session config (model, thinking level, mode).
+	 *
+	 * `handledBySessionEvent` marks changes the host may already learn from an
+	 * `AgentSession` lifetime event (`model_changed`/`thinking_level_changed`).
+	 * ACP installs a session-lifetime subscription that turns those into a
+	 * `config_option_update`, so it skips this explicit push once subscribed —
+	 * pre-bootstrap sessions still get it. Hosts without such a subscription
+	 * (RPC) ignore the flag and always push.
+	 */
+	notifyConfigChanged?: (options?: { handledBySessionEvent?: boolean }) => Promise<void> | void;
 }
 
 /**
@@ -125,6 +157,9 @@ export interface TuiSlashCommandRuntime {
 	input?: Pick<SubmittedUserInput, "images" | "imageLinks">;
 	/** The editor snapshot was cleared before asynchronous input hooks ran. */
 	draftDetached?: boolean;
+	/** Submitted with the follow-up key from this conversation position: queue behind the active run
+	 *  rather than interrupt it. */
+	followUp?: ConversationPosition;
 }
 
 /** Unified slash-command spec consumed by both TUI and ACP dispatchers. */
@@ -180,5 +215,5 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 /** Result returned by `executeAcpBuiltinSlashCommand`. */
 export type AcpBuiltinSlashCommandResult =
 	| false
-	| { consumed: true; agentInvoked?: boolean }
-	| { prompt: string; synthetic?: boolean };
+	| { consumed: true; agentInvoked?: boolean; failed?: boolean }
+	| { prompt: string };

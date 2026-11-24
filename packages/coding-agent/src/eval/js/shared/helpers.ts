@@ -1,5 +1,4 @@
 import * as path from "node:path";
-
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { JsStatusEvent } from "./types";
 
@@ -31,7 +30,8 @@ export interface HelperContext {
  * onto the global scope.
  */
 export interface HelperBundle {
-	read(rawPath: string, options?: HelperOptions): Promise<string>;
+	/** Resolves to `undefined` for a directory; the prelude then asks the read tool for its listing. */
+	read(rawPath: string, options?: HelperOptions): Promise<string | undefined>;
 	writeFile(rawPath: string, data: unknown): Promise<string>;
 	env(key?: string, value?: string): string | Record<string, string> | undefined;
 	/** Whether `rawPath` is an internal URL whose scheme has an injected root (served by these helpers, not delegated to the read tool). */
@@ -43,7 +43,9 @@ const utf8Encoder = new TextEncoder();
 export function createHelpers(ctx: HelperContext): HelperBundle {
 	return {
 		read: async (rawPath, options = {}) => {
-			const { filePath, file, size } = await resolveRegularFile(ctx, rawPath);
+			const resolved = await resolveRegularFile(ctx, rawPath);
+			if (!resolved) return undefined;
+			const { filePath, file, size } = resolved;
 			let text = await file.text();
 			const offset = typeof options.offset === "number" ? options.offset : 1;
 			const limit = typeof options.limit === "number" ? options.limit : undefined;
@@ -152,13 +154,11 @@ function resolveUnderRoot(scheme: string, root: string, rawRelative: string, raw
 async function resolveRegularFile(
 	ctx: HelperContext,
 	rawPath: string,
-): Promise<{ filePath: string; file: Bun.BunFile; size: number }> {
+): Promise<{ filePath: string; file: Bun.BunFile; size: number } | undefined> {
 	const filePath = resolveHelperPath(ctx, rawPath, "read");
 	const file = Bun.file(filePath);
 	const stat = await file.stat();
-	if (stat.isDirectory()) {
-		throw new ToolError(`Directory paths are not supported by read(): ${filePath}`);
-	}
+	if (stat.isDirectory()) return undefined;
 	return { filePath, file, size: stat.size };
 }
 

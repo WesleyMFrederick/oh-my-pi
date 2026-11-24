@@ -2,10 +2,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Subprocess } from "bun";
-import { getAgentDir, MAIN_CONFIG_FILENAMES } from "./dirs";
+import { getAgentDir, getProjectDir, MAIN_CONFIG_FILENAMES } from "./dirs";
 import { $env, filterChildShellEnv } from "./env";
 import { isExecutable } from "./executable";
-import { $which } from "./which";
+import { $which, $whichAll } from "./which";
 
 export { isExecutable };
 export interface ShellConfig {
@@ -20,18 +20,31 @@ export interface ShellConfigOptions {
 	/** File path or runtime layer that supplied the active shell setting. */
 	configSource?: string;
 }
-/** Auto-resolved shell (no custom path); stable for the process lifetime. */
+/** Auto-resolved shell (no custom path); kept until {@link refreshShellConfigCache}. */
 let cachedDefaultShellConfig: ShellConfig | null = null;
 /** Config for the most recent custom `shellPath`; never served once the path is cleared. */
 let cachedCustomShellConfig: ShellConfig | null = null;
+/**
+ * The child-shell environment {@link refreshShellConfigCache} last captured. Unset
+ * until the first refresh, so spawn environments are built from the live environment.
+ */
+let capturedChildShellEnv: Record<string, string> | undefined;
+/**
+ * Project whose dotenv values the spawn environment filters out: the one current
+ * when it was first built or captured.
+ * That is normally the launch project, whose dotenv files Bun and omp load into
+ * `process.env`; a later session in another project must not receive them.
+ */
+let spawnEnvProjectDir: string | undefined;
 
 /**
  * Build the spawn environment (cached).
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
+	spawnEnvProjectDir ??= getProjectDir();
 	return {
-		...filterChildShellEnv(Bun.env),
+		...(capturedChildShellEnv ?? filterChildShellEnv(Bun.env, spawnEnvProjectDir)),
 		SHELL: shell,
 		GIT_EDITOR: "true",
 		GPG_TTY: "not a tty",
@@ -129,7 +142,7 @@ export function resolveBasicShell(): string | undefined {
  * Resolve the external shell to advertise on Windows.
  *
  * A host bash is OPTIONAL: bash tool commands always execute in the embedded
- * brush-core shell. The resolved binary only serves the spawn-a-shell paths
+ * bash engine. The resolved binary only serves the spawn-a-shell paths
  * (interactive PTY sessions, ACP client terminals, SHELL env), so this
  * prefers a real Git Bash when one exists and otherwise falls back to
  * cmd.exe — it never fails.
@@ -138,7 +151,7 @@ export function resolveBasicShell(): string | undefined {
  * 1. Git for Windows install roots (machine + per-user installers)
  * 2. scoop installs — scoop's git manifest sets GIT_INSTALL_ROOT and shims
  *    sh.exe/git.exe but never bash.exe, so PATH lookup alone misses it
- * 3. bash.exe on PATH (Cygwin, MSYS2, ...)
+ * 3. bash.exe on PATH (Cygwin, MSYS2, ...), skipping the WSL launcher
  * 4. sh.exe on PATH (Git for Windows' sh.exe is bash; prefer a sibling
  *    bash.exe when present)
  * 5. cmd.exe from ComSpec
@@ -160,7 +173,13 @@ export function resolveWindowsShell(env: Record<string, string | undefined> = Bu
 		if (fs.existsSync(candidate)) return candidate;
 	}
 
-	const bashOnPath = $which("bash.exe");
+	// `System32\bash.exe` (and its WindowsApps alias) launches WSL: a Linux shell that cannot run
+	// Windows paths or programs as given.
+	const systemRoot = `${(env.SystemRoot || env.windir || "C:\\Windows").toLowerCase()}\\`;
+	const bashOnPath = $whichAll("bash.exe").find(candidate => {
+		const lower = candidate.toLowerCase();
+		return !lower.startsWith(systemRoot) && !lower.includes("\\microsoft\\windowsapps\\");
+	});
 	if (bashOnPath) return bashOnPath;
 
 	const shOnPath = $which("sh.exe");
@@ -200,6 +219,32 @@ export function getShellConfig(customShellPath?: string, options: ShellConfigOpt
 	}
 	cachedDefaultShellConfig ??= buildConfig(resolveDefaultShell());
 	return cachedDefaultShellConfig;
+}
+
+/**
+ * Capture the current process environment for child shells and drop both cached
+ * shell configs, so the next {@link getShellConfig} builds the spawn environment
+ * from that capture. Call right after code that changed `process.env` in a way
+ * child shells must see, such as extension session lifecycle handlers exporting
+ * session-scoped variables; later writes reach child shells only at the next call.
+ */
+export function refreshShellConfigCache(): void {
+	spawnEnvProjectDir ??= getProjectDir();
+	capturedChildShellEnv = filterChildShellEnv(Bun.env, spawnEnvProjectDir);
+	cachedDefaultShellConfig = null;
+	cachedCustomShellConfig = null;
+}
+
+/**
+ * Test-only: forget the capture and both cached shell configs, so the next
+ * {@link getShellConfig} builds from the live environment again. Production code
+ * MUST NOT call this; the capture's lifecycle is owned by {@link refreshShellConfigCache}.
+ */
+export function __resetShellConfigCacheForTests(): void {
+	capturedChildShellEnv = undefined;
+	spawnEnvProjectDir = undefined;
+	cachedDefaultShellConfig = null;
+	cachedCustomShellConfig = null;
 }
 
 /** Platform shell discovery used when no custom `shellPath` is configured. */

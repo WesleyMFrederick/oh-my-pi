@@ -2,7 +2,7 @@
  * `omp auth-broker` command handlers.
  *
  * Sub-verbs:
- *   - `serve [--bind=…]` — boots the broker against the local SQLite store.
+ *   - `serve [--bind=…] [--trust-proxy-headers]` — boots the broker against the local SQLite store.
  *   - `token` / `token --regenerate` — manages the bearer token file.
  *   - `login <provider> [--via=user@host]` — logs into a provider locally, or
  *     via SSH tunnel into a remote broker host.
@@ -19,10 +19,13 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import {
 	type AuthCredential,
+	type AuthCredentialSnapshotEntry,
 	AuthStorage,
 	getEnvApiKey,
 	getOAuthProviders,
+	isSameOAuthAccount,
 	listProvidersWithEnvKey,
+	matchesReplacementCredential,
 	type OAuthCredential,
 	type OAuthProvider,
 	PROVIDER_REGISTRY,
@@ -31,13 +34,17 @@ import {
 import { AuthBrokerClient, DEFAULT_AUTH_BROKER_BIND, startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker";
 import { refreshOAuthToken } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
-import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, logger, postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { setTransports as setLoggerTransports } from "@oh-my-pi/pi-utils/logger";
 import { $ } from "bun";
 import { refreshManagedMcpOAuthCredential } from "../mcp/oauth-credentials";
 import { isManagedMCPOAuthCredentialId, mcpOAuthServerUrlFromCredentialId } from "../mcp/oauth-flow";
-import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import {
+	applyUnpausedProviders,
+	resolveAuthBrokerConfig,
+	resolveEffectiveSettings,
+} from "../session/auth-broker-config";
 import { pickIndex, pickOAuthProvider, runTerminalOAuthLogin } from "./oauth-terminal";
 import { generateToken, readTokenFile, writeTokenFile } from "./token-file";
 
@@ -48,6 +55,7 @@ export interface AuthBrokerCommandArgs {
 	flags: {
 		json?: boolean;
 		bind?: string;
+		trustProxyHeaders?: boolean;
 		regenerate?: boolean;
 		via?: string;
 		provider?: string;
@@ -120,7 +128,16 @@ export function refreshBrokerOAuthCredential(
 	}
 	// Non-MCP rows: same per-provider path AuthStorage would take by default
 	// (the serve process registers no custom OAuth providers).
-	return refreshOAuthToken(provider as OAuthProvider, credential);
+	return refreshOAuthToken(provider as OAuthProvider, credential, signal);
+}
+
+/** The `omp auth-broker serve` vault: tokens refresh in this process through {@link refreshBrokerOAuthCredential}. */
+export function createBrokerAuthStorage(store: SqliteAuthCredentialStore): AuthStorage {
+	return new AuthStorage(store, {
+		refreshOAuthCredential: (provider, _credentialId, credential, signal) =>
+			refreshBrokerOAuthCredential(provider, credential, signal),
+		refreshOAuthCredentialMints: true,
+	});
 }
 
 async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
@@ -128,36 +145,49 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	// stdout so a process supervisor (pm2, journald, k8s) captures them, and
 	// skip the rotating ~/.omp/logs/ file the TUI default would have used.
 	setLoggerTransports({ console: true, file: false });
+	// SIGTERM/SIGINT are a supervisor's stop or restart, not a failure: exit 0 once
+	// the cleanup pass (which saves an in-flight token refresh) finishes.
+	postmortem.exitCleanlyOnStopSignals();
 
 	const bind = flags.bind ?? DEFAULT_AUTH_BROKER_BIND;
 	const token = await ensureToken();
 	const dbPath = getAgentDbPath();
+	applyUnpausedProviders(await resolveEffectiveSettings());
 	const store = await SqliteAuthCredentialStore.open(dbPath);
-	const storage = new AuthStorage(store, {
-		refreshOAuthCredential: (provider, _credentialId, credential, signal) =>
-			refreshBrokerOAuthCredential(provider, credential, signal),
-	});
+	const storage = createBrokerAuthStorage(store);
 	await storage.credentials.reload();
 	const handle = startAuthBroker({
 		storage,
 		bind,
 		bearerTokens: [token],
+		trustProxyHeaders: flags.trustProxyHeaders,
 		version: VERSION,
 	});
 	logger.info("auth-broker listening", { url: handle.url });
 	logger.info("auth-broker bearer token loaded", { path: getTokenFilePath(), mode: "0600" });
 
-	const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
+	// Stopping returns from `serve` and leaves the exit to the process signal handler, which first
+	// waits for a refresh still saving a token the provider already rotated. Exiting here would
+	// drop that save and leave the store with a spent refresh token.
+	const stopped = Promise.withResolvers<void>();
+	const shutdown = (signal: NodeJS.Signals): void => {
 		logger.info("auth-broker shutting down", { signal });
-		await handle.close();
-		storage.close();
-		process.exit(0);
+		void handle
+			.close()
+			.finally(() => storage.close())
+			.then(stopped.resolve, stopped.reject);
 	};
-	process.once("SIGINT", () => void shutdown("SIGINT"));
-	process.once("SIGTERM", () => void shutdown("SIGTERM"));
+	const onSigint = (): void => shutdown("SIGINT");
+	const onSigterm = (): void => shutdown("SIGTERM");
+	process.once("SIGINT", onSigint);
+	process.once("SIGTERM", onSigterm);
 
-	// Block forever; lifecycle is signal-driven.
-	await new Promise<never>(() => {});
+	try {
+		await stopped.promise;
+	} finally {
+		process.off("SIGINT", onSigint);
+		process.off("SIGTERM", onSigterm);
+	}
 }
 
 async function runToken(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
@@ -183,6 +213,7 @@ async function runLogin(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	if (flags.via && !flags.provider) {
 		throw new Error("Usage: omp auth-broker login <provider> --via=user@host (provider required for remote login)");
 	}
+	applyUnpausedProviders(await resolveEffectiveSettings());
 	const providers = getOAuthProviders();
 	// One interface for picker + login prompts; closed before `--via` hands
 	// stdin to ssh.
@@ -282,6 +313,7 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 }
 
 async function runList(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
+	applyUnpausedProviders(await resolveEffectiveSettings());
 	const providers = getOAuthProviders();
 	if (flags.json) {
 		process.stdout.write(`${JSON.stringify(providers.map(p => ({ id: p.id, name: p.name })))}\n`);
@@ -538,58 +570,26 @@ function credentialIdentity(provider: string, credential: AuthCredential): strin
 }
 
 /**
- * Build the set of "identities already on the broker" so re-runs are idempotent.
- * For OAuth, identity = email|accountId|projectId, each org-qualified when the
- * row carries an organization (one Anthropic email can hold a Team seat AND a
- * personal Max plan — those must migrate as two rows). A row with NO base
- * identity but an orgId (login recovered neither email nor account) is marked
- * by the org alone, so re-running migrate does not re-upload a stale refresh
- * token over the broker's newer one. For api_key, we collapse to a single
- * marker per provider (broker has no concept of "multiple api keys per
- * provider with different identities"; upsert would coalesce them).
+ * Whether the broker already holds this credential, so re-runs are idempotent.
+ * An OAuth row is held when uploading it would replace a broker row (the store's
+ * own identity match), so no upload overwrites the broker's newer refresh token,
+ * or when a broker row is the same account stored under another identity key, so
+ * no upload duplicates it. API keys collapse to a single one per provider.
  */
-function indexBrokerSnapshot(snapshot: {
-	credentials: Array<{
-		provider: string;
-		credential: { type: string; email?: string; accountId?: string; projectId?: string; orgId?: string };
-	}>;
-}): Map<string, Set<string>> {
-	const out = new Map<string, Set<string>>();
-	for (const entry of snapshot.credentials) {
-		const ids = out.get(entry.provider) ?? new Set<string>();
-		if (entry.credential.type === "api_key") {
-			ids.add("@api_key");
-		} else {
-			const orgSuffix = entry.credential.orgId ? `|org:${entry.credential.orgId}` : "";
-			if (entry.credential.email) ids.add(`email:${entry.credential.email}${orgSuffix}`);
-			if (entry.credential.accountId) ids.add(`accountId:${entry.credential.accountId}${orgSuffix}`);
-			if (entry.credential.projectId) ids.add(`projectId:${entry.credential.projectId}${orgSuffix}`);
-			if (
-				!entry.credential.email &&
-				!entry.credential.accountId &&
-				!entry.credential.projectId &&
-				entry.credential.orgId
-			) {
-				ids.add(`org:${entry.credential.orgId}`);
-			}
-		}
-		out.set(entry.provider, ids);
-	}
-	return out;
-}
-
-function brokerAlreadyHas(existing: Map<string, Set<string>>, provider: string, credential: AuthCredential): boolean {
-	const ids = existing.get(provider);
-	if (!ids) return false;
-	if (credential.type === "api_key") return ids.has("@api_key");
-	const orgSuffix = credential.orgId ? `|org:${credential.orgId}` : "";
-	if (credential.email && ids.has(`email:${credential.email}${orgSuffix}`)) return true;
-	if (credential.accountId && ids.has(`accountId:${credential.accountId}${orgSuffix}`)) return true;
-	if (credential.projectId && ids.has(`projectId:${credential.projectId}${orgSuffix}`)) return true;
-	if (!credential.email && !credential.accountId && !credential.projectId && credential.orgId) {
-		return ids.has(`org:${credential.orgId}`);
-	}
-	return false;
+function brokerAlreadyHas(
+	existing: readonly AuthCredentialSnapshotEntry[],
+	provider: string,
+	credential: AuthCredential,
+): boolean {
+	return existing.some(entry => {
+		if (entry.provider !== provider) return false;
+		if (credential.type === "api_key") return entry.credential.type === "api_key";
+		return (
+			entry.credential.type === "oauth" &&
+			(matchesReplacementCredential(provider, entry.credential, entry.identityKey, credential) ||
+				isSameOAuthAccount(entry.credential, credential))
+		);
+	});
 }
 
 async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
@@ -608,7 +608,7 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 	const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 	const snapshotResult = await client.fetchSnapshot();
 	if (snapshotResult.status !== 200) throw new Error("Auth broker returned no snapshot");
-	const existing = indexBrokerSnapshot(snapshotResult.snapshot);
+	const existing = snapshotResult.snapshot.credentials;
 
 	const plan: MigratePlanEntry[] = [];
 	const skipped: MigrateSkip[] = [];

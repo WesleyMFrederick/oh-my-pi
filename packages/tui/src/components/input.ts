@@ -1,6 +1,6 @@
 import { BracketedPasteHandler, decodeReencodedPasteControls } from "../bracketed-paste";
-import { getKeybindings } from "../keybindings";
-import { extractPrintableText, matchesKey } from "../keys";
+import { canonicalKeyId, getKeybindings } from "../keybindings";
+import { extractPrintableText, parseKey } from "../keys";
 import { KillRing } from "../kill-ring";
 import type { TspInputProps } from "@oh-my-pi/pi-wire";
 import { node } from "../native/describe";
@@ -14,7 +14,7 @@ import {
 	type NativeUiEvent,
 	resolveTextEdit,
 } from "../native/node";
-import { SpaceHoldGesture } from "../space-hold";
+import { getSpaceHoldText, SpaceHoldGesture } from "../space-hold";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
 import { cursorColumnWindow } from "./scroll-viewport";
 import {
@@ -120,10 +120,10 @@ export class Input implements Component, Focusable {
 		};
 	}
 
-	setValue(value: string): void {
+	/** Replace the value; the caret lands at the end unless `cursor: "start"`. */
+	setValue(value: string, options: { cursor?: "start" | "end" } = {}): void {
 		this.#value = value;
-		// Callers seed or replace the value wholesale; typing continues at the end.
-		this.#cursor = value.length;
+		this.#cursor = options.cursor === "start" ? 0 : value.length;
 	}
 
 	setUseTerminalCursor(useTerminalCursor: boolean): void {
@@ -132,6 +132,10 @@ export class Input implements Component, Focusable {
 
 	getUseTerminalCursor(): boolean {
 		return this.#useTerminalCursor;
+	}
+
+	capturesInput(data: string): boolean {
+		return this.spaceHold.shouldRoute(data);
 	}
 
 	/**
@@ -154,10 +158,14 @@ export class Input implements Component, Focusable {
 			return true;
 		}
 
-		// Space-hold push-to-talk: a sustained space bar starts/stops STT instead of typing spaces.
-		switch (this.spaceHold.process(matchesKey(data, "space"))) {
+		// Reserve configured keys before text bindings or submit/delete handlers can consume them.
+		const parsedKey = parseKey(data);
+		const canonical = parsedKey !== undefined ? canonicalKeyId(parsedKey) : undefined;
+		const spaceHoldText = getSpaceHoldText(data, canonical);
+		switch (this.spaceHold.process(canonical, spaceHoldText?.length ?? 0)) {
 			case "type":
-				this.#insertCharacter(" ");
+				this.#insertCharacter(spaceHoldText!);
+				this.spaceHold.recordTyped(spaceHoldText!.length);
 				return true;
 			case "swallow":
 				return true;
@@ -284,9 +292,10 @@ export class Input implements Component, Focusable {
 		this.#handlePaste(text);
 	}
 
-	/** Terminal-side selection edits on the `input` node (see {@link applyHostEdit}). */
+	/** Terminal-side selection edits and undo on the `input` node (see {@link applyHostEdit}). */
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type === "edit") this.applyHostEdit(event);
+		else if (event.type === "undo") this.#undo();
 	}
 
 	/**
@@ -582,6 +591,7 @@ export class Input implements Component, Focusable {
 		const props: TspInputProps = {
 			text: value,
 			cursor,
+			sendable: false,
 			prompt: prompt || undefined,
 			placeholder: this.placeholder,
 		};

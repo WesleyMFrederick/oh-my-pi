@@ -1,14 +1,18 @@
 import { describe, expect, it } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { Model, ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
 	type RetryFallbackResolutionContext,
+	parseRetryFallbackSelector,
 	resolveRetryFallbackChainKey,
 	validateRetryFallbackChains,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
+import { resolveProviderModelReference } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 function createContext(
@@ -16,9 +20,9 @@ function createContext(
 	roles: Record<string, string> = {},
 ): RetryFallbackResolutionContext {
 	const models = [
-		getBundledModel("google", "gemini-2.5-flash"),
-		getBundledModel("google-vertex", "gemini-2.5-flash"),
-		getBundledModel("openrouter", "google/gemini-2.5-flash"),
+		getBundledModel("google", "gemini-3.5-flash"),
+		getBundledModel("google-vertex", "gemini-3.5-flash"),
+		getBundledModel("openrouter", "google/gemini-3.5-flash"),
 		getBundledModel("openai", "gpt-4o-mini"),
 		getBundledModel("xai-oauth", "grok-4.7"),
 	].filter(model => model !== undefined);
@@ -34,14 +38,14 @@ function createContext(
 
 describe("retry fallback selector resolution", () => {
 	it("resolves chain keys by exact model, longest wildcard, role, then default", () => {
-		const selector = "openrouter/google/gemini-2.5-flash";
+		const selector = "openrouter/google/gemini-3.5-flash";
 		const exactContext = createContext(
 			{
 				default: ["openai/gpt-4o-mini"],
-				task: ["google/gemini-2.5-flash"],
+				task: ["google/gemini-3.5-flash"],
 				"openrouter/*": ["openai/gpt-4o-mini"],
 				"openrouter/google/*": ["google-vertex/*"],
-				[selector]: ["google/gemini-2.5-flash"],
+				[selector]: ["google/gemini-3.5-flash"],
 			},
 			{ task: selector },
 		);
@@ -50,7 +54,7 @@ describe("retry fallback selector resolution", () => {
 		const wildcardContext = createContext(
 			{
 				default: ["openai/gpt-4o-mini"],
-				task: ["google/gemini-2.5-flash"],
+				task: ["google/gemini-3.5-flash"],
 				"openrouter/*": ["openai/gpt-4o-mini"],
 				"openrouter/google/*": ["google-vertex/*"],
 			},
@@ -59,7 +63,7 @@ describe("retry fallback selector resolution", () => {
 		expect(resolveRetryFallbackChainKey(wildcardContext, selector, undefined, "task")).toBe("openrouter/google/*");
 
 		const roleContext = createContext(
-			{ default: ["openai/gpt-4o-mini"], task: ["google/gemini-2.5-flash"] },
+			{ default: ["openai/gpt-4o-mini"], task: ["google/gemini-3.5-flash"] },
 			{ task: selector },
 		);
 		expect(resolveRetryFallbackChainKey(roleContext, selector, undefined, "task")).toBe("task");
@@ -68,12 +72,98 @@ describe("retry fallback selector resolution", () => {
 		expect(resolveRetryFallbackChainKey(defaultContext, selector)).toBe("default");
 	});
 
+	it("matches keys and entries by catalog identity across dotted and dashed spellings", () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-5-5");
+		const models = [sonnet, getBundledModel("openai", "gpt-4o-mini")].filter(model => model !== undefined);
+		expect(models).toHaveLength(2);
+		const lookup = {
+			find: (provider: string, id: string) => resolveProviderModelReference(provider, id, models),
+			hasProvider: (provider: string) => models.some(model => model.provider === provider),
+		};
+		const live = "anthropic/claude-sonnet-5-5";
+
+		// The registry accepts the dotted key, so it must outrank the provider wildcard.
+		const keyed: RetryFallbackResolutionContext = {
+			chains: {
+				"anthropic/*": ["openai/gpt-4o-mini:high"],
+				"anthropic/claude-sonnet-5.5": ["openai/gpt-4o-mini"],
+			},
+			getModelRole: () => undefined,
+			modelLookup: lookup,
+		};
+		const key = resolveRetryFallbackChainKey(keyed, live, sonnet);
+		expect(key).toBe("anthropic/claude-sonnet-5.5");
+		expect(findRetryFallbackCandidates(keyed, key!, live, sonnet).map(candidate => candidate.raw)).toEqual([
+			"openai/gpt-4o-mini",
+		]);
+
+		// A dotted entry naming the live model is the live model: never a candidate for itself.
+		const listed: RetryFallbackResolutionContext = {
+			chains: { default: ["anthropic/claude-sonnet-5.5", "openai/gpt-4o-mini"] },
+			getModelRole: () => undefined,
+			modelLookup: lookup,
+		};
+		expect(
+			findRetryFallbackCandidates(listed, "default", live, sonnet, { allowMissingPrimary: true }).map(
+				candidate => candidate.raw,
+			),
+		).toEqual(["openai/gpt-4o-mini"]);
+	});
+
+	it("keeps effort-routed wire ids distinct from their logical model", () => {
+		const mythos = buildModel({
+			id: "claude-mythos-9",
+			name: "claude-mythos-9",
+			api: "devin-agent",
+			provider: "devin",
+			baseUrl: "https://server.codeium.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 64_000,
+			requestModelId: "claude-mythos-9-medium",
+			thinking: {
+				mode: "effort",
+				efforts: [Effort.Medium, Effort.High],
+				effortRouting: { [Effort.Medium]: "claude-mythos-9-medium", [Effort.High]: "claude-mythos-9-high" },
+				requiresEffort: true,
+			},
+		});
+		const models = [mythos];
+		const lookup = {
+			find: (provider: string, id: string) => resolveProviderModelReference(provider, id, models),
+			hasProvider: (provider: string) => provider === "devin",
+		};
+		expect(lookup.find("devin", "claude-mythos-9-high")?.id).toBe("claude-mythos-9");
+
+		// An effort-downgrade chain keeps its lower tier as a fallback.
+		const downgrade: RetryFallbackResolutionContext = {
+			chains: { default: ["devin/claude-mythos-9-high", "devin/claude-mythos-9-medium"] },
+			getModelRole: () => undefined,
+			modelLookup: lookup,
+		};
+		expect(
+			findRetryFallbackCandidates(downgrade, "default", "devin/claude-mythos-9-high", mythos).map(
+				candidate => candidate.raw,
+			),
+		).toEqual(["devin/claude-mythos-9-medium"]);
+
+		// A key naming the high tier does not capture medium-effort turns.
+		const tierKey: RetryFallbackResolutionContext = {
+			chains: { "devin/claude-mythos-9-high": ["openai/gpt-4o-mini"], "devin/*": ["openai/gpt-4o-mini:high"] },
+			getModelRole: () => undefined,
+			modelLookup: lookup,
+		};
+		expect(resolveRetryFallbackChainKey(tierKey, "devin/claude-mythos-9:medium", mythos)).toBe("devin/*");
+	});
+
 	it("does not let a later shared-assignment role steal the default chain", () => {
-		const selector = "openrouter/google/gemini-2.5-flash";
+		const selector = "openrouter/google/gemini-3.5-flash";
 		const context = createContext(
 			{
 				vision: ["openai/gpt-4o-mini"],
-				default: ["google/gemini-2.5-flash"],
+				default: ["google/gemini-3.5-flash"],
 			},
 			{ default: selector, vision: selector },
 		);
@@ -103,51 +193,76 @@ describe("retry fallback selector resolution", () => {
 
 	it("stops a role chain when its primary assignment is removed at runtime", () => {
 		const context = createContext({
-			slow: ["google/gemini-2.5-flash", "openai/gpt-4o-mini"],
+			slow: ["google/gemini-3.5-flash", "openai/gpt-4o-mini"],
 		});
-		expect(findRetryFallbackCandidates(context, "slow", "google/gemini-2.5-flash")).toEqual([]);
+		expect(findRetryFallbackCandidates(context, "slow", "google/gemini-3.5-flash")).toEqual([]);
 	});
 
 	it("expands wildcard candidates from the current selector", () => {
-		const selector = "openrouter/google/gemini-2.5-flash";
+		const selector = "openrouter/google/gemini-3.5-flash";
 		const context = createContext({ "openrouter/google/*": ["google-vertex/*"] });
 		const candidates = findRetryFallbackCandidates(context, "openrouter/google/*", selector);
 		expect(candidates).toEqual([
 			{
-				raw: "google-vertex/gemini-2.5-flash",
+				raw: "google-vertex/gemini-3.5-flash",
 				provider: "google-vertex",
-				id: "gemini-2.5-flash",
+				id: "gemini-3.5-flash",
 				thinkingLevel: undefined,
 			},
 		]);
 	});
 
 	it("carries per-entry thinking levels while bare entries inherit", () => {
-		const context = createContext({ default: ["openai/gpt-4o-mini:low", "google/gemini-2.5-flash"] });
+		const context = createContext({ default: ["openai/gpt-4o-mini:low", "google/gemini-3.5-flash"] });
 		const candidates = findRetryFallbackCandidates(context, "default", "openai/gpt-4o-mini");
-		expect(candidates.map(candidate => candidate.raw)).toEqual(["openai/gpt-4o-mini:low", "google/gemini-2.5-flash"]);
+		expect(candidates.map(candidate => candidate.raw)).toEqual(["openai/gpt-4o-mini:low", "google/gemini-3.5-flash"]);
 		expect(candidates[0]?.thinkingLevel).toBe(ThinkingLevel.Low);
 		// Bare entries carry no level so the failing turn's effort applies at switch time.
 		expect(candidates[1]?.thinkingLevel).toBeUndefined();
 	});
 
+	it("keeps the auto sentinel on parsed selectors instead of collapsing it to no suffix", () => {
+		const context = createContext({ default: ["openai/gpt-4o-mini:auto", "google/gemini-3.5-flash"] });
+		expect(parseRetryFallbackSelector("openai/gpt-4o-mini:auto", context.modelLookup)?.thinkingLevel).toBe("auto");
+		expect(parseRetryFallbackSelector("openai/gpt-4o-mini", context.modelLookup)?.thinkingLevel).toBeUndefined();
+		expect(parseRetryFallbackSelector("openai/gpt-4o-mini:low", context.modelLookup)?.thinkingLevel).toBe(
+			ThinkingLevel.Low,
+		);
+		const candidates = findRetryFallbackCandidates(context, "default", "xai-oauth/grok-4.7:high");
+		expect(candidates.map(candidate => candidate.thinkingLevel)).toEqual(["auto", undefined]);
+	});
+
+	it("matches an auto-keyed primary at any effort without demoting it behind a fixed effort", () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model claude-sonnet-4-5");
+		const auto = "anthropic/claude-sonnet-4-5:auto";
+		const low = "anthropic/claude-sonnet-4-5:low";
+		const context = createContext({
+			[auto]: ["openai/gpt-4o-mini"],
+			[low]: ["google/gemini-3.5-flash"],
+		});
+		expect(resolveRetryFallbackChainKey(context, auto, model)).toBe(auto);
+		expect(resolveRetryFallbackChainKey(context, low, model)).toBe(low);
+		expect(resolveRetryFallbackChainKey(context, "anthropic/claude-sonnet-4-5:high", model)).toBe(auto);
+	});
+
 	it("inherits the default chain only for chat roles and preserves explicit empty kind chains", () => {
 		const defaultChain = ["openai/gpt-4o-mini"];
 		const expanded = expandDefaultRetryFallbackChains(
-			{ default: defaultChain, slow: ["google/gemini-2.5-flash"], judge: [] },
+			{ default: defaultChain, slow: ["google/gemini-3.5-flash"], judge: [] },
 			["default", "task", "slow", "judge", "image", "web"],
 		);
 		expect(expanded.task).toBe(defaultChain);
-		expect(expanded.slow).toEqual(["google/gemini-2.5-flash"]);
+		expect(expanded.slow).toEqual(["google/gemini-3.5-flash"]);
 		expect(expanded.judge).toEqual([]);
 		expect(expanded.image).toBeUndefined();
 		expect(expanded.web).toBeUndefined();
 	});
 
 	it("prefers an exact model+effort key over a different-effort key regardless of object order", () => {
-		const model = getBundledModel("google", "gemini-2.5-flash");
-		const low = "google/gemini-2.5-flash:low";
-		const max = "google/gemini-2.5-flash:max";
+		const model = getBundledModel("google", "gemini-3.5-flash");
+		const low = "google/gemini-3.5-flash:low";
+		const max = "google/gemini-3.5-flash:max";
 
 		const maxFirst = createContext({ [max]: ["openai/gpt-4o-mini:max"], [low]: ["openai/gpt-4o-mini:low"] });
 		expect(resolveRetryFallbackChainKey(maxFirst, low, model)).toBe(low);
@@ -160,9 +275,9 @@ describe("retry fallback selector resolution", () => {
 	});
 
 	it("lets a suffixless key match any effort but an exact effort key still wins", () => {
-		const model = getBundledModel("google", "gemini-2.5-flash");
-		const low = "google/gemini-2.5-flash:low";
-		const suffixless = "google/gemini-2.5-flash";
+		const model = getBundledModel("google", "gemini-3.5-flash");
+		const low = "google/gemini-3.5-flash:low";
+		const suffixless = "google/gemini-3.5-flash";
 
 		const baseOnly = createContext({ [suffixless]: ["openai/gpt-4o-mini"] });
 		expect(resolveRetryFallbackChainKey(baseOnly, low, model)).toBe(suffixless);
@@ -175,9 +290,9 @@ describe("retry fallback selector resolution", () => {
 	});
 
 	it("never escalates to a different-effort chain when no matching effort is configured", () => {
-		const model = getBundledModel("google", "gemini-2.5-flash");
-		const low = "google/gemini-2.5-flash:low";
-		const max = "google/gemini-2.5-flash:max";
+		const model = getBundledModel("google", "gemini-3.5-flash");
+		const low = "google/gemini-3.5-flash:low";
+		const max = "google/gemini-3.5-flash:max";
 
 		const maxOnly = createContext({ [max]: ["openai/gpt-4o-mini:max"] });
 		expect(resolveRetryFallbackChainKey(maxOnly, low, model)).toBeUndefined();
@@ -190,9 +305,9 @@ describe("retry fallback selector resolution", () => {
 	});
 
 	it("treats effort aliases as equivalent to their canonical form when matching keys", () => {
-		const model = getBundledModel("google", "gemini-2.5-flash");
-		const canonicalHigh = "google/gemini-2.5-flash:high";
-		const aliasKey = "google/gemini-2.5-flash:hi";
+		const model = getBundledModel("google", "gemini-3.5-flash");
+		const canonicalHigh = "google/gemini-3.5-flash:high";
+		const aliasKey = "google/gemini-3.5-flash:hi";
 
 		const context = createContext({ [aliasKey]: ["openai/gpt-4o-mini:high"] });
 		expect(resolveRetryFallbackChainKey(context, canonicalHigh, model)).toBe(aliasKey);
@@ -202,9 +317,9 @@ describe("retry fallback selector resolution", () => {
 	});
 
 	it("matches a requested effort key to the active model's clamped effort", () => {
-		const model = getBundledModel("google", "gemini-2.5-flash");
-		const high = "google/gemini-2.5-flash:high";
-		const max = "google/gemini-2.5-flash:max";
+		const model = getBundledModel("google", "gemini-3.5-flash");
+		const high = "google/gemini-3.5-flash:high";
+		const max = "google/gemini-3.5-flash:max";
 
 		const maxOnly = createContext({ [max]: ["openai/gpt-4o-mini:max"] });
 		expect(resolveRetryFallbackChainKey(maxOnly, high, model)).toBe(max);
@@ -220,18 +335,18 @@ describe("retry fallback selector resolution", () => {
 	});
 
 	it("uses the default chain when the live model matches no role primary (#12421)", () => {
-		const live = "openrouter/google/gemini-2.5-flash";
+		const live = "openrouter/google/gemini-3.5-flash";
 		const context = createContext(
 			{
-				default: ["openai/gpt-4o-mini", "google/gemini-2.5-flash"],
+				default: ["openai/gpt-4o-mini", "google/gemini-3.5-flash"],
 				slow: ["openai/gpt-4o-mini"],
 			},
-			{ default: "google/gemini-2.5-flash", slow: "openai/gpt-4o-mini" },
+			{ default: "google/gemini-3.5-flash", slow: "openai/gpt-4o-mini" },
 		);
 		expect(resolveRetryFallbackChainKey(context, live)).toBe("default");
 		// The effective chain leads with `default`'s primary, then the configured entries.
 		expect(findRetryFallbackCandidates(context, "default", live).map(candidate => candidate.raw)).toEqual([
-			"google/gemini-2.5-flash",
+			"google/gemini-3.5-flash",
 			"openai/gpt-4o-mini",
 		]);
 	});
@@ -258,6 +373,39 @@ describe("retry fallback selector resolution", () => {
 		// Model-selector keys stay effort-exact.
 		const modelKey = createContext({ [high]: ["openai/gpt-4o-mini"] });
 		expect(resolveRetryFallbackChainKey(modelKey, xhigh, model)).toBeUndefined();
+	});
+
+	it("does not adopt a model-kind role's chain for a chat session on the same model", () => {
+		const model = getBundledModel("google-antigravity", "gemini-3.8-flash");
+		const webModel = getBundledModel("web", "parallel");
+		if (!model || !webModel) throw new Error("Expected bundled Gemini and web-search test models");
+		const live = "google-antigravity/gemini-3.8-flash:medium";
+		const models = [model, webModel];
+		const roleModels: Record<string, string> = {
+			web: "google-antigravity/gemini-3.8-flash:minimal",
+			task: live,
+		};
+		const withWebChain = (chains: RetryFallbackResolutionContext["chains"]): RetryFallbackResolutionContext => ({
+			chains,
+			getModelRole: role => roleModels[role],
+			modelLookup: {
+				find: (provider, id) => models.find(m => m.provider === provider && m.id === id),
+				hasProvider: provider => models.some(m => m.provider === provider),
+			},
+		});
+
+		// `web` owns the live model at a different effort; its chain is search providers.
+		const webOnly = withWebChain({ web: ["web/parallel"] });
+		expect(resolveRetryFallbackChainKey(webOnly, live, model)).toBeUndefined();
+
+		// A matching chat role or `default` is still found past the kind role.
+		const withTask = withWebChain({ web: ["web/parallel"], task: ["google/gemini-3.5-flash"] });
+		expect(resolveRetryFallbackChainKey(withTask, live, model)).toBe("task");
+		const withDefault = withWebChain({ web: ["web/parallel"], default: ["google/gemini-3.5-flash"] });
+		expect(resolveRetryFallbackChainKey(withDefault, live, model)).toBe("default");
+
+		// A web-search caller names its role explicitly and keeps its own chain.
+		expect(resolveRetryFallbackChainKey(webOnly, live, model, "web")).toBe("web");
 	});
 });
 

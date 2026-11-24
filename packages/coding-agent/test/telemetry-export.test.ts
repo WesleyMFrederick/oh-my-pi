@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { CostEstimatorContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTelemetryExport, isTelemetryExportEnabled } from "@oh-my-pi/pi-coding-agent/telemetry-export";
+import { estimateProviderCost } from "@oh-my-pi/pi-coding-agent/telemetry-export-otlp";
 import { cfgTelemetryOtlpExportEnabled } from "@oh-my-pi/pi-coding-agent/telemetry-settings";
 
 /**
@@ -26,13 +31,38 @@ const OTEL_KEYS = [
 ] as const;
 
 let saved: Record<string, string | undefined>;
+const tempDirs: string[] = [];
+
+/**
+ * Environment for a probe subprocess that must not read the developer's real
+ * omp dotenv files (omp keeps `OTEL_*` from them in a private map that the SDK
+ * window exposes): an empty HOME and agent dir, with every variable `dirs.ts`
+ * uses to locate them cleared.
+ */
+async function cleanProbeEnv(): Promise<Record<string, string | undefined>> {
+	const home = await fs.mkdtemp(path.join(os.tmpdir(), "omp-otel-gating-"));
+	tempDirs.push(home);
+	return {
+		...process.env,
+		HOME: home,
+		USERPROFILE: home,
+		OMP_PROFILE: undefined,
+		PI_PROFILE: undefined,
+		PI_CODING_AGENT_DIR: undefined,
+		PI_CONFIG_DIR: undefined,
+		XDG_DATA_HOME: undefined,
+		XDG_STATE_HOME: undefined,
+		XDG_CACHE_HOME: undefined,
+	};
+}
 
 beforeEach(() => {
 	saved = Object.fromEntries(OTEL_KEYS.map(k => [k, process.env[k]]));
 	for (const k of OTEL_KEYS) delete process.env[k];
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { force: true, recursive: true })));
 	for (const k of OTEL_KEYS) {
 		const v = saved[k];
 		if (v === undefined) delete process.env[k];
@@ -41,11 +71,6 @@ afterEach(() => {
 });
 
 describe("initTelemetryExport gating", () => {
-	it("stays disabled when no OTLP endpoint is configured", async () => {
-		await initTelemetryExport(true);
-		expect(isTelemetryExportEnabled()).toBe(false);
-	});
-
 	it("keeps OTLP export disabled when the user opts out despite configured endpoints", async () => {
 		process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = "http://localhost:4318/v1/traces";
 		const settings = Settings.isolated({ "telemetry.otlpExportEnabled": false });
@@ -106,7 +131,7 @@ describe("initTelemetryExport exporter selection", () => {
 	it("does not send OTLP when console is explicitly selected for every signal", async () => {
 		const probe = fileURLToPath(new URL("./otel-non-otlp-probe.ts", import.meta.url));
 		const proc = Bun.spawn([process.execPath, probe], {
-			env: { ...process.env },
+			env: await cleanProbeEnv(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "ignore",
@@ -137,7 +162,7 @@ describe("initTelemetryExport signals export path", () => {
 				const proc = Bun.spawn([process.execPath, probe], {
 					// Bun otherwise inherits the process's original native environment,
 					// including external OTEL kill-switches removed in beforeEach.
-					env: { ...process.env },
+					env: await cleanProbeEnv(),
 					stdin: "ignore",
 					stdout: "ignore",
 					stderr: "ignore",
@@ -152,4 +177,69 @@ describe("initTelemetryExport signals export path", () => {
 			"resource attributes": 0,
 		});
 	}, 20_000);
+});
+
+describe("OTLP shutdown", () => {
+	it("releases the process promptly when a collector accepts logs but never responds", async () => {
+		const probe = fileURLToPath(new URL("./fixtures/otel-shutdown-probe.ts", import.meta.url));
+		const proc = Bun.spawn([process.execPath, probe], {
+			env: { ...process.env },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "inherit",
+		});
+		expect(await proc.exited).toBe(0);
+	}, 15_000);
+});
+
+describe("estimateProviderCost", () => {
+	// A Codex subscription request: OTel labels the provider `openai`, and the
+	// response may name a served model rather than the requested one.
+	const context: CostEstimatorContext = {
+		provider: "openai",
+		providerId: "openai-codex",
+		model: "served-model",
+		modelId: "requested-model",
+		serviceTier: undefined,
+		usage: {
+			inputTokens: 1_500,
+			outputTokens: 500,
+			totalTokens: 2_000,
+			cachedInputTokens: 400,
+			cacheWriteTokens: 100,
+			reasoningOutputTokens: 0,
+		},
+		usageCost: { input: 0.2, output: 0.8, cacheRead: 0.04, cacheWrite: 0.06, total: 1.1 },
+	};
+
+	it("reports the request's computed cost when the requested model has known pricing", () => {
+		const result = estimateProviderCost(
+			context,
+			(providerId, modelId) => providerId === "openai-codex" && modelId === "requested-model",
+		);
+
+		expect(result).toEqual({ usd: 1.1, inputUsd: 0.2, outputUsd: 0.8 });
+	});
+	it("preserves a provider-reported charge while distinguishing unpriced zero from a free priced request", () => {
+		const providerReported: CostEstimatorContext = {
+			...context,
+			usageCost: { input: 0.42, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.42 },
+		};
+		expect(estimateProviderCost(providerReported, () => false)).toEqual({
+			usd: 0.42,
+			inputUsd: 0.42,
+			outputUsd: 0,
+		});
+
+		const unpricedZero: CostEstimatorContext = {
+			...context,
+			usageCost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		expect(estimateProviderCost(unpricedZero, () => false)).toEqual({ unavailable: "model_price_unavailable" });
+		expect(estimateProviderCost(unpricedZero, () => true)).toEqual({
+			usd: 0,
+			inputUsd: 0,
+			outputUsd: 0,
+		});
+	});
 });

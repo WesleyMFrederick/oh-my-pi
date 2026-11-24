@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { buildSkillPromptMessage, renderSkillPromptMessage } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { dispatchRpcSkillPrompt, tryRunRpcSkillCommand } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import {
 	RpcExtensionUserMessageTracker,
@@ -9,6 +10,11 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-prompt-results";
 import { type CustomMessage, SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { removeWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+
+const skillPromptBuilder = {
+	buildUserSkillPrompt: buildSkillPromptMessage,
+	renderUserSkillPrompt: renderSkillPromptMessage,
+};
 
 describe("tryRunRpcSkillCommand", () => {
 	test("dispatches registered /skill commands as skill prompt messages", async () => {
@@ -24,6 +30,7 @@ describe("tryRunRpcSkillCommand", () => {
 
 		const handled = await tryRunRpcSkillCommand(
 			{
+				...skillPromptBuilder,
 				skillsSettings: { enableSkillCommands: true },
 				skills: [
 					{ name: "reviewer", description: "Review code", filePath: skillPath, baseDir: dir, source: "project" },
@@ -61,6 +68,7 @@ describe("tryRunRpcSkillCommand", () => {
 		try {
 			const handled = await tryRunRpcSkillCommand(
 				{
+					...skillPromptBuilder,
 					skillsSettings: { enableSkillCommands: true },
 					skills: [
 						{
@@ -88,9 +96,57 @@ describe("tryRunRpcSkillCommand", () => {
 		}
 	});
 
+	test("preserves attached images in skill prompt messages", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), `omp-rpc-skill-${Snowflake.next()}-`));
+		const skillPath = path.join(dir, "SKILL.md");
+		await Bun.write(
+			skillPath,
+			"---\nname: reviewer\ndescription: Review code\n---\n\nReview the supplied code carefully.\n",
+		);
+
+		let message: Pick<CustomMessage, "attribution" | "content" | "customType" | "details" | "display"> | undefined;
+		const image = { type: "image" as const, data: "fake-png", mimeType: "image/png" };
+
+		try {
+			const handled = await tryRunRpcSkillCommand(
+				{
+					...skillPromptBuilder,
+					skillsSettings: { enableSkillCommands: true },
+					skills: [
+						{
+							name: "reviewer",
+							description: "Review code",
+							filePath: skillPath,
+							baseDir: dir,
+							source: "project",
+						},
+					],
+					async promptCustomMessage(nextMessage) {
+						message = nextMessage;
+						return true;
+					},
+				},
+				"/skill:reviewer inspect screenshot",
+				"steer",
+				[image],
+			);
+
+			expect(handled).toEqual({ agentInvoked: true });
+			expect(message?.customType).toBe(SKILL_PROMPT_MESSAGE_TYPE);
+			expect(Array.isArray(message?.content)).toBe(true);
+			expect(message?.content).toEqual([
+				{ type: "text", text: expect.stringContaining("Review the supplied code carefully.") },
+				image,
+			]);
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
 	test("ignores unknown skill commands so normal prompt handling can continue", async () => {
 		const handled = await tryRunRpcSkillCommand(
 			{
+				...skillPromptBuilder,
 				skillsSettings: { enableSkillCommands: true },
 				skills: [],
 				async promptCustomMessage() {
@@ -115,6 +171,7 @@ describe("tryRunRpcSkillCommand", () => {
 		try {
 			const handled = await tryRunRpcSkillCommand(
 				{
+					...skillPromptBuilder,
 					skillsSettings: { enableSkillCommands: true },
 					skills: [
 						{
@@ -153,7 +210,7 @@ async function settleUntil(condition: () => boolean, timeoutMs = 5000): Promise<
 /** Prompt-result plumbing for an idle session; frames land in `frames`. */
 function promptResultsFor(id: string, frames: object[] = []) {
 	const results = new RpcPromptResults(
-		{ isStreaming: false, hasAdmittedSubmission: false, queuedMessageCount: 0, hasPendingAsyncWork: () => false },
+		{ isRunActive: false, isStreaming: false, hasAdmittedSubmission: false, queuedMessageCount: 0 },
 		frame => frames.push(frame),
 	);
 	return { ticket: results.begin(id), results };
@@ -173,6 +230,7 @@ describe("dispatchRpcSkillPrompt", () => {
 		const result = await dispatchRpcSkillPrompt({
 			...promptResultsFor("cmd-1"),
 			session: {
+				...skillPromptBuilder,
 				skillsSettings: { enableSkillCommands: true },
 				skills: [
 					{ name: "reviewer", description: "Review code", filePath: skillPath, baseDir: dir, source: "project" },
@@ -214,6 +272,7 @@ describe("dispatchRpcSkillPrompt", () => {
 		const resultPromise = dispatchRpcSkillPrompt({
 			...promptResultsFor("cmd-1b"),
 			session: {
+				...skillPromptBuilder,
 				skillsSettings: { enableSkillCommands: true },
 				skills: [
 					{ name: "reviewer", description: "Review code", filePath: skillPath, baseDir: dir, source: "project" },
@@ -252,6 +311,7 @@ describe("dispatchRpcSkillPrompt", () => {
 		const result = await dispatchRpcSkillPrompt({
 			...promptResultsFor("cmd-2"),
 			session: {
+				...skillPromptBuilder,
 				skillsSettings: { enableSkillCommands: true },
 				skills: [],
 				async promptCustomMessage() {
@@ -275,6 +335,7 @@ describe("dispatchRpcSkillPrompt", () => {
 		await dispatchRpcSkillPrompt({
 			...promptResultsFor("cmd-3"),
 			session: {
+				...skillPromptBuilder,
 				skillsSettings: { enableSkillCommands: true },
 				skills: [
 					{ name: "reviewer", description: "Review code", filePath: skillPath, baseDir: dir, source: "project" },
@@ -304,6 +365,7 @@ describe("dispatchRpcSkillPrompt", () => {
 			dispatchRpcSkillPrompt({
 				...promptResultsFor("cmd-4"),
 				session: {
+					...skillPromptBuilder,
 					skillsSettings: { enableSkillCommands: true },
 					skills: [
 						{
@@ -339,6 +401,7 @@ describe("dispatchRpcSkillPrompt", () => {
 		const result = await dispatchRpcSkillPrompt({
 			...promptResultsFor("cmd-5", frames),
 			session: {
+				...skillPromptBuilder,
 				skillsSettings: { enableSkillCommands: true },
 				skills: [
 					{ name: "reviewer", description: "Review code", filePath: skillPath, baseDir: dir, source: "project" },
@@ -362,5 +425,49 @@ describe("dispatchRpcSkillPrompt", () => {
 		]);
 
 		await removeWithRetries(dir);
+	});
+
+	test("forwards attached images to promptCustomMessage", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), `omp-rpc-skill-${Snowflake.next()}-`));
+		const skillPath = path.join(dir, "SKILL.md");
+		await Bun.write(skillPath, "---\nname: reviewer\ndescription: Review code\n---\n\nBody.\n");
+
+		let message: Pick<CustomMessage, "attribution" | "content" | "customType" | "details" | "display"> | undefined;
+		const image = { type: "image" as const, data: "fake-png", mimeType: "image/png" };
+
+		try {
+			const result = await dispatchRpcSkillPrompt({
+				...promptResultsFor("cmd-img"),
+				session: {
+					...skillPromptBuilder,
+					skillsSettings: { enableSkillCommands: true },
+					skills: [
+						{
+							name: "reviewer",
+							description: "Review code",
+							filePath: skillPath,
+							baseDir: dir,
+							source: "project",
+						},
+					],
+					async promptCustomMessage(nextMessage, options) {
+						message = nextMessage;
+						options?.onPromptAdmitted?.();
+						return true;
+					},
+				},
+				message: "/skill:reviewer go",
+				streamingBehavior: undefined,
+				onError: () => {},
+				extensionUserMessageTracker: new RpcExtensionUserMessageTracker(),
+				images: [image],
+			});
+
+			expect(result).toEqual({ agentInvoked: true });
+			expect(Array.isArray(message?.content)).toBe(true);
+			expect(message?.content).toEqual([{ type: "text", text: expect.stringContaining("Body.") }, image]);
+		} finally {
+			await removeWithRetries(dir);
+		}
 	});
 });

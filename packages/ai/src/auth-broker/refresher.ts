@@ -75,7 +75,12 @@ export class AuthBrokerRefresher {
 		};
 	}
 
-	/** Run one sweep. Exposed for tests. */
+	/**
+	 * Run one sweep. Exposed for tests.
+	 *
+	 * Never rejects: callers fire it unawaited from a timer, so a failed sweep
+	 * (e.g. an unreadable credential store) is logged and retried next interval.
+	 */
 	async tick(): Promise<void> {
 		if (this.#running) return;
 		this.#running = true;
@@ -94,6 +99,8 @@ export class AuthBrokerRefresher {
 				targets.push(entry.id);
 			}
 			await Promise.all(targets.map(id => this.#refreshOne(id)));
+		} catch (error) {
+			logger.warn("auth-broker refresh sweep failed", { error: String(error) });
 		} finally {
 			this.#running = false;
 			this.#nextSweepAt = this.#now() + this.#refreshIntervalMs;
@@ -105,7 +112,7 @@ export class AuthBrokerRefresher {
 			await this.#storage.oauth.refresh(id);
 		} catch (error) {
 			const errorMsg = String(error);
-			if (isDefinitiveOAuthFailure(errorMsg)) {
+			if (isDefinitiveOAuthFailure(error)) {
 				// AuthStorage.oauth.refresh already CAS-disabled the row
 				// (unless a peer/login rotated it first, in which case the live
 				// credential is intentionally kept). Nothing to do here but record it.

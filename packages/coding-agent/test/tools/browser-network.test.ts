@@ -43,6 +43,8 @@ function createHost() {
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: Settings.isolated({
+			// Managed Chromium, whether or not omp's WebKit engine is installed on this machine.
+			"browser.webkit": false,
 			"browser.enabled": true,
 			"browser.headless": true,
 			"browser.cmux": false,
@@ -57,6 +59,11 @@ function createHost() {
 function valueOf(result: { details?: unknown }): unknown {
 	return (result.details as { value?: unknown } | undefined)?.value;
 }
+
+/** Run code that leaves the page's CDP session unable to answer `Fetch.disable`. */
+const STALL_FETCH_DISABLE = `const client = page._client();
+const send = client.send.bind(client);
+client.send = (method, ...args) => (method === "Fetch.disable" ? Promise.withResolvers().promise : send(method, ...args));`;
 
 afterAll(async () => {
 	await releaseAllTabs({ kill: true });
@@ -227,5 +234,50 @@ return { body, seen };`,
 			}),
 		) as Array<{ failureText?: string }>;
 		expect(blocked.some(request => request.failureText === "blocked by allowed_domains")).toBe(true);
+	});
+
+	test("keeps a run's result when interception was never touched and cannot be reset", async () => {
+		const invoke = createHost();
+		await invoke({ action: "open", name: "untouched-interception", url: `${baseUrl}/` });
+		const result = valueOf(
+			await invoke({
+				action: "run",
+				name: "untouched-interception",
+				code: `${STALL_FETCH_DISABLE}
+return "done";`,
+			}),
+		);
+		expect(result).toBe("done");
+	});
+
+	test("keeps a completed run's result when its interception cannot be reset", async () => {
+		const invoke = createHost();
+		await invoke({ action: "open", name: "stuck-interception", url: `${baseUrl}/` });
+		const completed = await invoke({
+			action: "run",
+			name: "stuck-interception",
+			code: `await page.setRequestInterception(true);
+${STALL_FETCH_DISABLE}
+return "done";`,
+		});
+		expect(valueOf(completed)).toBe("done");
+		// The result arrives with the reattach and what it reset, not in place of them.
+		const notes = completed.content.flatMap(block => (block.type === "text" ? [block.text] : []));
+		expect(
+			notes.some(
+				note =>
+					note.includes("interception could not be reset after this run") &&
+					note.includes("reattached to a new worker") &&
+					note.includes("tab.route routes"),
+			),
+		).toBe(true);
+		const next = valueOf(
+			await invoke({
+				action: "run",
+				name: "stuck-interception",
+				code: `return await tab.evaluate(async url => await (await fetch(url)).json(), ${JSON.stringify(`${baseUrl}/api`)})`,
+			}),
+		);
+		expect(next).toEqual({ source: "fixture" });
 	});
 });

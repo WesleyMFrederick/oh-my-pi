@@ -1,36 +1,53 @@
 /**
- * `/wt` backing: fork the current checkout into a fresh linked git worktree on
- * a new branch, carrying the uncommitted changes along, so the session can be
- * relocated there without disturbing the original checkout.
- *
- * The worktree is created through the clone-first path (`worktree.clone`,
- * `isolation.backend`) and lands under the agent-managed worktree base
- * (`worktree.base`, default `~/.omp/wt`) next to `github pr_checkout` trees,
- * so `omp worktree list|clear` sees it. The repository's `post-checkout` hook
- * then runs in it, as `git worktree add` would run it.
+ * Session relocation and exit policy for worktrees created by `/wt`. After
+ * creation the repository's `post-checkout` hook runs in the new worktree, as
+ * `git worktree add` would run it.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { IsoBackendKind } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { getWorktreeDir, hashPath, logger } from "@oh-my-pi/pi-utils";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { logger } from "@oh-my-pi/pi-utils";
+import type { SettingValueOf } from "../config/registry";
 import type { Settings } from "../config/settings";
-import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
-import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
+import { cfgWorktreeCleanSource, type cfgWorktreeOnExit } from "../task/settings";
+import { formatIsolationBackend } from "../task/worktree";
+import type { SessionWorktree } from "../worktree/backend";
+import { creationBackend, worktreeBackend, worktreeOrigin } from "../worktree/worktrees";
 
-import { cfgIsolationBackend, cfgWorktreeCleanSource, cfgWorktreeClone } from "../task/settings";
+/** State of a session-owned worktree at exit. */
+export interface SessionWorktreeState {
+	/** Worktree has uncommitted or untracked changes. */
+	dirty: boolean;
+	/** Branch tip moved off `baseCommit`; the branch is kept on removal. */
+	moved: boolean;
+	/** Worktree `HEAD` is not the branch tip, so its commits may be on no branch. */
+	offBranch: boolean;
+}
 
-export interface SessionWorktree {
-	/** Absolute, realpath'd worktree root. */
-	path: string;
-	/** Branch checked out in the worktree (created from the source `HEAD`). */
-	branch: string;
-	/** Backend that cloned the checkout, or undefined for a plain checkout. */
-	clonedWith?: IsoBackendKind;
-	/** Why the clone fell back to a plain checkout, when it did. */
-	cloneError?: string;
-	/** Why the repository's `post-checkout` hook failed, when it did. */
-	hookError?: string;
+/** `worktree.onExit` policy for worktrees this launch created. */
+export type WorktreeExitPolicy = SettingValueOf<typeof cfgWorktreeOnExit>;
+
+/** What to do with a session-owned worktree when the session exits. */
+export type WorktreeExitAction = "keep" | "remove" | "prompt";
+
+/**
+ * Map the `worktree.onExit` policy and the worktree's state to an exit action.
+ * `remove` only removes worktrees with nothing to lose; `force` removes every
+ * worktree; anything else prompts.
+ */
+export function decideWorktreeExit(policy: WorktreeExitPolicy, state: SessionWorktreeState): WorktreeExitAction {
+	if (policy === "keep") return "keep";
+	if (policy === "force") return "remove";
+	if (policy === "remove" && !state.dirty && !state.moved && !state.offBranch) return "remove";
+	return "prompt";
+}
+
+/** Reports whether `cwd` is a primary Git checkout with commits, not an existing worktree. */
+export async function canAutoCreateWorktree(cwd: string, settings?: Settings): Promise<boolean> {
+	const repository = vcs.git(cwd);
+	if (!repository || (await worktreeOrigin(cwd, settings))) return false;
+	return Boolean(await repository.headSha());
 }
 
 /** Default `/wt` branch name: `wt/<yyyymmdd-hhmmss>`. */
@@ -39,66 +56,21 @@ export function defaultSessionWorktreeBranch(now = new Date()): string {
 	return `wt/${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 }
 
-/** Outcome of {@link runPostCheckoutHook}. `output` is empty when streamed. */
-export interface PostCheckoutHookResult {
-	exitCode: number;
-	output: string;
-}
-
-/**
- * Run the repository's `post-checkout` hook in a freshly added worktree the way
- * `git worktree add` does: in the worktree, with `<null-oid> <head> 1`. The
- * native `worktreeAdd` checks out without git, so repo setup hooks would
- * otherwise never fire for `/wt` or `omp worktree add`.
- *
- * A missing hook is a no-op. `output: "stderr"` streams hook output to stderr
- * (git sends hook stdout there too); `"capture"` returns it. Never throws: a
- * spawn failure returns exit code 127 with the error as output.
- */
-export async function runPostCheckoutHook(
-	worktreePath: string,
-	head: string,
-	output: "capture" | "stderr",
-): Promise<PostCheckoutHookResult> {
-	const nullOid = "0".repeat(head.length);
-	const argv = [
-		"git",
-		"-C",
-		worktreePath,
-		"hook",
-		"run",
-		"--ignore-missing",
-		"post-checkout",
-		"--",
-		nullOid,
-		head,
-		"1",
-	];
-	try {
-		if (output === "stderr") {
-			const child = Bun.spawn(argv, { stdin: "ignore", stdout: 2, stderr: "inherit" });
-			return { exitCode: await child.exited, output: "" };
-		}
-		const child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-			child.exited,
-		]);
-		return { exitCode, output: stdout + stderr };
-	} catch (err) {
-		return { exitCode: 127, output: err instanceof Error ? err.message : String(err) };
-	}
-}
-
 /** One-line confirmation shown after the session moved into `worktree`. */
 export function formatSessionWorktreeSummary(worktree: SessionWorktree, sourceCleaned = false): string {
+	const changeStatus = !worktree.keptChanges
+		? "started from clean HEAD"
+		: sourceCleaned
+			? "uncommitted changes moved, source checkout cleaned"
+			: "uncommitted changes carried over";
+	const where = `Moved to worktree ${worktree.path} on branch ${worktree.branch}`;
+	if (worktree.ovnfs) {
+		const { checkout } = worktree.ovnfs;
+		return `${where} (ovnfs checkout ${checkout}, ${changeStatus}; \`ovnfs land ${checkout}\` lands its commits).`;
+	}
 	const how =
 		worktree.clonedWith === undefined ? "checked out" : `cloned via ${formatIsolationBackend(worktree.clonedWith)}`;
-	const changeStatus = sourceCleaned
-		? "uncommitted changes moved, source checkout cleaned"
-		: "uncommitted changes carried over";
-	return `Moved to worktree ${worktree.path} on branch ${worktree.branch} (${how}, ${changeStatus}).`;
+	return `${where} (${how}, ${changeStatus}).`;
 }
 
 /**
@@ -126,10 +98,18 @@ export async function cleanSourceCheckoutIfConfigured(
 	}
 }
 /**
- * Create the worktree for `/wt`. Throws with a user-facing message when `cwd`
- * is not a git checkout, `branch` already exists, or git refuses.
+ * Create the worktree for `/wt`: an ovnfs checkout when `isolation.backend` is
+ * auto and ovnfs is found, else a linked git worktree. Throws with a
+ * user-facing message when `cwd` is not a git checkout, `branch` already
+ * exists, the checkout name is taken, or git or ovnfs refuses.
  */
-export async function createSessionWorktree(cwd: string, settings: Settings, branch: string): Promise<SessionWorktree> {
+export async function createSessionWorktree(
+	cwd: string,
+	settings: Settings,
+	branch: string,
+	options: { keepChanges?: boolean } = {},
+): Promise<SessionWorktree> {
+	const keepChanges = options.keepChanges ?? true;
 	try {
 		await settings.flush();
 	} catch (err) {
@@ -146,28 +126,172 @@ export async function createSessionWorktree(cwd: string, settings: Settings, bra
 	if (await repository.refExists(branchRef)) {
 		throw new Error(`Branch '${branch}' already exists; pick another name.`);
 	}
-	const primaryRoot = repository.primaryRoot() ?? repository.info().repoRoot;
-	const slug = branch.replaceAll(/[^A-Za-z0-9._-]+/g, "-");
-	const basePath = getWorktreeDir(`${slug}-${hashPath(primaryRoot)}`);
-	const worktreePath = await resolveAvailableWorktreePath(basePath, await repository.worktrees());
-	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-
-	await repository.createBranch(branch, "HEAD", false);
-	const result = await repository.worktreeAdd(worktreePath, branch, {
-		detach: false,
-		clone: cfgWorktreeClone.get(settings),
-		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
-		keepChanges: true,
-	});
-	const resolvedPath = await fs.realpath(worktreePath);
-	const head = (await repository.commitDetails(branch)).sha;
-	const hook = await runPostCheckoutHook(resolvedPath, head, "capture");
-	const hookOutput = hook.output.trim().split("\n").slice(-5).join("\n");
-	return {
-		path: resolvedPath,
+	const baseCommit = await repository.headSha();
+	if (!baseCommit) {
+		throw new Error(`Cannot create a worktree: ${cwd} has no commits.`);
+	}
+	const worktree = await creationBackend(settings).create({
+		repository,
+		settings,
 		branch,
-		clonedWith: result.clonedWith ?? undefined,
-		cloneError: result.cloneError ?? undefined,
-		hookError: hook.exitCode === 0 ? undefined : `post-checkout hook exited ${hook.exitCode}: ${hookOutput}`,
+		sourceCwd: cwd,
+		baseCommit,
+		keptChanges: keepChanges,
+	});
+	const hook = await vcs.runPostCheckoutHook(worktree.path, baseCommit);
+	if (hook.exitCode === 0) return worktree;
+	const decoder = new TextDecoder();
+	const hookOutput = (decoder.decode(hook.stdout) + decoder.decode(hook.stderr))
+		.trim()
+		.split("\n")
+		.slice(-5)
+		.join("\n");
+	return { ...worktree, hookError: `post-checkout hook exited ${hook.exitCode}: ${hookOutput}` };
+}
+
+/** State of `wt` plus a fingerprint that changes whenever any file, ref, or `HEAD` in it changes. */
+interface WorktreeSnapshot {
+	state: SessionWorktreeState;
+	fingerprint: string;
+	/** Worktree directory still exists as a git checkout. */
+	present: boolean;
+}
+
+async function snapshotSessionWorktree(wt: SessionWorktree): Promise<WorktreeSnapshot> {
+	const { checkout: worktreeRepo, branchRepo, missingBranchRepoMeansMoved } = await worktreeBackend(wt).inspect(wt);
+	let moved = missingBranchRepoMeansMoved;
+	let tip: string | null | undefined;
+	if (branchRepo) {
+		tip = await branchRepo.resolveRef(`refs/heads/${wt.branch}`);
+		moved = tip !== null && tip !== undefined && tip !== wt.baseCommit;
+	}
+	if (!worktreeRepo) {
+		return { state: { dirty: false, moved, offBranch: false }, fingerprint: `missing\0${tip ?? ""}`, present: false };
+	}
+	const status = await worktreeRepo.statusPorcelain({ untracked: "all", nulTerminated: true });
+	const head = await worktreeRepo.headSha();
+	// Porcelain codes do not change when an already-modified file is edited again,
+	// so fold in each changed path's size and mtime.
+	const parts = [head ?? "", tip ?? "", status];
+	const entries = status.split("\0");
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i];
+		if (entry.length < 4) continue;
+		// Renames and copies are followed by their source path as a separate entry.
+		if (entry[0] === "R" || entry[0] === "C") i++;
+		const file = entry.slice(3);
+		const stat = await fs.stat(path.join(wt.path, file)).catch(() => undefined);
+		parts.push(stat ? `${file}:${stat.size}:${stat.mtimeMs}` : `${file}:-`);
+	}
+	return {
+		state: { dirty: status.length > 0, moved, offBranch: Boolean(head) && head !== tip },
+		fingerprint: Bun.hash(parts.join("\0")).toString(16),
+		present: true,
 	};
+}
+
+/**
+ * Gets the state of `wt`. A missing worktree is not dirty and not off-branch; a
+ * deleted branch has not moved; a missing source repo counts as moved so the
+ * branch is never deleted; a missing ovnfs checkout took its branch along, so
+ * it has not moved. Throws when the daemon serving an ovnfs checkout cannot start.
+ */
+export async function inspectSessionWorktree(wt: SessionWorktree): Promise<SessionWorktreeState> {
+	return (await snapshotSessionWorktree(wt)).state;
+}
+
+/** Describes what removing a worktree in `state` would lose, for the exit prompt. */
+function describeWorktreeRisk(wt: SessionWorktree, state: SessionWorktreeState): string {
+	const issues: string[] = [];
+	if (state.dirty) issues.push("has uncommitted changes");
+	if (state.moved) issues.push("has new commits (branch is kept)");
+	if (state.offBranch) issues.push(`HEAD is not on ${wt.branch}; commits only reachable from HEAD are lost`);
+	return issues.join("; ");
+}
+
+/** A worktree chosen for removal at exit. */
+export interface WorktreeExitPlan {
+	worktree: SessionWorktree;
+	/**
+	 * Snapshot fingerprint at the time removal was decided or approved; the
+	 * worktree is kept if it changed since. Absent under `force`: removed regardless.
+	 */
+	approvedFingerprint?: string;
+}
+
+/**
+ * Applies `policy` to `owned` and returns the worktrees to remove, newest first.
+ * Calls `confirm` for each worktree that needs a prompt; inspection errors go to
+ * `warn` and keep that worktree.
+ */
+export async function planWorktreeExit(
+	owned: readonly SessionWorktree[],
+	policy: WorktreeExitPolicy,
+	confirm: (title: string, message: string) => Promise<boolean>,
+	warn: (message: string) => void,
+): Promise<WorktreeExitPlan[]> {
+	if (policy === "keep") return [];
+	const plan: WorktreeExitPlan[] = [];
+	// Newest first: a `/wt` worktree may have been forked from an older owned one.
+	for (const worktree of owned.toReversed()) {
+		try {
+			const { state, fingerprint } = await snapshotSessionWorktree(worktree);
+			const action = decideWorktreeExit(policy, state);
+			if (action === "keep") continue;
+			if (action === "remove") {
+				plan.push(policy === "force" ? { worktree } : { worktree, approvedFingerprint: fingerprint });
+				continue;
+			}
+			const risk = describeWorktreeRisk(worktree, state);
+			const message = `${shortenPath(worktree.path)} (${worktree.branch})${risk ? `: ${risk}` : ""}`;
+			if (await confirm("Remove worktree?", message)) plan.push({ worktree, approvedFingerprint: fingerprint });
+		} catch (err) {
+			warn(err instanceof Error ? err.message : String(err));
+		}
+	}
+	return plan;
+}
+
+/**
+ * Removes the planned worktrees in order, keeping any with an `approvedFingerprint`
+ * that changed at all since removal was decided or approved. Returns one message
+ * per kept or failed worktree, plus a resume note when the worktree holding the
+ * process cwd is removed.
+ */
+export async function removeExitWorktrees(plan: readonly WorktreeExitPlan[]): Promise<string[]> {
+	const messages: string[] = [];
+	for (const { worktree, approvedFingerprint } of plan) {
+		try {
+			const { state, fingerprint, present } = await snapshotSessionWorktree(worktree);
+			// A vanished worktree holds nothing to lose; `state.moved` still guards the branch.
+			if (present && approvedFingerprint !== undefined && fingerprint !== approvedFingerprint) {
+				messages.push(`Kept worktree ${shortenPath(worktree.path)}: it changed while the session was closing.`);
+				continue;
+			}
+			// Git cannot open the source repo while our cwd is the deleted worktree.
+			const rel = path.relative(worktree.path, process.cwd());
+			const holdsCwd = !rel.startsWith("..") && !path.isAbsolute(rel);
+			if (holdsCwd) process.chdir(worktree.sourceCwd);
+			await removeSessionWorktree(worktree, state.moved);
+			if (holdsCwd) {
+				const commits = state.moved ? `; its commits are on branch ${worktree.branch}` : "";
+				messages.push(
+					`Removed worktree ${shortenPath(worktree.path)}. Resuming opens in the directory you launch omp from${commits}.`,
+				);
+			}
+		} catch (err) {
+			messages.push(err instanceof Error ? err.message : String(err));
+		}
+	}
+	return messages;
+}
+
+/**
+ * Force-remove `wt`; also delete its branch unless it `moved` (has new commits).
+ * An ovnfs checkout's moved branch is first copied into the source repo, where
+ * it is kept. Throws a user-facing error when git or ovnfs refuses a step; the
+ * checkout then stays.
+ */
+export async function removeSessionWorktree(wt: SessionWorktree, moved: boolean): Promise<void> {
+	await worktreeBackend(wt).remove(wt, moved);
 }

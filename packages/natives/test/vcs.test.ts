@@ -32,6 +32,9 @@ async function repository() {
 	await git(root, "init", "-b", "main");
 	await git(root, "config", "user.name", "Native Test");
 	await git(root, "config", "user.email", "native@example.test");
+	// Assertions compare exact LF bytes; Git for Windows' system
+	// `core.autocrlf=true` would check files out as CRLF.
+	await git(root, "config", "core.autocrlf", "false");
 	await writeFile(join(root, "tracked.txt"), "one\ntwo\n");
 	await git(root, "add", "tracked.txt");
 	await git(root, "commit", "-m", "initial");
@@ -156,6 +159,13 @@ describe("in-process VCS bindings", () => {
 		controller.abort();
 
 		await expect(pending).rejects.toMatchObject({ name: "VcsError", code: "Canceled" });
+	});
+
+	test("rejects quoted path escapes git would not apply", async () => {
+		const root = await repository();
+		const repo = vcsGitDiscover(root)!;
+		const patch = ['diff --git "a/\\777.txt" "b/\\777.txt"', "old mode 100644", "new mode 100755", ""].join("\n");
+		await expect(repo.applyPatch(patch, {})).rejects.toThrow(/invalid octal escape/);
 	});
 });
 

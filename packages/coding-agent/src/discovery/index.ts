@@ -23,6 +23,7 @@ import "../capability/tool";
 import "./agent-plugins";
 import "./agents-md";
 import "./claude-md";
+import "./custom-context-files";
 import "./builtin";
 import "./builtin-defaults";
 import "./claude";
@@ -38,6 +39,7 @@ import "./mcp-json";
 import "./omp-plugins";
 import "./skillshare";
 import "./ssh";
+import "./ssh-config";
 import "./vscode";
 import "./windsurf";
 

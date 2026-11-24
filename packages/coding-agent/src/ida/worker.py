@@ -1,27 +1,65 @@
-"""omp IDA worker: drives one idalib database over an NDJSON stdin/stdout protocol.
+"""omp IDA worker: drives one idalib database over an NDJSON socket protocol.
+
+Launched as `worker.py --socket PATH` (Unix socket) or `worker.py --port-file PATH` (loopback TCP;
+the bound port is written to PATH). The omp daemon connects, sends `{"token": $OMP_DISASM_WORKER_TOKEN}`
+as its first line, then speaks:
 
 Request:  {"id": int, "method": str, "params": dict}
 Response: {"id", "ok": true, "result"} | {"id", "ok": false, "error": {"type", "message"}}
+
+A dropped connection does not close the database: the daemon reconnects after a restart. With no
+connection for `_ORPHAN_S` the worker saves and exits.
 """
 
+import _thread
 import ast
 import io
 import json
 import os
+import queue
 import re
 import signal
+import socket
 import sys
+import threading
+import time
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 
-# Keep a private handle on the real stdout for protocol frames, then point fd 1 at stderr so
-# kernel messages and stray prints can never corrupt the NDJSON stream.
-_proto = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
-os.dup2(2, 1)
-try:
-    sys.stdin.reconfigure(encoding="utf-8")
-except (AttributeError, ValueError):
-    pass
+
+def _listen():
+    """Bind the protocol listener before the slow idalib import so the daemon can connect at once."""
+    args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "--socket":
+        try:
+            os.unlink(args[1])
+        except FileNotFoundError:
+            pass
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(args[1])
+        sock.listen(4)
+        return sock
+    if len(args) == 2 and args[0] == "--port-file":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(4)
+        tmp = args[1] + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(sock.getsockname()[1]))
+        os.replace(tmp, args[1])
+        return sock
+    raise SystemExit("usage: worker.py --socket PATH | --port-file PATH")
+
+
+_TOKEN = os.environ.pop("OMP_DISASM_WORKER_TOKEN", "")
+_listener = _listen()
+# Set by SIGTERM: the main loop saves and exits once the running request (if any) finishes.
+_terminate = False
+
+
+def _on_sigterm(signum, frame):
+    global _terminate
+    _terminate = True
 
 import idapro  # noqa: E402,F401  (loads libidalib before any ida_* module)
 
@@ -32,10 +70,10 @@ def _arm_sigint():
     # supervisor's timeout/abort SIGINT raises KeyboardInterrupt instead of killing the worker.
     if signal.getsignal(signal.SIGINT) is not signal.default_int_handler:
         signal.signal(signal.SIGINT, signal.default_int_handler)
-    # The broker stops the host's whole process group; the host saves and closes this worker,
-    # so a group SIGTERM must not kill it mid-save.
-    if signal.getsignal(signal.SIGTERM) is not signal.SIG_IGN:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    # SIGTERM must not kill the worker mid-request or mid-save: it only asks the main loop to
+    # save and exit at the next request boundary.
+    if signal.getsignal(signal.SIGTERM) is not _on_sigterm:
+        signal.signal(signal.SIGTERM, _on_sigterm)
 
 
 _arm_sigint()
@@ -50,6 +88,7 @@ import ida_lines  # noqa: E402
 import ida_loader  # noqa: E402
 import ida_nalt  # noqa: E402
 import ida_name  # noqa: E402
+import ida_pro  # noqa: E402
 import ida_segment  # noqa: E402
 import ida_typeinf  # noqa: E402
 import ida_ua  # noqa: E402
@@ -79,6 +118,52 @@ _NS_MODULES = (
     ida_loader,
     idautils,
 )
+# IDA 9.5 deprecated the func_t/segment_t pointer APIs (the first call of each prints a
+# DeprecationWarning into exec output) for ea-based ones that older IDA lacks; bind once here.
+if ida_pro.IDA_SDK_VERSION >= 950:
+    _Func = ida_funcs.func_entry_info_t
+
+    def _get_func(ea):
+        info = _Func()
+        return info if ida_funcs.get_func_entry_info(info, ea) else None
+
+    def _getn_func(n):
+        info = _Func()
+        return info if ida_funcs.get_func_entry_info_by_num(info, n) else None
+
+    _set_func_cmt = ida_funcs.set_func_cmt_ea
+
+    def _segments():
+        """(name, start_ea, end_ea, perm, class) per segment."""
+        info = ida_segment.segment_info_t()
+        for n in range(ida_segment.get_segm_qty()):
+            if ida_segment.get_segment_info_by_num(info, n):
+                ea = info.start_ea
+                yield (
+                    ida_segment.get_segment_name(ea),
+                    ea,
+                    info.end_ea,
+                    info.get_perm(),
+                    ida_segment.get_segment_class(ea),
+                )
+
+else:
+    _Func = ida_funcs.func_t
+    _get_func = ida_funcs.get_func
+    _getn_func = ida_funcs.getn_func
+
+    def _set_func_cmt(ea, cmt, repeatable):
+        f = ida_funcs.get_func(ea)
+        return f is not None and ida_funcs.set_func_cmt(f, cmt, repeatable)
+
+    def _segments():
+        """(name, start_ea, end_ea, perm, class) per segment."""
+        for n in range(ida_segment.get_segm_qty()):
+            s = ida_segment.getnseg(n)
+            if s is not None:
+                yield ida_segment.get_segm_name(s), s.start_ea, s.end_ea, s.perm, ida_segment.get_segm_class(s)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +223,11 @@ def resolve(t):
 
 
 def func(t):
-    """Return the ida_funcs.func_t containing the target."""
-    if isinstance(t, ida_funcs.func_t):
+    """The function containing the target (start_ea, end_ea, size()): func_entry_info_t on IDA 9.5+, func_t before."""
+    if isinstance(t, _Func):
         return t
     ea = resolve(t)
-    f = ida_funcs.get_func(ea)
+    f = _get_func(ea)
     if f is None:
         raise LookupError(f"no function at 0x{ea:x}")
     return f
@@ -177,7 +262,7 @@ def pseudocode(t):
     f = func(t)
     header = f"// {ida_funcs.get_func_name(f.start_ea)} @ 0x{f.start_ea:x}-0x{f.end_ea:x}"
     try:
-        body = _db().pseudocode.decompile(f).to_text()
+        body = _db().pseudocode.decompile(f.start_ea).to_text()
     except Exception as e:
         _arm_sigint()
         return _text([header, f"// decompilation failed: {e}; showing disassembly", *_asm_lines(f)])
@@ -192,7 +277,7 @@ def _xrefs_to(ea):
 
 def _xrefs_from(t):
     ea = resolve(t)
-    f = ida_funcs.get_func(ea)
+    f = _get_func(ea)
     sources = idautils.FuncItems(f.start_ea) if f is not None and f.start_ea == ea else (ea,)
     db = _db()
     for src in sources:
@@ -223,7 +308,7 @@ def callers(t):
 
 def _callee_name(x, own):
     if x.is_code:
-        target = ida_funcs.get_func(x.to_ea)
+        target = _get_func(x.to_ea)
         if target is None:
             return name_of(x.to_ea) if x.is_call else None
         if target.start_ea == own.start_ea or (not x.is_call and target.start_ea != x.to_ea):
@@ -243,7 +328,8 @@ def callees(t):
 
 
 def _funcs():
-    return _db().functions.get_all()
+    _db()
+    return (f for f in map(_getn_func, range(ida_funcs.get_func_qty())) if f is not None)
 
 
 def functions(pattern=None):
@@ -313,9 +399,9 @@ def comment(t, text, repeatable=False):
     rpt = bool(repeatable)
     if not ida_bytes.set_cmt(ea, text, rpt):
         raise ValueError(f"comment failed at 0x{ea:x}")
-    f = ida_funcs.get_func(ea)
+    f = _get_func(ea)
     if f is not None and f.start_ea == ea:
-        ida_funcs.set_func_cmt(f, text, rpt)
+        _set_func_cmt(ea, text, rpt)
     return {"ea": _hex(ea)}
 
 
@@ -395,8 +481,8 @@ _HELPERS = (
 # ---------------------------------------------------------------------------
 
 
-def _perm(seg):
-    return "".join(c if seg.perm & bit else "-" for c, bit in (("r", 4), ("w", 2), ("x", 1)))
+def _perm(perm):
+    return "".join(c if perm & bit else "-" for c, bit in (("r", 4), ("w", 2), ("x", 1)))
 
 
 # Neutral names for processor modules whose ids leak the backend.
@@ -405,7 +491,7 @@ _ARCH_NAMES = {"metapc": "x86"}
 
 def _view_overview():
     db = _db()
-    segs = list(db.segments.get_all())
+    segs = list(_segments())
     entries = list(db.entries.get_all())
     funcs = list(_funcs())
     n_imports = sum(1 for _ in db.imports.get_all_imports())
@@ -416,10 +502,8 @@ def _view_overview():
         f"md5 {db.md5} sha256 {db.sha256}",
         f"segments ({len(segs)}):",
     ]
-    for s in segs:
-        lines.append(
-            f"  {ida_segment.get_segm_name(s)} 0x{s.start_ea:x}-0x{s.end_ea:x} {_perm(s)} {ida_segment.get_segm_class(s)}"
-        )
+    for name, start, end, perm, sclass in segs:
+        lines.append(f"  {name} 0x{start:x}-0x{end:x} {_perm(perm)} {sclass}")
     lines.append(f"entry points ({len(entries)}):")
     for e in entries[:_OVERVIEW_ENTRY_LIMIT]:
         lines.append(f"  0x{e.address:x} {e.name}")
@@ -562,6 +646,10 @@ def _rpc_open(params):
     NS.update({"__name__": "__ida_exec__", "__builtins__": __builtins__, "db": DB, "ida_domain": ida_domain})
     NS.update({m.__name__: m for m in _NS_MODULES})
     NS.update({h.__name__: h for h in _HELPERS})
+    return _open_info()
+
+
+def _open_info():
     return {
         "idb": _idb_path(),
         "module": DB.module,
@@ -569,6 +657,13 @@ def _rpc_open(params):
         "arch": DB.architecture,
         "bitness": DB.bitness,
     }
+
+
+def _rpc_status(params):
+    # Queued behind any running request, so a reconnecting daemon sees the finished open.
+    if DB is None:
+        return {"open": False}
+    return {"open": True, **_open_info()}
 
 
 def _rpc_view(params):
@@ -643,6 +738,7 @@ _METHODS = {
     "set_type": _rpc_set_type,
     "make_function": _rpc_make_function,
     "save": _rpc_save,
+    "status": _rpc_status,
 }
 
 
@@ -657,15 +753,133 @@ def _error(e):
 
 
 def _send(frame):
-    data = json.dumps(frame, ensure_ascii=False, default=str) + "\n"
-    # Defer SIGINT while writing so a late interrupt cannot truncate a frame; it is
-    # delivered after unblocking and swallowed by the idle loop.
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    data = (json.dumps(frame, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+    with _conn_lock:
+        conn = _conn
+        if conn is None:
+            # The daemon is gone; after it reconnects it asks `status` instead.
+            return
+        if _WINDOWS:
+            _sendall(conn, data)
+            return
+        # Defer SIGINT while writing so a late interrupt cannot truncate a frame; it is
+        # delivered after unblocking and swallowed by the idle loop.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        try:
+            _sendall(conn, data)
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
+
+def _sendall(conn, data):
     try:
-        _proto.write(data)
-        _proto.flush()
-    finally:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+        conn.sendall(data)
+    except OSError:
+        traceback.print_exc()
+
+
+# Windows cannot deliver SIGINT to one child process (kill terminates it), so the daemon writes
+# `{"interrupt": <id>}` to the socket instead. The connection's reader thread schedules
+# KeyboardInterrupt in the main thread (at most once) while that request runs. Scheduling is
+# asynchronous, so `_run` absorbs a pending interrupt before the response is written: it can
+# never truncate a frame or hit the next request.
+_WINDOWS = sys.platform == "win32"
+# How long `_run` spins for a scheduled interrupt the request's own code already swallowed.
+_INTERRUPT_ABSORB_S = 0.5
+# How long the worker keeps its database open with no daemon connected before it saves and exits.
+_ORPHAN_S = 600.0
+_requests = queue.Queue()
+_running_lock = threading.Lock()
+_running_id = None
+_interrupt_pending = False
+_conn_lock = threading.Lock()
+_conn = None
+_disconnected_at = time.monotonic()
+
+
+def _accept_connections():
+    """Serve one daemon connection at a time; a new connection replaces the previous one."""
+    while True:
+        try:
+            conn, _ = _listener.accept()
+        except OSError:
+            traceback.print_exc()
+            return
+        threading.Thread(target=_read_requests, args=(conn,), name="omp-ida-conn", daemon=True).start()
+
+
+def _read_requests(conn):
+    global _interrupt_pending, _conn, _disconnected_at
+    authenticated = False
+    try:
+        for line in conn.makefile("r", encoding="utf-8", newline="\n"):
+            try:
+                frame = json.loads(line)
+            except ValueError:
+                frame = None
+            if not authenticated:
+                if not isinstance(frame, dict) or frame.get("token") != _TOKEN:
+                    break
+                authenticated = True
+                with _conn_lock:
+                    previous, _conn = _conn, conn
+                if previous is not None:
+                    try:
+                        previous.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                continue
+            if isinstance(frame, dict) and "interrupt" in frame:
+                with _running_lock:
+                    if not _interrupt_pending and _running_id is not None and _running_id == frame["interrupt"]:
+                        _interrupt_pending = True
+                        _thread.interrupt_main()
+                continue
+            _requests.put(line)
+    except OSError:
+        pass
+    with _conn_lock:
+        if _conn is conn:
+            _conn = None
+            _disconnected_at = time.monotonic()
+    conn.close()
+
+
+def _run(req_id, handler, params):
+    """Run `handler` as request `req_id`; returns (ok, result or exception) with no interrupt left pending.
+
+    A KeyboardInterrupt can surface at any bytecode boundary from the moment `req_id` is
+    running until the pending interrupt is absorbed, so every step sits inside one retry loop.
+    """
+    global _running_id, _interrupt_pending
+    ok, value, started, finished, delivered = False, None, False, False, False
+    while True:
+        try:
+            if not started:
+                started = True
+                with _running_lock:
+                    _running_id = req_id
+            if not finished:
+                finished = True
+                try:
+                    value, ok = handler(params), True
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as e:
+                    value = e
+            with _running_lock:
+                _running_id = None
+                pending = _interrupt_pending and not delivered
+                _interrupt_pending = False
+            # A scheduled interrupt fires at the next bytecode boundary; let it fire here.
+            deadline = time.monotonic() + _INTERRUPT_ABSORB_S if pending else 0
+            while time.monotonic() < deadline:
+                pass
+            return ok, value
+        except KeyboardInterrupt as e:
+            delivered = True
+            if not ok:
+                value = e
 
 
 def _close_and_exit(save):
@@ -678,7 +892,6 @@ def _close_and_exit(save):
             traceback.print_exc()
             code = 1
         DB = None
-    _proto.flush()
     sys.exit(code)
 
 
@@ -706,21 +919,30 @@ def _handle(line):
         handler = _METHODS.get(method)
         if handler is None:
             raise ValueError(f"unknown method: {method}")
-        result = handler(params)
     except SystemExit:
         raise
     except BaseException as e:
         _send({"id": req_id, "ok": False, "error": _error(e)})
         return
-    _send({"id": req_id, "ok": True, "result": result, "dirty": _DIRTY})
+    ok, result = _run(req_id, handler, params)
+    if ok:
+        _send({"id": req_id, "ok": True, "result": result, "dirty": _DIRTY})
+    else:
+        _send({"id": req_id, "ok": False, "error": _error(result)})
 
 
 def main():
-    while True:
+    threading.Thread(target=_accept_connections, name="omp-ida-accept", daemon=True).start()
+    while not _terminate:
         try:
-            line = sys.stdin.readline()
-            if not line:
-                break
+            try:
+                line = _requests.get(timeout=1)
+            except queue.Empty:
+                with _conn_lock:
+                    orphaned = _conn is None and time.monotonic() - _disconnected_at > _ORPHAN_S
+                if orphaned:
+                    break
+                continue
             if line.strip():
                 _handle(line)
         except KeyboardInterrupt:

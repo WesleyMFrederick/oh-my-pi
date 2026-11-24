@@ -1,26 +1,31 @@
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
-import { $env, $envExact } from "@oh-my-pi/pi-utils";
-import { type ApiKeyResolver, markAfterSiblingWait, type ResolvedApiKey } from "../auth-retry";
+import { $env, $envExact, logger } from "@oh-my-pi/pi-utils";
+import { type ApiKeyResolver, createOAuthProvenance, type ResolvedApiKey, resolveAfterRotation } from "../auth-retry";
+import { getEnvApiKey, getEnvApiKeyName } from "../env-api-key";
 import * as AIError from "../error";
-import { isUsageLimitOutcome } from "../error/rate-limit";
-import { AUTHENTICATED_SENTINEL } from "../registry/types";
-import { getEnvApiKey, getEnvApiKeyName } from "../stream";
+import { getProviderDefinition } from "../registry";
+import { assertProviderEnabled, providerPauseReason } from "../registry/oauth";
+import { AUTHENTICATED_SENTINEL, type ProviderDefinition } from "../registry/types";
 import type { SessionAffinity } from "./affinity";
 import type { CredentialPool } from "./pool";
-import type { CredentialSelector } from "./select";
+import type { CredentialSelector, OAuthResolutionResult } from "./select";
 import type {
 	AuthApiKeyOptions,
+	AuthPeekOptions,
 	AuthCredential,
 	AuthSource,
 	AuthSourceOptions,
 	KeysApi,
 	LimitsApi,
+	OAuthCredential,
 	OAuthRequestIdentity,
 } from "./types";
 
+type OAuthKeyEncoder = NonNullable<ProviderDefinition["getApiKey"]>;
+
 /**
  * Default config value resolver that checks env vars and treats as literal.
- * Does NOT support "!command" syntax (that requires pi-natives).
+ * Does NOT support "!command" syntax (that requires omp-natives).
  */
 async function defaultConfigValueResolver(config: string): Promise<string | undefined> {
 	const envValue = $envExact(config);
@@ -40,6 +45,17 @@ export class KeyOverrides {
 
 	has(provider: string): boolean {
 		return this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider);
+	}
+
+	/**
+	 * Whether an override replaces OAuth for a session. Any override does for an
+	 * unrestricted session. A restricted session skips the runtime key, but a
+	 * config key still blocks OAuth: it marks the provider's endpoint (often a
+	 * proxy) as taking that key, so the session fails closed instead of sending
+	 * a pooled OAuth token there (see `KeyCascade.get`).
+	 */
+	suppressesOAuth(provider: string, restricted: boolean): boolean {
+		return restricted ? this.#configOverrides.has(provider) : this.has(provider);
 	}
 
 	runtimeKey(provider: string): string | undefined {
@@ -148,6 +164,19 @@ export class KeyCascade implements KeysApi {
 	}
 
 	/**
+	 * The request key a provider's `getApiKey` hook builds from a stored OAuth
+	 * row, or undefined when the hook rejects the row (an incomplete login).
+	 */
+	#encodeOAuthKey(getApiKey: OAuthKeyEncoder, credential: OAuthCredential): string | undefined {
+		try {
+			return getApiKey(credential);
+		} catch (error) {
+			logger.debug("Stored OAuth credential skipped: provider cannot build its key", { error: String(error) });
+			return undefined;
+		}
+	}
+
+	/**
 	 * True when a stored credential is the provider's KDL `empty-fallback`
 	 * keyless-mode marker — what an empty paste at an "Optional: paste API key"
 	 * login prompt stores (e.g. `lm-studio-local` for lm-studio). The wire layer
@@ -203,6 +232,7 @@ export class KeyCascade implements KeysApi {
 	 * selects dedicated-only, alias-aware, or no environment fallback.
 	 */
 	source(provider: string, { env = "dedicated" }: AuthSourceOptions = {}): AuthSource | undefined {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		if (this.#deps.overrides.runtimeKey(provider) !== undefined) return { kind: "runtime", concrete: true };
 		if (this.#deps.overrides.configKey(provider) !== undefined) return { kind: "config", concrete: true };
 		const bearing = this.#getAuthBearingCredentials(provider);
@@ -239,9 +269,12 @@ export class KeyCascade implements KeysApi {
 	 * Used for model discovery where we only need to know if credentials exist
 	 * and get a best-effort token. GitHub Copilot's peek must preserve
 	 * enterprise routing metadata because discovery needs a structured
-	 * credential to reach the correct host.
+	 * credential to reach the correct host. With several stored accounts every
+	 * peek returns the same one, so credential-scoped discovery caches stay on
+	 * one namespace.
 	 */
-	async peek(provider: string): Promise<string | undefined> {
+	async peek(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		const runtimeKey = this.#deps.overrides.runtimeKey(provider);
 		if (runtimeKey) {
 			return runtimeKey;
@@ -256,19 +289,34 @@ export class KeyCascade implements KeysApi {
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
 		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
-		const oauthSelection = this.#deps.selector.selectByType(provider, "oauth");
+		// Peek never refreshes, so only an unexpired OAuth access token is usable
+		// unless the caller only needs the account it names.
+		const now = Date.now();
+		// A provider-owned key encoding (`getApiKey`) is shared with `getOAuthApiKey`, so a peek
+		// and a refresh of one row resolve the same key; a row it rejects is skipped, as `get()` does.
+		const getApiKey = getProviderDefinition(provider)?.getApiKey;
+		const servable = (credential: AuthCredential): credential is OAuthCredential =>
+			credential.type === "oauth" && (!getApiKey || this.#encodeOAuthKey(getApiKey, credential) !== undefined);
+		const oauthSelection =
+			this.#deps.selector.selectByType(
+				provider,
+				"oauth",
+				undefined,
+				credential => servable(credential) && Number.isFinite(credential.expires) && credential.expires > now,
+			) ??
+			(options?.includeExpired
+				? this.#deps.selector.selectByType(provider, "oauth", undefined, servable)
+				: undefined);
 		if (oauthSelection) {
-			const expiresAt = oauthSelection.credential.expires;
-			if (Number.isFinite(expiresAt) && expiresAt > Date.now()) {
-				if (provider === "github-copilot") {
-					return JSON.stringify({
-						token: oauthSelection.credential.access,
-						enterpriseUrl: oauthSelection.credential.enterpriseUrl,
-						apiEndpoint: oauthSelection.credential.apiEndpoint,
-					});
-				}
-				return oauthSelection.credential.access;
+			if (provider === "github-copilot") {
+				return JSON.stringify({
+					token: oauthSelection.credential.access,
+					enterpriseUrl: oauthSelection.credential.enterpriseUrl,
+					apiEndpoint: oauthSelection.credential.apiEndpoint,
+				});
 			}
+			if (getApiKey) return this.#encodeOAuthKey(getApiKey, oauthSelection.credential);
+			return oauthSelection.credential.access;
 		}
 
 		const loginApiKeySelection = this.#deps.selector.selectByType(
@@ -297,34 +345,77 @@ export class KeyCascade implements KeysApi {
 		return undefined;
 	}
 
-	/** Resolve a bearer together with the stored row that supplied it. */
+	/**
+	 * Resolve a bearer together with the stored row that supplied it, for a request.
+	 * Same precedence as {@link KeyCascade.get}, but rejects with
+	 * {@link AIError.OAuthRefreshUnavailableError} (transient, retryable) when OAuth
+	 * refresh failed with a retryable error and no other permitted source could serve
+	 * the request, so request paths retry instead of reporting a missing key.
+	 */
 	async getWithCredential(
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<ResolvedApiKey | undefined> {
+		assertProviderEnabled(provider);
 		let credentialId: number | undefined;
 		let oauthIdentity: OAuthRequestIdentity | undefined;
-		const apiKey = await this.get(provider, sessionId, options, (id, identity) => {
+		let oauthAccess: string | undefined;
+		const apiKey = await this.#resolve(provider, sessionId, options, (id, identity, access) => {
 			credentialId = id;
 			oauthIdentity = identity;
+			oauthAccess = access;
 		});
-		return apiKey === undefined ? undefined : { apiKey, credentialId, ...(oauthIdentity ? { oauthIdentity } : {}) };
+		if (apiKey === undefined) return undefined;
+		return {
+			apiKey,
+			credentialId,
+			...(oauthAccess ? { oauthAccess } : {}),
+			...(oauthIdentity ? { oauthIdentity } : {}),
+		};
 	}
 
 	/**
 	 * Get API key for a provider.
 	 * Priority (first match wins): runtime override, config override, OAuth,
 	 * login API key, environment variable, then another stored API key.
+	 * A session restricted by `sessions.restrict` resolves only its allowed
+	 * OAuth accounts and throws {@link AIError.MissingApiKeyError} when none
+	 * can serve or a config key (a models.yml `apiKey`, often for a proxy
+	 * `baseUrl`) owns the provider, rather than using any other credential.
+	 * A transient OAuth refresh failure resolves `undefined`, so availability
+	 * probes move on to their next candidate; request paths use
+	 * {@link KeyCascade.getWithCredential}, which surfaces it.
 	 */
-	async get(
+	async get(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
+		try {
+			return await this.#resolve(provider, sessionId, options);
+		} catch (error) {
+			if (!(error instanceof AIError.OAuthRefreshUnavailableError)) throw error;
+			logger.debug("API key probe skipped transient OAuth refresh failure", { provider, error: error.message });
+			return undefined;
+		}
+	}
+
+	/** Warm selection metadata during session startup without choosing or pinning an account. */
+	async prefetchUsage(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<void> {
+		options?.signal?.throwIfAborted();
+		if (this.source(provider)?.kind !== "oauth") return;
+		await this.#deps.selector.prefetchUsage(provider, sessionId, options);
+	}
+
+	async #resolve(
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
-		onCredentialId?: (id: number, identity?: OAuthRequestIdentity) => void,
+		onCredentialId?: (id: number, identity?: OAuthRequestIdentity, oauthAccess?: string) => void,
 	): Promise<string | undefined> {
+		// A provider turned off in its auth rules is reached by no key source:
+		// runtime, models.yml, stored, env or broker.
+		if (providerPauseReason(provider) !== undefined) return undefined;
+		const restricted = this.#deps.affinity.isRestricted(provider, sessionId);
 		// Runtime override takes highest priority
-		const runtimeKey = this.#deps.overrides.runtimeKey(provider);
+		const runtimeKey = restricted ? undefined : this.#deps.overrides.runtimeKey(provider);
 		if (runtimeKey) {
 			return runtimeKey;
 		}
@@ -334,20 +425,43 @@ export class KeyCascade implements KeysApi {
 		// (e.g. an auth-gateway) and supplied the bearer for that endpoint —
 		// honor it instead of forwarding an upstream OAuth token that the proxy
 		// won't accept.
-		const configKey = this.#deps.overrides.configKey(provider);
+		if (restricted && this.#deps.overrides.configKey(provider) !== undefined) {
+			throw new AIError.MissingApiKeyError(
+				provider,
+				`No API key for provider: ${provider} (session ${sessionId} is restricted to its OAuth account pool, but models.yml configures an apiKey for this provider, and pooled OAuth tokens are never sent past it)`,
+			);
+		}
+		const configKey = restricted ? undefined : this.#deps.overrides.configKey(provider);
 		if (configKey !== undefined) {
 			return this.#deps.overrides.resolve(configKey);
 		}
 
 		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
 		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
-		const oauthResolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
+		// A transient OAuth refresh failure still lets later sources serve the request; it is
+		// rethrown only when none can, so callers retry instead of reporting a missing key.
+		let oauthResolved: OAuthResolutionResult | undefined;
+		let oauthRefreshFailure: AIError.OAuthRefreshUnavailableError | undefined;
+		try {
+			oauthResolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
+		} catch (error) {
+			if (!(error instanceof AIError.OAuthRefreshUnavailableError)) throw error;
+			oauthRefreshFailure = error;
+		}
 		if (oauthResolved) {
 			if (onCredentialId && oauthResolved.credentialId !== undefined) {
-				const { orgId, region, inferenceRegion } = oauthResolved.credential;
-				onCredentialId(oauthResolved.credentialId, { orgId, region, inferenceRegion });
+				const { accountId, orgId, region, inferenceRegion } = oauthResolved.credential;
+				const identity = { accountId, orgId, region, inferenceRegion };
+				onCredentialId(oauthResolved.credentialId, identity, oauthResolved.credential.access);
 			}
 			return oauthResolved.apiKey;
+		}
+		if (restricted) {
+			if (oauthRefreshFailure) throw oauthRefreshFailure;
+			throw new AIError.MissingApiKeyError(
+				provider,
+				`No API key for provider: ${provider} (session ${sessionId} is restricted to its OAuth account pool and none of those accounts is available)`,
+			);
 		}
 		const loginApiKeySelection = await this.#deps.selector.selectApiKey(
 			provider,
@@ -356,7 +470,9 @@ export class KeyCascade implements KeysApi {
 			credential => credential.source === "login" && !this.isKeylessFallback(provider, credential),
 		);
 		if (loginApiKeySelection) {
-			this.#deps.affinity.record(provider, sessionId, "api_key", loginApiKeySelection.index);
+			if (options?.recordAffinity !== false) {
+				this.#deps.affinity.record(provider, sessionId, "api_key", loginApiKeySelection.index);
+			}
 			const credentialId = onCredentialId
 				? this.#deps.pool.entries(provider)[loginApiKeySelection.index]?.id
 				: undefined;
@@ -382,12 +498,15 @@ export class KeyCascade implements KeysApi {
 			credential => credential.source !== "login",
 		);
 		if (apiKeySelection) {
-			this.#deps.affinity.record(provider, sessionId, "api_key", apiKeySelection.index);
+			if (options?.recordAffinity !== false) {
+				this.#deps.affinity.record(provider, sessionId, "api_key", apiKeySelection.index);
+			}
 			const credentialId = onCredentialId ? this.#deps.pool.entries(provider)[apiKeySelection.index]?.id : undefined;
 			const apiKey = await this.#deps.overrides.resolve(apiKeySelection.credential.key);
 			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
 			return apiKey;
 		}
+		if (oauthRefreshFailure) throw oauthRefreshFailure;
 		return undefined;
 	}
 
@@ -404,41 +523,33 @@ export class KeyCascade implements KeysApi {
 	 */
 	resolver(provider: string, options?: { sessionId?: string; baseUrl?: string; modelId?: string }): ApiKeyResolver {
 		const { sessionId, baseUrl, modelId } = options ?? {};
+		// One resolver serves many requests, and they fail out of order, so the
+		// token a 401 rejected is looked up from the bearer that request sent.
+		const provenance = createOAuthProvenance();
+		const resolve = async (extra: AuthApiKeyOptions): Promise<ResolvedApiKey | undefined> => {
+			const resolved = await this.getWithCredential(provider, sessionId, { baseUrl, modelId, ...extra });
+			provenance.record(resolved);
+			return resolved;
+		};
 		return async ({ lastChance, error, signal, previousKey }) => {
+			const rejectedAccessToken = provenance.accessFor(previousKey);
 			if (error === undefined) {
-				return this.getWithCredential(provider, sessionId, {
-					baseUrl,
-					modelId,
-					signal,
-				});
+				return resolve({ signal });
 			}
 			if (lastChance) {
 				const rotation = await this.#deps.rotate(provider, sessionId, {
 					error,
 					modelId,
+					baseUrl,
 					signal,
 					apiKey: previousKey,
 				});
-				if (!rotation.switched) {
-					const status = AIError.status(error);
-					const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
-					// Preserve no-sibling quota backoff instead of re-resolving an
-					// already-blocked fallback. Hard-auth declines still re-resolve
-					// because a peer may have refreshed the failed bearer.
-					if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) return undefined;
-				}
-				const resolved = await this.getWithCredential(provider, sessionId, {
-					baseUrl,
-					modelId,
-					signal,
-				});
-				return rotation.afterSiblingWait ? markAfterSiblingWait(resolved) : resolved;
+				return resolveAfterRotation(rotation, error, () => resolve({ signal }));
 			}
-			return this.getWithCredential(provider, sessionId, {
-				baseUrl,
-				modelId,
+			return resolve({
 				forceRefresh: true,
 				refreshReason: AIError.status(error) === 401 ? "auth-recovery" : undefined,
+				rejectedAccessToken,
 				signal,
 			});
 		};
@@ -458,6 +569,7 @@ export class KeyCascade implements KeysApi {
 	 * The string is purely informational; consumers must not parse it.
 	 */
 	describe(provider: string, sessionId?: string): string | undefined {
+		if (providerPauseReason(provider) !== undefined) return undefined;
 		if (this.#deps.overrides.runtimeKey(provider) !== undefined) {
 			return "runtime override (--api-key)";
 		}

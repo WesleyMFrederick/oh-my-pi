@@ -7,8 +7,9 @@ import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { calculateCost, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
-import { applyXaiCatalogPricing, xaiModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
+import { xaiModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import { type ModelSpec, type Usage } from "@oh-my-pi/pi-catalog/types";
+import { applyPricingPeerFallback } from "../scripts/generated-policies";
 
 const XAI_RESPONSES_SPEC: ModelSpec<"openai-responses"> = {
 	id: "grok-4.5",
@@ -109,7 +110,7 @@ describe("paid xai (XAI_API_KEY) Responses contract", () => {
 			id: "grok-composer-2.5-fast",
 			name: "Grok Composer 2.5 Fast",
 		};
-		const priced = applyXaiCatalogPricing([XAI_RESPONSES_SPEC, oauthSpec, composerSpec]);
+		const priced = applyPricingPeerFallback([XAI_RESPONSES_SPEC, oauthSpec, composerSpec]);
 		const paid = priced[0];
 		const oauth = priced[1];
 		const composer = priced[2];
@@ -162,15 +163,19 @@ describe("paid xai (XAI_API_KEY) Responses contract", () => {
 			provider: "xai-oauth",
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		};
-		const [paid, oauth] = applyXaiCatalogPricing([paidSpec, oauthSpec]);
+		const [paid, oauth] = applyPricingPeerFallback([paidSpec, oauthSpec]);
 		if (!paid || !oauth) throw new Error("xAI pricing policy dropped a model");
 
 		expect(oauth.cost).toEqual(paid.cost);
+		// Both surfaces carry the 4.20-0309 generation card ($1.25 / $0.20 /
+		// $2.50 below 200K prompt tokens; the class `cost-patch` owns it) and its
+		// doubled tier, not the retired 4.5-generation card stencil.so still
+		// reports on the alias (#18404).
 		expect(buildModel(paid).cost.longContext).toEqual({
 			inputThreshold: 200_000,
 			inputThresholdInclusive: true,
-			input: 4,
-			output: 12,
+			input: 2.5,
+			output: 5,
 			cacheRead: 0.4,
 			cacheWrite: 0,
 		});

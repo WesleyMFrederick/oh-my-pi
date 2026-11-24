@@ -14,7 +14,7 @@ export interface SessionInfoDetails {
 	modelProvider: string | null;
 	modelId: string | null;
 	thinkingLevel: string | null;
-	approvalMode: "always-ask" | "write" | "yolo" | null;
+	approvalMode: "always-ask" | "always-ask-cached" | "write" | "yolo" | null;
 	contextUsage: { tokens: number; contextWindow: number; percent: number } | null;
 	messageCounts: { user: number; assistant: number; toolCalls: number; toolResults: number; total: number } | null;
 	tokenCounts: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } | null;

@@ -46,7 +46,11 @@ import { recentTranscriptEntries, type TranscriptEntryLike as TranscriptEntry } 
 import { theme } from "../theme/theme";
 import { matchesAppToolsExpand, matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../keybinding-matchers";
 import { ChatTranscriptBuilder } from "../chat/chat-transcript-builder";
-import { TranscriptBrowser, type TranscriptBrowserFrame } from "../chat/transcript-browser";
+import {
+	nearestVisibleOutlineTarget,
+	TranscriptBrowser,
+	type TranscriptBrowserFrame,
+} from "../chat/transcript-browser";
 import { padToWidth } from "../render/utils";
 import { expandKeyHint } from "../render/render-utils";
 import { formatKeyHint, formatKeyHints } from "../app-keybindings";
@@ -55,6 +59,7 @@ import {
 	appendOutlineEntries,
 	type ComposedColumn,
 	composeOutlineColumn,
+	describedVisibility,
 	type OutlineTarget,
 	isUserTurnEntry,
 	outlineVisibility,
@@ -83,10 +88,13 @@ export interface RewindSelectorDeps {
 	cwd: string;
 	hideThinkingBlock?: () => boolean;
 	proseOnlyThinking?: () => boolean;
+	expandThinkingBlocks?: () => boolean;
 	linkTargets?: ReadonlyMap<string, string>;
 	requestRender: () => void;
 	/** Sibling branch paths of `entryId`'s turn (excluding the turn itself). */
 	siblingPaths?: (entryId: string) => BranchVariantPath[];
+	/** The entry the outline starts on (a turn's "Rewind to here…"); the latest target without one. */
+	startAt?: string;
 	/** Rewind the session to `entryId` (a message entry anywhere in the tree). */
 	onSelect: (entryId: string) => void;
 	onCancel: () => void;
@@ -108,7 +116,9 @@ interface SiblingColumn {
  */
 class MarkedBlock implements Component {
 	mark: TspMark | undefined;
-	#memo: { node: NativeNode; mark: TspMark; out: NativeNode } | undefined;
+	/** Moves the outline to the target this block belongs to (a click or tap on it); none outside targets. */
+	pick: (() => void) | undefined;
+	#memo: { node: NativeNode; mark: TspMark | undefined; pickable: boolean; out: NativeNode } | undefined;
 
 	constructor(readonly block: Component) {}
 
@@ -122,18 +132,48 @@ class MarkedBlock implements Component {
 
 	describe(cx: DescribeContext): NativeNode | null {
 		const described = this.block.describe?.(cx) ?? null;
+		if (!described) return null;
 		const mark = this.mark;
-		if (!described || !mark) return described;
+		// A block whose own click does something keeps it; a tap anywhere else in a target picks it.
+		const actions = described.p?.actions;
+		const pickable = this.pick !== undefined && actions?.click === undefined;
+		if (!mark && !pickable) return described;
 		const memo = this.#memo;
-		if (memo?.node === described && memo.mark === mark) return memo.out;
-		const out = node(described.k, { ...described.p, mark }, described.c, described.key);
-		this.#memo = { node: described, mark, out };
+		if (memo?.node === described && memo.mark === mark && memo.pickable === pickable) return memo.out;
+		const props = {
+			...described.p,
+			...(mark ? { mark } : {}),
+			...(pickable ? { actions: { ...actions, click: PICK } } : {}),
+		};
+		const out = node(described.k, props, described.c, described.key);
+		this.#memo = { node: described, mark, pickable, out };
 		return out;
 	}
 
 	handleNativeEvent(event: NativeUiEvent): void {
+		if (event.type === "action" && event.act === PICK && this.pick) {
+			this.pick();
+			return;
+		}
 		this.block.handleNativeEvent?.(event);
 	}
+}
+
+/** The click action that picks a block's target on the page. */
+const PICK = "rewind-pick";
+
+/** Index of the target in `targets` (sorted, disjoint) whose blocks include child `child`; -1 for none. */
+function targetAt(targets: readonly OutlineTarget[], child: number): number {
+	let lo = 0;
+	let hi = targets.length - 1;
+	while (lo <= hi) {
+		const mid = (lo + hi) >> 1;
+		const target = targets[mid]!;
+		if (child < target.start) hi = mid - 1;
+		else if (child >= target.end) lo = mid + 1;
+		else return mid;
+	}
+	return -1;
 }
 
 const kMarked = Symbol("rewind.marked");
@@ -155,6 +195,14 @@ const EARLIER_TURNS = node(
 const STRIP_GAP = 2;
 /** Duration of the branch-swap camera slide. */
 const SLIDE_MS = 160;
+
+/** Same length and identical elements (or both undefined). */
+function sameElements<T>(a: readonly T[] | undefined, b: readonly T[] | undefined): boolean {
+	if (a === b) return true;
+	if (a === undefined || b === undefined || a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
 
 export class RewindSelectorComponent implements Component {
 	#builder: ChatTranscriptBuilder;
@@ -194,6 +242,24 @@ export class RewindSelectorComponent implements Component {
 	#rowText = new WeakMap<readonly string[], string>();
 	/** Native filter haystack: lowercased turn text per main target (no rendered rows under TSP). */
 	#nativeTexts: { targets: OutlineTarget[]; texts: string[] } | undefined;
+	/** Compiled word patterns of the last filter query. */
+	#filterPatterns: { query: string; patterns: RegExp[] } | undefined;
+	/**
+	 * Last {@link #filterMatches} result and its inputs. Frames hand back fresh
+	 * outer `mainRows`/`mainVisible` arrays over cached per-child rows, so those
+	 * compare element-wise.
+	 */
+	#filterMemo:
+		| {
+				query: string;
+				targets: OutlineTarget[];
+				expanded: boolean;
+				native: boolean;
+				mainRows: readonly (readonly string[])[];
+				mainVisible: readonly boolean[] | undefined;
+				matches: readonly number[];
+		  }
+		| undefined;
 	/** Last described bar and the state it was built from. */
 	#bar: { memo: string; targets: OutlineTarget[]; node: NativeNode } | undefined;
 
@@ -210,6 +276,18 @@ export class RewindSelectorComponent implements Component {
 			getHeight: () => this.deps.ui.terminal?.rows || process.stdout.rows || 40,
 			frame: context => this.#frame(context.contentWidth),
 		});
+		if (deps.startAt !== undefined) this.#startAt(deps.startAt);
+	}
+
+	/** Starts the outline on the target holding `entryId`, replaying the whole branch when the tail lacks it. */
+	#startAt(entryId: string): void {
+		const holds = (target: OutlineTarget) => target.entries.some(entry => entry.id === entryId);
+		let index = this.#targets.findIndex(holds);
+		if (index < 0 && this.#truncated) {
+			this.#loadFullHistory();
+			index = this.#targets.findIndex(holds);
+		}
+		if (index >= 0) this.#selected = index;
 	}
 
 	/** Number of selectable rewind points on the current path; hosts skip mounting when zero. */
@@ -226,6 +304,7 @@ export class RewindSelectorComponent implements Component {
 			cwd: this.deps.cwd,
 			hideThinkingBlock: this.deps.hideThinkingBlock,
 			proseOnlyThinking: this.deps.proseOnlyThinking,
+			expandThinkingBlocks: this.deps.expandThinkingBlocks,
 			linkTargets: this.deps.linkTargets,
 			requestRender: this.deps.requestRender,
 		});
@@ -526,14 +605,25 @@ export class RewindSelectorComponent implements Component {
 	 * Matching the rendered rows keeps results honest: collapsed tool output
 	 * only matches once Ctrl+O expands it.
 	 */
-	#filterMatches(): number[] {
-		const words = (this.#filter ?? "").toLowerCase().split(/\s+/).filter(Boolean);
-		const patterns = words.map(word =>
-			/^[\p{Script=Latin}\p{N}_]+$/u.test(word)
-				? new RegExp(`(?<![\\p{L}\\p{N}_])${RegExp.escape(word)}(?![\\p{L}\\p{N}_])`, "u")
-				: new RegExp(RegExp.escape(word), "u"),
-		);
-		if (isNativeRendering() && this.#nativeTexts?.targets !== this.#targets) {
+	#filterMatches(): readonly number[] {
+		const query = this.#filter ?? "";
+		const native = isNativeRendering();
+		const memo = this.#filterMemo;
+		if (
+			memo &&
+			memo.query === query &&
+			memo.targets === this.#targets &&
+			memo.expanded === this.#expanded &&
+			memo.native === native &&
+			sameElements(memo.mainVisible, this.#mainVisible) &&
+			(native || sameElements(memo.mainRows, this.#mainRows))
+		) {
+			memo.mainRows = this.#mainRows;
+			memo.mainVisible = this.#mainVisible;
+			return memo.matches;
+		}
+		const patterns = this.#compileFilter(query);
+		if (native && this.#nativeTexts?.targets !== this.#targets) {
 			this.#nativeTexts = {
 				targets: this.#targets,
 				// Turn text plus its commands and tool output, like the expanded rendered rows.
@@ -548,19 +638,51 @@ export class RewindSelectorComponent implements Component {
 		for (let index = 0; index < this.#targets.length; index++) {
 			if (!this.#isMainSelectable(index)) continue;
 			const target = this.#targets[index]!;
-			const texts = isNativeRendering()
-				? [this.#nativeTexts?.texts[index] ?? ""]
-				: this.#mainRows.slice(target.start, target.end).map(rows => {
-						let text = this.#rowText.get(rows);
-						if (text === undefined) {
-							text = Bun.stripANSI(rows.join("\n")).toLowerCase();
-							this.#rowText.set(rows, text);
+			const matched = native
+				? patterns.every(pattern => pattern.test(this.#nativeTexts?.texts[index] ?? ""))
+				: patterns.every(pattern => {
+						for (let child = target.start; child < target.end; child++) {
+							const rows = this.#mainRows[child];
+							if (rows !== undefined && pattern.test(this.#plainRowText(rows))) return true;
 						}
-						return text;
+						return false;
 					});
-			if (patterns.every(pattern => texts.some(text => pattern.test(text)))) matches.push(index);
+			if (matched) matches.push(index);
 		}
+		this.#filterMemo = {
+			query,
+			targets: this.#targets,
+			expanded: this.#expanded,
+			native,
+			mainRows: this.#mainRows,
+			mainVisible: this.#mainVisible,
+			matches,
+		};
 		return matches;
+	}
+
+	/** Word patterns of `query`, compiled once per distinct query. */
+	#compileFilter(query: string): RegExp[] {
+		const cached = this.#filterPatterns;
+		if (cached?.query === query) return cached.patterns;
+		const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+		const patterns = words.map(word =>
+			/^[\p{Script=Latin}\p{N}_]+$/u.test(word)
+				? new RegExp(`(?<![\\p{L}\\p{N}_])${RegExp.escape(word)}(?![\\p{L}\\p{N}_])`, "u")
+				: new RegExp(RegExp.escape(word), "u"),
+		);
+		this.#filterPatterns = { query, patterns };
+		return patterns;
+	}
+
+	/** Lowercased plain text of one rendered child row array, cached by array identity. */
+	#plainRowText(rows: readonly string[]): string {
+		let text = this.#rowText.get(rows);
+		if (text === undefined) {
+			text = Bun.stripANSI(rows.join("\n")).toLowerCase();
+			this.#rowText.set(rows, text);
+		}
+		return text;
 	}
 
 	/** Up/Down: step within the active column; leaving a sibling column's top exits the strip. */
@@ -611,6 +733,21 @@ export class RewindSelectorComponent implements Component {
 		return this.#mainVisible?.[index] ?? true;
 	}
 
+	/**
+	 * Adopt the main path's per-target visibility. A selection on a target
+	 * that shows nothing (the empty turn an interrupt leaves last, a turn the
+	 * expansion toggle collapsed) moves to the nearest one that shows and
+	 * leaves the strip.
+	 */
+	#adoptVisibility(visible: boolean[]): void {
+		this.#mainVisible = visible;
+		const selected = nearestVisibleOutlineTarget(visible, this.#selected);
+		if (selected === this.#selected) return;
+		this.#selected = selected;
+		this.#activeVariant = 0;
+		this.#siblingSelected = 0;
+	}
+
 	// ========================================================================
 	// Native: the transcript as a page
 	// ========================================================================
@@ -623,12 +760,13 @@ export class RewindSelectorComponent implements Component {
 	 * of branch columns, the current path first. The bar is this component's
 	 * own node, docked under the page, so the filter field keeps the caret.
 	 */
-	describeScreen(_cx: DescribeContext): NativeScreen {
-		return { role: "omp.rewind", main: this.#page(), dock: [this] };
+	describeScreen(cx: DescribeContext): NativeScreen {
+		this.#adoptVisibility(describedVisibility(this.#builder.container.children, this.#targets, cx));
+		return { role: "omp.rewind", main: this.#page(cx), dock: [this] };
 	}
 
 	/** The page's blocks, marked for the current outline. */
-	#page(): NativeChild[] {
+	#page(cx: DescribeContext): NativeChild[] {
 		const blocks = this.#builder.container.children;
 		const page: NativeChild[] = [];
 		const filter = this.#filter;
@@ -640,7 +778,7 @@ export class RewindSelectorComponent implements Component {
 				const picked = index === this.#selected;
 				if (picked) page.push(this.#caption(this.#targets, index, "main"));
 				for (let i = target.start; i < target.end; i++)
-					page.push(this.#marked(blocks[i]!, picked ? "pick" : undefined));
+					page.push(this.#marked(blocks[i]!, picked ? "pick" : undefined, "main", index));
 			}
 			if (matches.length === 0) {
 				page.push(text([span(`No turns match "${filter}"`, "muted")], { role: "omp.rewind.empty" }));
@@ -655,7 +793,8 @@ export class RewindSelectorComponent implements Component {
 			return page;
 		}
 		// Shared history above the fork at full width, then the branches side by side.
-		for (let i = 0; i < anchor.start; i++) page.push(this.#marked(blocks[i]!, undefined));
+		for (let i = 0; i < anchor.start; i++)
+			page.push(this.#marked(blocks[i]!, undefined, "main", targetAt(this.#targets, i)));
 		const count = columns.length + 1;
 		const current: NativeChild[] = [this.#columnHead(0, count, "current")];
 		this.#markRun(
@@ -670,6 +809,9 @@ export class RewindSelectorComponent implements Component {
 		for (let index = 0; index < columns.length; index++) {
 			const column = columns[index]!;
 			const active = this.#activeVariant === index + 1;
+			if (active) {
+				this.#siblingVisible = describedVisibility(column.builder.container.children, column.targets, cx);
+			}
 			const children: NativeChild[] = [this.#columnHead(index + 1, count, column.label)];
 			const picked = active ? this.#siblingSelected : -1;
 			this.#markRun(children, column.builder.container.children, 0, column.targets, picked, column.rootId);
@@ -695,7 +837,7 @@ export class RewindSelectorComponent implements Component {
 		for (let i = from; i < blocks.length; i++) {
 			if (target && i === target.start) out.push(this.#caption(targets, picked, column));
 			const mark = !target || i < target.start ? undefined : i < target.end ? "pick" : "drop";
-			out.push(this.#marked(blocks[i]!, mark));
+			out.push(this.#marked(blocks[i]!, mark, column, targetAt(targets, i)));
 		}
 	}
 
@@ -748,10 +890,31 @@ export class RewindSelectorComponent implements Component {
 	}
 
 	/** `block` wrapped to carry `mark`; one wrapper per block, so ids and view state persist while stepping. */
-	#marked(block: Component & MarkTagged, mark: TspMark | undefined): MarkedBlock {
+	#marked(block: Component & MarkTagged, mark: TspMark | undefined, column: string, target: number): MarkedBlock {
 		const marked = (block[kMarked] ??= new MarkedBlock(block));
 		marked.mark = mark;
+		marked.pick = target < 0 ? undefined : () => this.#pick(column, target);
 		return marked;
+	}
+
+	/**
+	 * A click or tap on a turn: the outline moves to `targets[index]` of `column` (`main`, or a strip
+	 * column's root id), as stepping there would; Enter or Rewind here then rewinds to it.
+	 */
+	#pick(column: string, index: number): void {
+		if (column === "main") {
+			if (this.#activeVariant === 0 && this.#selected === index) return;
+			this.#selected = index;
+			this.#activeVariant = 0;
+			this.#siblingSelected = 0;
+			this.#stopSlide();
+		} else {
+			const variant = this.#stripColumns().findIndex(c => c.rootId === column) + 1;
+			if (variant === 0 || (this.#activeVariant === variant && this.#siblingSelected === index)) return;
+			this.#activeVariant = variant;
+			this.#siblingSelected = index;
+		}
+		this.deps.requestRender();
 	}
 
 	/** The bar docked under the page: position, key hints, Cancel and Rewind; the filter field while filtering. */
@@ -829,15 +992,8 @@ export class RewindSelectorComponent implements Component {
 		// rows a matching two-column left gutter so blocks never shift while stepping.
 		const children = this.#builder.container.children;
 		const prepared = this.#browser.prepareOutline(children, this.#targets, this.#selected, contentWidth);
-		this.#mainVisible = prepared.visible;
 		this.#mainRows = prepared.childRows;
-		if (prepared.selected !== this.#selected) {
-			// The current target collapsed (e.g. expansion toggle): rest on the
-			// nearest visible one and leave the strip.
-			this.#selected = prepared.selected;
-			this.#activeVariant = 0;
-			this.#siblingSelected = 0;
-		}
+		this.#adoptVisibility(prepared.visible);
 
 		if (this.#filter !== undefined) return this.#filterFrame(this.#filter, prepared.childRows, contentWidth);
 

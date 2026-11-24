@@ -9,11 +9,11 @@ import { resolveCodexResponsesUrl } from "@oh-my-pi/pi-ai/providers/openai-codex
 import {
 	applyCodexResidencyHeader,
 	CODEX_BASE_URL,
-	CODEX_CLIENT_VERSION,
 	getCodexAccountId,
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
+import { getCodexClientVersion } from "@oh-my-pi/pi-catalog/wire/codex-version";
 import { readSseJson, USER_AGENT } from "@oh-my-pi/pi-utils";
 import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
@@ -302,9 +302,8 @@ function buildCodexHeaders(
 		headers.delete(OPENAI_HEADERS.ACCOUNT_ID);
 	}
 	applyCodexResidencyHeader(headers, accessToken);
-	headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
 	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
-	headers.set(OPENAI_HEADERS.VERSION, CODEX_CLIENT_VERSION);
+	headers.set(OPENAI_HEADERS.VERSION, getCodexClientVersion());
 	headers.set("User-Agent", USER_AGENT);
 	headers.set("Accept", "text/event-stream");
 	headers.set("Content-Type", "application/json");
@@ -565,6 +564,21 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 	const parsed = params.parsedQuery ?? parseSearchQuery(params.query);
 	const query = parsed.hasDirectives ? formatQuery(parsed, GOOGLE_QUERY_SYNTAX) : params.query;
 
+	const runSearch = async (auth: { accessToken: string; accountId?: string }): Promise<CodexSearchResult> => {
+		// Re-resolved per attempt so a retried or rotated credential sees the
+		// registry headers current at call time.
+		const requestTransport = await resolveCodexSearchTransport(params);
+		return callCodexSearch(auth, query, {
+			signal: params.signal,
+			timeoutMs: params.timeoutMs,
+			systemPrompt: params.systemPrompt,
+			searchContextSize: "high",
+			modelId: params.model.id,
+			fetch: params.fetch,
+			transport: requestTransport,
+		});
+	};
+
 	let result: CodexSearchResult;
 	if (transport.customEndpoint) {
 		// The registry resolver and provenance guard must consult the same storage;
@@ -580,53 +594,47 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 		}
 
 		const keyOrResolver = params.modelRegistry.resolver(params.model, params.sessionId);
-		result = await withAuth(
-			keyOrResolver,
-			async accessToken => {
-				const requestTransport = await resolveCodexSearchTransport(params);
-				return callCodexSearch({ accessToken }, query, {
-					signal: params.signal,
-					timeoutMs: params.timeoutMs,
-					systemPrompt: params.systemPrompt,
-					searchContextSize: "high",
-					modelId: params.model.id,
-					fetch: params.fetch,
-					transport: requestTransport,
-				});
-			},
-			{
-				signal: params.signal,
-				missingKeyMessage: `Codex credentials not found for selected provider "${params.model.provider}".`,
-			},
-		);
+		result = await withAuth(keyOrResolver, async accessToken => runSearch({ accessToken }), {
+			signal: params.signal,
+			missingKeyMessage: `Codex credentials not found for selected provider "${params.model.provider}".`,
+		});
 	} else {
+		// `hasCodexSearch` admits this provider from `keys.source()`, which knows
+		// about env bearers; `oauth.access` below does not — it only reads stored
+		// `type: "oauth"` rows. So an OPENAI_CODEX_OAUTH_TOKEN-only setup passed
+		// the availability check and then failed here with "No Codex OAuth
+		// credentials found". Take the registry resolver when the stored pool is
+		// empty but the origin is an env var, as the xAI search provider does.
 		const seed = await params.authStorage.oauth.access(params.model.provider, params.sessionId, {
 			signal: params.signal,
 		});
 		if (!seed) {
-			throw new Error(`No Codex OAuth credentials found for selected provider "${params.model.provider}".`);
-		}
-
-		result = await withOAuthAccess(
-			params.authStorage,
-			params.model.provider,
-			async access => {
-				// A refreshed/rotated credential can carry a different bearer and
-				// ChatGPT account id than the seed used to select the first attempt.
-				const accountId = access.accountId ?? getCodexAccountId(access.accessToken);
-				const requestTransport = await resolveCodexSearchTransport(params);
-				return callCodexSearch({ accessToken: access.accessToken, accountId }, query, {
+			const credentialOrigin = params.modelRegistry.authStorage.keys.source(params.model.provider);
+			if (credentialOrigin?.kind !== "env") {
+				throw new Error(`No Codex OAuth credentials found for selected provider "${params.model.provider}".`);
+			}
+			result = await withAuth(
+				params.modelRegistry.resolver(params.model, params.sessionId),
+				async accessToken => runSearch({ accessToken, accountId: getCodexAccountId(accessToken) }),
+				{
 					signal: params.signal,
-					timeoutMs: params.timeoutMs,
-					systemPrompt: params.systemPrompt,
-					searchContextSize: "high",
-					modelId: params.model.id,
-					fetch: params.fetch,
-					transport: requestTransport,
-				});
-			},
-			{ sessionId: params.sessionId, signal: params.signal, seed },
-		);
+					missingKeyMessage: `Codex credentials not found for selected provider "${params.model.provider}".`,
+				},
+			);
+		} else {
+			result = await withOAuthAccess(
+				params.authStorage,
+				params.model.provider,
+				// A refreshed/rotated credential can carry a different bearer and ChatGPT
+				// account id than the seed used to select the first attempt.
+				async access =>
+					runSearch({
+						accessToken: access.accessToken,
+						accountId: access.accountId ?? getCodexAccountId(access.accessToken),
+					}),
+				{ sessionId: params.sessionId, signal: params.signal, seed },
+			);
+		}
 	}
 
 	let sources = result.sources;

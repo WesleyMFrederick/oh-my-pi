@@ -3,11 +3,7 @@
  * pipeline, and the post-link stamp tool (`scripts/stamp-native-version.ts`).
  *
  * Kept in its own module so `scripts/embed-native.ts` can reuse them without
- * importing `loader-state.js` — which pulls in the generated
- * `embedded-addon.js` and its `with { type: "file" }` archive import. That
- * chain fails to resolve when the archive is missing, which would break
- * `gen:native:reset` on an inconsistent tree (populated manifest, deleted
- * archive) before it can restore the checked-in null stub.
+ * importing `loader-state.js` and the rest of the runtime loader.
  *
  * Current addons carry a fixed-size stamp slot (`VERSION_STAMP_MAGIC` + the
  * release version + NUL padding) written after linking and reported by
@@ -17,7 +13,7 @@
  * is diagnosed correctly.
  */
 
-/** Prefix of the stamp slot linked into every addon (`crates/pi-natives/src/lib.rs`). */
+/** Prefix of the stamp slot linked into every addon (`crates/natives/src/lib.rs`). */
 export const VERSION_STAMP_MAGIC = "PI_NATIVES_VERSION_STAMP:";
 
 /** Total stamp slot size in bytes: magic, version, NUL padding. */

@@ -1,10 +1,9 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import * as modelCache from "@oh-my-pi/pi-catalog/model-cache";
 import { getModelCacheWriteStats, readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
@@ -101,6 +100,9 @@ describe("model cache write churn", () => {
 		const entry = readModelCache("rewrite-test", TTL_MS, () => 2_000, dbPath);
 		expect(entry?.authoritative).toBe(false);
 		expect(entry?.updatedAt).toBe(2_000);
+		// The side row carries freshness and retry authority only; the payload still
+		// records that its models came from an authoritative discovery result.
+		expect(entry?.payloadAuthoritative).toBe(true);
 		expect(payloadRow(dbPath, "rewrite-test")?.authoritative).toBe(1);
 	});
 
@@ -115,7 +117,7 @@ describe("model cache write churn", () => {
 		expect(entry?.updatedAt).toBe(3_000);
 		expect(entry?.authoritative).toBe(false);
 		const db = new Database(dbPath, { readonly: true });
-		const refreshRows = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM model_cache_refresh").get();
+		const refreshRows = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM model_cache_freshness").get();
 		db.close();
 		expect(refreshRows?.count).toBe(0);
 	});
@@ -130,6 +132,145 @@ describe("model cache write churn", () => {
 		const entry = readModelCache("rewrite-test", TTL_MS, () => 3_000, dbPath);
 		expect(entry?.updatedAt).toBe(3_000);
 		expect(entry?.authoritative).toBe(false);
+	});
+
+	/** Serialized `models` payload for `ids`, as this binary writes it. */
+	function payloadFor(ids: string[]): string {
+		const otherPath = path.join(tempDir, "payload-source.db");
+		writeModelCache(
+			"rewrite-test",
+			1_000,
+			ids.map(id => model(id)),
+			true,
+			"fp",
+			otherPath,
+		);
+		const row = payloadRow(otherPath, "rewrite-test");
+		if (!row) throw new Error("expected payload row");
+		return row.models;
+	}
+
+	it("re-reads a row an older binary replaced without recording its payload hash", () => {
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual(["a"]);
+		const replacement = payloadFor(["a", "legacy"]);
+		const db = new Database(dbPath);
+		db.run(
+			`INSERT OR REPLACE INTO model_cache (
+				provider_id, version, materialization_policy, updated_at, authoritative, static_fingerprint,
+				header_omitted_model_ids, unrestorable_header_model_ids, header_restore_version, models
+			)
+			SELECT provider_id, version, materialization_policy, updated_at, authoritative, static_fingerprint,
+				header_omitted_model_ids, unrestorable_header_model_ids, header_restore_version, ?
+			FROM model_cache WHERE provider_id = 'rewrite-test'`,
+			[replacement],
+		);
+		db.close();
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual([
+			"a",
+			"legacy",
+		]);
+	});
+
+	/** Copy this build's `rewrite-test` row under `policy`, the way another build's `INSERT OR REPLACE` lands. */
+	function writeAsOtherBuild(policy: string, updatedAt: number): void {
+		const db = new Database(dbPath);
+		db.run(
+			`INSERT OR REPLACE INTO model_cache (
+				provider_id, version, materialization_policy, updated_at, authoritative, static_fingerprint,
+				header_omitted_model_ids, unrestorable_header_model_ids, header_restore_version, models
+			)
+			SELECT provider_id, version, ?, ?, authoritative, static_fingerprint,
+				header_omitted_model_ids, unrestorable_header_model_ids, header_restore_version, ?
+			FROM model_cache WHERE provider_id = 'rewrite-test' LIMIT 1`,
+			[policy, updatedAt, payloadFor(["other-build"])],
+		);
+		db.close();
+	}
+
+	function policyRows(): string[] {
+		const db = new Database(dbPath, { readonly: true });
+		try {
+			return db
+				.query<{ policy: string }, []>(
+					"SELECT materialization_policy AS policy FROM model_cache WHERE provider_id = 'rewrite-test' ORDER BY updated_at",
+				)
+				.all()
+				.map(row => row.policy);
+		} finally {
+			db.close();
+		}
+	}
+
+	it("keeps this build's row when another app version writes the same provider", () => {
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		writeAsOtherBuild("app-0.0.0:builder-1:rules-other", 2_000);
+
+		expect(readModelCache("rewrite-test", TTL_MS, () => 2_000, dbPath)?.models.map(m => m.id)).toEqual(["a"]);
+		// An unchanged rewrite by this build only advances freshness; the other build's row stays.
+		const before = payloadWrites();
+		writeModelCache("rewrite-test", 3_000, [model("a")], true, "fp", dbPath);
+		expect(payloadWrites()).toBe(before);
+		expect(policyRows()).toHaveLength(2);
+	});
+
+	it("prunes other builds' rows to the most recently written ones on a payload write", () => {
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		for (let i = 1; i <= 4; i++) writeAsOtherBuild(`app-0.0.${i}:builder-1:rules-other`, 1_000 + i);
+
+		writeModelCache("rewrite-test", 9_000, [model("a"), model("b")], true, "fp", dbPath);
+		const rows = policyRows();
+		expect(rows).toHaveLength(3);
+		expect(rows.slice(0, 2)).toEqual(["app-0.0.3:builder-1:rules-other", "app-0.0.4:builder-1:rules-other"]);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 9_000, dbPath)?.models.map(m => m.id)).toEqual(["a", "b"]);
+	});
+
+	it("rekeys a provider-keyed table from an older build without losing its rows", () => {
+		const db = new Database(dbPath);
+		db.run(`
+			CREATE TABLE model_cache (
+				provider_id TEXT PRIMARY KEY,
+				version INTEGER NOT NULL,
+				materialization_policy TEXT NOT NULL DEFAULT '',
+				updated_at INTEGER NOT NULL,
+				authoritative INTEGER NOT NULL DEFAULT 0,
+				static_fingerprint TEXT NOT NULL DEFAULT '',
+				header_omitted_model_ids TEXT NOT NULL DEFAULT '[]',
+				unrestorable_header_model_ids TEXT NOT NULL DEFAULT '[]',
+				header_restore_version INTEGER NOT NULL DEFAULT 0,
+				models_hash TEXT NOT NULL DEFAULT '',
+				models TEXT NOT NULL
+			)
+		`);
+		db.run(
+			"INSERT INTO model_cache (provider_id, version, materialization_policy, updated_at, models) VALUES (?, 15, ?, 500, '[]')",
+			["rewrite-test", "app-0.0.0:builder-1:rules-old"],
+		);
+		db.close();
+
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		expect(policyRows()).toEqual(["app-0.0.0:builder-1:rules-old", expect.stringMatching(/^app-/)]);
+		// The older build's provider-keyed upsert now replaces only its own row.
+		writeAsOtherBuild("app-0.0.0:builder-1:rules-old", 2_000);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 2_000, dbPath)?.models.map(m => m.id)).toEqual(["a"]);
+		expect(policyRows()).toHaveLength(2);
+	});
+
+	it("re-reads and rewrites a payload edited in place", () => {
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual(["a"]);
+		const edited = payloadFor(["a", "edited"]);
+		const db = new Database(dbPath);
+		db.run("UPDATE model_cache SET models = ? WHERE provider_id = 'rewrite-test'", [edited]);
+		db.close();
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual([
+			"a",
+			"edited",
+		]);
+
+		// Writing the original snapshot again must replace the edited row, not skip it as unchanged.
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 1_000, dbPath)?.models.map(m => m.id)).toEqual(["a"]);
 	});
 
 	it("does not re-persist an unchanged snapshot while discovery keeps failing", async () => {
@@ -196,45 +337,35 @@ describe("model cache write churn", () => {
 		expect(readModelCache("azure", TTL_MS, Date.now, dbPath)?.models.length).toBe(bundled.length);
 	});
 
-	it("runs a signal handler between writes while many providers persist a cold cache concurrently", async () => {
-		const providers = Array.from({ length: 24 }, (_, i) => `yield-test-${i}`);
-		let writes = 0;
-		let writesWhenSignalHandled: number | undefined;
-		const handled = Promise.withResolvers<void>();
-		const onSignal = () => {
-			writesWhenSignalHandled = writes;
-			handled.resolve();
-		};
-		process.on("SIGUSR2", onSignal);
-		const realWrite = modelCache.writeModelCache;
-		const spy = spyOn(modelCache, "writeModelCache").mockImplementation((...args) => {
-			realWrite(...args);
-			writes++;
-			// Stand-in for SIGTERM arriving mid-refresh. A real signal, so it only runs when the loop polls.
-			if (writes === 1) process.kill(process.pid, "SIGUSR2");
-		});
-		try {
-			await Promise.all([
-				...providers.map(providerId =>
-					resolveProviderModels(
-						{
-							providerId,
-							staticModels: [spec("static-a", providerId)],
-							cacheDbPath: dbPath,
-							fetchDynamicModels: async () => [spec("dynamic-a", providerId)],
-						},
-						"online",
-					),
-				),
-				handled.promise,
-			]);
-		} finally {
-			spy.mockRestore();
-			process.off("SIGUSR2", onSignal);
-		}
-		expect(writes).toBe(providers.length);
-		// Uninterrupted persistence would deliver the signal only after the last write.
-		expect(writesWhenSignalHandled).toBeLessThan(providers.length);
+	it("lets other event-loop work (signal handlers, timers) run between providers while a cold cache is persisted", async () => {
+		const providers = Array.from({ length: 12 }, (_, i) => `yield-test-${i}`);
+		let finished = 0;
+		let finishedWhenTimerRan: number | undefined;
+		// A macrotask stands in for a SIGTERM handler: it can only run when the refresh yields the event loop.
+		const timer = new Promise<void>(resolve =>
+			setTimeout(() => {
+				finishedWhenTimerRan = finished;
+				resolve();
+			}, 0),
+		);
+		await Promise.all([
+			timer,
+			...providers.map(async providerId => {
+				await resolveProviderModels(
+					{
+						providerId,
+						staticModels: [spec("static-a", providerId)],
+						cacheDbPath: dbPath,
+						fetchDynamicModels: async () => [spec("dynamic-a", providerId)],
+					},
+					"online",
+				);
+				finished++;
+			}),
+		]);
+		expect(finished).toBe(providers.length);
+		// Every provider persisted in one uninterrupted stretch would give 12 here.
+		expect(finishedWhenTimerRan).toBeLessThan(providers.length);
 		for (const providerId of providers) {
 			expect(
 				readModelCache(providerId, TTL_MS, Date.now, dbPath)

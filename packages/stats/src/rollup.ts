@@ -27,11 +27,14 @@
 
 import type { Database } from "bun:sqlite";
 import { currentDb, unpricedRequestSql } from "./db";
+import { isDecisionModelApi, sideChannelCategory } from "./side-channels";
 import type {
 	AgentType,
 	AgentTypeStats,
 	AggregatedStats,
 	CostTimeSeriesPoint,
+	DailyActivityPoint,
+	DashboardStats,
 	FolderStats,
 	ModelPerformancePoint,
 	ModelStats,
@@ -39,10 +42,12 @@ import type {
 	ProviderAggregate,
 	ProviderHourlyPoint,
 	ProviderTimeSeriesPoint,
+	SideChannelStats,
 	TimeSeriesPoint,
 	ToolModelStats,
 	ToolTimeSeriesPoint,
 	ToolUsageStats,
+	UsageAttributionTotals,
 } from "./types";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -52,11 +57,20 @@ const DAY_MS = 24 * HOUR_MS;
  * Bump when the rollup schema or fact definitions change: the tables are then
  * dropped and every hour is rebuilt from the raw tables.
  */
-const ROLLUP_VERSION = "2";
+const ROLLUP_VERSION = "3";
 const ROLLUP_VERSION_KEY = "rollup_version";
 /** Bump when the dirty-marking triggers change; they are then recreated in place. */
-const TRIGGER_VERSION = "3";
+const TRIGGER_VERSION = "4";
 const TRIGGER_VERSION_KEY = "rollup_triggers_version";
+/**
+ * `tool_agent_rollup` (tool-result characters per hour and agent type) is built
+ * on its own dirty set, so adding it never rebuilds the other rollups. Bump to
+ * rebuild just this table.
+ */
+const TOOL_AGENT_VERSION = "1";
+const TOOL_AGENT_VERSION_KEY = "tool_agent_rollup_version";
+/** Before this, timestamps are sentinels (0) or garbage: their hours are seeded one by one, not as a range. */
+const SANE_TIMESTAMP_MS = Date.UTC(2000, 0, 1);
 
 /** Above this many dirty hours, reads use stale rollup rows instead of scanning dirty hours raw. */
 const EXACT_DIRTY_LIMIT = 96;
@@ -69,13 +83,25 @@ const REFRESH_MAX_BATCH = 64;
 // the raw read paths so both produce identical columns.
 // ---------------------------------------------------------------------------
 
-const MESSAGE_DIMENSIONS = "model, provider, folder, agent_type";
+/**
+ * `purpose` (NULL on assistant messages) and `api` carry the attribution of
+ * off-transcript model calls. Both stay raw: the purpose's category and whether
+ * the api is a native judgment api are decided in TypeScript at read time, so
+ * re-cutting either needs no rebuild.
+ */
+const MESSAGE_DIMENSION_COLUMNS = ["model", "provider", "folder", "agent_type", "purpose", "api"] as const;
+const MESSAGE_DIMENSIONS = MESSAGE_DIMENSION_COLUMNS.join(", ");
+
+/** The message dimensions as columns of `messages` qualified by `p`. */
+function messageDimensions(p: string): string {
+	return MESSAGE_DIMENSION_COLUMNS.map(column => `${p}${column}`).join(", ");
+}
 
 /** Additive per-bucket facts over `messages` (columns qualified by `p`). */
 function messageFacts(bucketExpr: string, p: string): string {
 	return `
 		${bucketExpr} AS bucket,
-		${p}model AS model, ${p}provider AS provider, ${p}folder AS folder, ${p}agent_type AS agent_type,
+		${MESSAGE_DIMENSION_COLUMNS.map(column => `${p}${column} AS ${column}`).join(", ")},
 		COUNT(*) AS requests,
 		SUM(CASE WHEN ${p}stop_reason = 'error' THEN 1 ELSE 0 END) AS failed,
 		SUM(${p}input_tokens) AS input_tokens,
@@ -141,11 +167,22 @@ function hourOf(column: string): string {
  * Trigger statements marking a row's hour and transcript dirty (`row` is
  * `NEW` or `OLD`), without any conflict clause.
  */
-function markDirty(row: "NEW" | "OLD"): string {
+function markDirty(row: "NEW" | "OLD", table: "messages" | "tool_calls"): string {
+	const toolAgent =
+		table === "tool_calls"
+			? `INSERT INTO tool_agent_dirty (bucket)
+		SELECT h FROM (SELECT ${hourOf(`${row}.timestamp`)} AS h) WHERE h NOT IN (SELECT bucket FROM tool_agent_dirty);`
+			: "";
 	return `INSERT INTO rollup_dirty (bucket)
 		SELECT h FROM (SELECT ${hourOf(`${row}.timestamp`)} AS h) WHERE h NOT IN (SELECT bucket FROM rollup_dirty);
 	INSERT INTO session_dirty (session_file)
-		SELECT ${row}.session_file WHERE ${row}.session_file NOT IN (SELECT session_file FROM session_dirty);`;
+		SELECT ${row}.session_file WHERE ${row}.session_file NOT IN (SELECT session_file FROM session_dirty);
+	${toolAgent}`;
+}
+
+/** Additive per-bucket tool-result facts per agent type (columns of `tool_calls`). */
+function toolAgentFacts(bucketExpr: string): string {
+	return `${bucketExpr} AS bucket, agent_type, SUM(COALESCE(result_chars, 0)) AS result_chars`;
 }
 
 /** Per-transcript facts over `messages` (qualified by `p`); tool calls counted by subquery. */
@@ -179,11 +216,12 @@ const EXACT_DIRTY_SESSIONS = 512;
  */
 export function ensureRollupSchema(database: Database): void {
 	const readMeta = (key: string) =>
-		(database.prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined)?.value;
+		(database.query("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined)?.value;
 	const fresh = readMeta(ROLLUP_VERSION_KEY) !== ROLLUP_VERSION;
+	const toolAgentFresh = fresh || readMeta(TOOL_AGENT_VERSION_KEY) !== TOOL_AGENT_VERSION;
 	// Steady state touches no schema: DDL on every open would contend with
 	// other omp processes writing the same database.
-	if (!fresh && readMeta(TRIGGER_VERSION_KEY) === TRIGGER_VERSION) return;
+	if (!fresh && !toolAgentFresh && readMeta(TRIGGER_VERSION_KEY) === TRIGGER_VERSION) return;
 	database
 		.transaction(() => {
 			if (fresh) {
@@ -193,6 +231,10 @@ export function ensureRollupSchema(database: Database): void {
 				database.run("DROP TABLE IF EXISTS session_rollup");
 				database.run("DROP TABLE IF EXISTS session_dirty");
 			}
+			if (toolAgentFresh) {
+				database.run("DROP TABLE IF EXISTS tool_agent_rollup");
+				database.run("DROP TABLE IF EXISTS tool_agent_dirty");
+			}
 			database.run(`
 			CREATE TABLE IF NOT EXISTS message_rollup (
 				bucket INTEGER NOT NULL,
@@ -200,6 +242,8 @@ export function ensureRollupSchema(database: Database): void {
 				provider TEXT NOT NULL,
 				folder TEXT NOT NULL,
 				agent_type TEXT NOT NULL,
+				purpose TEXT,
+				api TEXT NOT NULL,
 				requests INTEGER NOT NULL,
 				failed INTEGER NOT NULL,
 				input_tokens INTEGER NOT NULL,
@@ -255,17 +299,24 @@ export function ensureRollupSchema(database: Database): void {
 				tool_calls INTEGER NOT NULL
 			) WITHOUT ROWID;
 			CREATE TABLE IF NOT EXISTS session_dirty (session_file TEXT PRIMARY KEY) WITHOUT ROWID;
+			CREATE TABLE IF NOT EXISTS tool_agent_rollup (
+				bucket INTEGER NOT NULL,
+				agent_type TEXT NOT NULL,
+				result_chars INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_tool_agent_rollup_bucket ON tool_agent_rollup(bucket);
+			CREATE TABLE IF NOT EXISTS tool_agent_dirty (bucket INTEGER PRIMARY KEY) WITHOUT ROWID;
 		`);
 			// A tool share reads its assistant message, so message changes dirty the
 			// hour for both rollups (tool calls share their message's timestamp).
 			// Triggers must not use `OR IGNORE`: a trigger statement inherits the
 			// outer statement's conflict policy, and the UPSERTs in
 			// `insertMessageStats` would turn a duplicate dirty mark into a failed ingest.
-			for (const table of ["messages", "tool_calls"]) {
+			for (const table of ["messages", "tool_calls"] as const) {
 				const triggers = {
-					insert: `AFTER INSERT ON ${table} BEGIN ${markDirty("NEW")} END`,
-					delete: `AFTER DELETE ON ${table} BEGIN ${markDirty("OLD")} END`,
-					update: `AFTER UPDATE ON ${table} BEGIN ${markDirty("OLD")} ${markDirty("NEW")} END`,
+					insert: `AFTER INSERT ON ${table} BEGIN ${markDirty("NEW", table)} END`,
+					delete: `AFTER DELETE ON ${table} BEGIN ${markDirty("OLD", table)} END`,
+					update: `AFTER UPDATE ON ${table} BEGIN ${markDirty("OLD", table)} ${markDirty("NEW", table)} END`,
 				};
 				for (const [event, body] of Object.entries(triggers)) {
 					database.run(`DROP TRIGGER IF EXISTS rollup_dirty_${table}_${event}`);
@@ -273,7 +324,7 @@ export function ensureRollupSchema(database: Database): void {
 				}
 			}
 			database
-				.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
+				.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
 				.run(TRIGGER_VERSION_KEY, TRIGGER_VERSION);
 			if (fresh) {
 				database.run(`
@@ -286,8 +337,28 @@ export function ensureRollupSchema(database: Database): void {
 				SELECT DISTINCT session_file FROM messages UNION SELECT DISTINCT session_file FROM tool_calls
 			`);
 				database
-					.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
+					.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
 					.run(ROLLUP_VERSION_KEY, ROLLUP_VERSION);
+			}
+			if (toolAgentFresh) {
+				// Every hour between the first and last call, seeded from two index lookups
+				// instead of a scan; hours without calls refresh to nothing.
+				database.run(`
+				WITH RECURSIVE h(bucket) AS (
+					SELECT ${hourOf("MIN(timestamp)")} FROM tool_calls WHERE timestamp >= ${SANE_TIMESTAMP_MS}
+					UNION ALL
+					SELECT bucket + ${HOUR_MS} FROM h
+					WHERE bucket + ${HOUR_MS} <= (SELECT MAX(timestamp) FROM tool_calls)
+				)
+				INSERT OR IGNORE INTO tool_agent_dirty (bucket) SELECT bucket FROM h WHERE bucket IS NOT NULL
+			`);
+				database.run(`
+				INSERT OR IGNORE INTO tool_agent_dirty (bucket)
+				SELECT DISTINCT ${hourOf("timestamp")} FROM tool_calls WHERE timestamp < ${SANE_TIMESTAMP_MS}
+			`);
+				database
+					.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
+					.run(TOOL_AGENT_VERSION_KEY, TOOL_AGENT_VERSION);
 			}
 		})
 		.immediate();
@@ -307,8 +378,9 @@ export function getRollupStatus(): RollupStatus {
 	const database = currentDb();
 	if (!database) return { dirtyHours: 0, dirtySessions: 0 };
 	return database
-		.prepare(
-			"SELECT (SELECT COUNT(*) FROM rollup_dirty) AS dirtyHours, (SELECT COUNT(*) FROM session_dirty) AS dirtySessions",
+		.query(
+			`SELECT MAX((SELECT COUNT(*) FROM rollup_dirty), (SELECT COUNT(*) FROM tool_agent_dirty)) AS dirtyHours,
+			 (SELECT COUNT(*) FROM session_dirty) AS dirtySessions`,
 		)
 		.get() as RollupStatus;
 }
@@ -322,25 +394,25 @@ export function refreshRollupBatch(limit: number): number {
 	const database = currentDb();
 	if (!database) return 0;
 	const run = database.transaction(() => {
-		const buckets = database.prepare("SELECT bucket FROM rollup_dirty ORDER BY bucket DESC LIMIT ?").all(limit) as {
+		const buckets = database.query("SELECT bucket FROM rollup_dirty ORDER BY bucket DESC LIMIT ?").all(limit) as {
 			bucket: number;
 		}[];
-		const clearMessages = database.prepare("DELETE FROM message_rollup WHERE bucket = ?");
-		const clearTools = database.prepare("DELETE FROM tool_rollup WHERE bucket = ?");
-		const fillMessages = database.prepare(`
+		const clearMessages = database.query("DELETE FROM message_rollup WHERE bucket = ?");
+		const clearTools = database.query("DELETE FROM tool_rollup WHERE bucket = ?");
+		const fillMessages = database.query(`
 			INSERT INTO message_rollup (${MESSAGE_ROLLUP_COLUMNS})
 			SELECT ${messageFacts("?1", "")}
 			FROM messages WHERE timestamp >= ?1 AND timestamp < ?1 + ${HOUR_MS}
 			GROUP BY ${MESSAGE_DIMENSIONS}
 		`);
-		const fillTools = database.prepare(`
+		const fillTools = database.query(`
 			INSERT INTO tool_rollup (${TOOL_ROLLUP_COLUMNS})
 			SELECT ${toolFacts("?1")}
 			FROM tool_calls t ${TOOL_JOIN}
 			WHERE t.timestamp >= ?1 AND t.timestamp < ?1 + ${HOUR_MS}
 			GROUP BY t.tool_name, t.model, t.provider
 		`);
-		const clean = database.prepare("DELETE FROM rollup_dirty WHERE bucket = ?");
+		const clean = database.query("DELETE FROM rollup_dirty WHERE bucket = ?");
 		for (const { bucket } of buckets) {
 			clearMessages.run(bucket);
 			clearTools.run(bucket);
@@ -349,24 +421,41 @@ export function refreshRollupBatch(limit: number): number {
 			clean.run(bucket);
 		}
 
+		const agentBuckets = database
+			.query("SELECT bucket FROM tool_agent_dirty ORDER BY bucket DESC LIMIT ?")
+			.all(limit) as { bucket: number }[];
+		const clearAgent = database.query("DELETE FROM tool_agent_rollup WHERE bucket = ?");
+		const fillAgent = database.query(`
+			INSERT INTO tool_agent_rollup (bucket, agent_type, result_chars)
+			SELECT ${toolAgentFacts("?1")}
+			FROM tool_calls WHERE timestamp >= ?1 AND timestamp < ?1 + ${HOUR_MS}
+			GROUP BY agent_type
+		`);
+		const cleanAgent = database.query("DELETE FROM tool_agent_dirty WHERE bucket = ?");
+		for (const { bucket } of agentBuckets) {
+			clearAgent.run(bucket);
+			fillAgent.run(bucket);
+			cleanAgent.run(bucket);
+		}
+
 		// Transcripts are cheap (indexed by session_file); roll many per hour-batch.
 		const sessions = database
-			.prepare("SELECT session_file FROM session_dirty LIMIT ?")
+			.query("SELECT session_file FROM session_dirty LIMIT ?")
 			.all(limit * SESSIONS_PER_HOUR) as { session_file: string }[];
-		const clearSession = database.prepare("DELETE FROM session_rollup WHERE session_file = ?");
-		const fillSession = database.prepare(`
+		const clearSession = database.query("DELETE FROM session_rollup WHERE session_file = ?");
+		const fillSession = database.query(`
 			INSERT INTO session_rollup (${SESSION_ROLLUP_COLUMNS})
 			SELECT ${sessionFacts("m.")}
 			FROM messages m WHERE m.session_file = ?1
 			GROUP BY m.session_file
 		`);
-		const cleanSession = database.prepare("DELETE FROM session_dirty WHERE session_file = ?");
+		const cleanSession = database.query("DELETE FROM session_dirty WHERE session_file = ?");
 		for (const { session_file } of sessions) {
 			clearSession.run(session_file);
 			fillSession.run(session_file);
 			cleanSession.run(session_file);
 		}
-		return buckets.length + sessions.length;
+		return buckets.length + agentBuckets.length + sessions.length;
 	});
 	return run.immediate();
 }
@@ -393,7 +482,7 @@ export async function refreshRollups(opts?: RefreshOptions): Promise<void> {
 		const elapsed = performance.now() - started;
 		if (elapsed < REFRESH_TARGET_MS / 2) batch = Math.min(REFRESH_MAX_BATCH, batch * 2);
 		else if (elapsed > REFRESH_TARGET_MS * 2) batch = Math.max(1, Math.floor(batch / 2));
-		opts?.onProgress?.(getRollupStatus().dirtyHours);
+		if (opts?.onProgress) opts.onProgress(getRollupStatus().dirtyHours);
 		await Bun.sleep(0);
 	}
 }
@@ -416,7 +505,7 @@ interface Source {
 
 function dirtyIsSmall(database: Database): boolean {
 	const row = database
-		.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM rollup_dirty LIMIT ${EXACT_DIRTY_LIMIT + 1})`)
+		.query(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM rollup_dirty LIMIT ${EXACT_DIRTY_LIMIT + 1})`)
 		.get() as {
 		n: number;
 	};
@@ -456,7 +545,7 @@ function messageSource(database: Database, cutoff: number | null, fine: boolean)
 			`SELECT ${messageFacts("d.bucket", "m.")}
 			 FROM rollup_dirty d JOIN messages m ON m.timestamp >= d.bucket AND m.timestamp < d.bucket + ${HOUR_MS}
 			 ${hi !== null ? "WHERE d.bucket >= ?" : ""}
-			 GROUP BY d.bucket, m.model, m.provider, m.folder, m.agent_type`,
+			 GROUP BY d.bucket, ${messageDimensions("m.")}`,
 		);
 		if (hi !== null) params.push(hi);
 	}
@@ -508,7 +597,8 @@ function queryMessages<T>(window: Pick<RangeWindow, "cutoff"> & { bucketMs?: num
 	if (!database) return [];
 	const fine = window.bucketMs !== undefined && window.bucketMs < HOUR_MS;
 	const source = messageSource(database, normalizeCutoff(window.cutoff), fine);
-	return database.prepare(`SELECT ${select} FROM (${source.sql}) f ${tail}`).all(...source.params) as T[];
+	// `query` caches the compiled statement: the SQL varies only over a small set of shapes.
+	return database.query(`SELECT ${select} FROM (${source.sql}) f ${tail}`).all(...source.params) as T[];
 }
 
 function queryTools<T>(window: Pick<RangeWindow, "cutoff"> & { bucketMs?: number }, select: string, tail = ""): T[] {
@@ -516,15 +606,39 @@ function queryTools<T>(window: Pick<RangeWindow, "cutoff"> & { bucketMs?: number
 	if (!database) return [];
 	const fine = window.bucketMs !== undefined && window.bucketMs < HOUR_MS;
 	const source = toolSource(database, normalizeCutoff(window.cutoff), fine);
-	return database.prepare(`SELECT ${select} FROM (${source.sql}) f ${tail}`).all(...source.params) as T[];
+	return database.query(`SELECT ${select} FROM (${source.sql}) f ${tail}`).all(...source.params) as T[];
 }
 
 function normalizeCutoff(cutoff: number | null | undefined): number | null {
 	return cutoff === undefined || cutoff === null || cutoff <= 0 ? null : cutoff;
 }
 
+/**
+ * Series bucket for a fact row. Day buckets are the local calendar date
+ * (`YYYY-MM-DD` in the server's timezone, the viewer's when both run on one
+ * machine; the client tolerates a mismatch by floor-matching, see
+ * `client/data/series.ts`), so a day matches the date the user sees. Rolled
+ * hours are attributed by their start, so half-hour UTC offsets shift a day
+ * boundary by up to 30 minutes, as in {@link getProviderHourlyBurn}. Shorter
+ * buckets stay epoch-aligned.
+ */
 function seriesBucket(bucketMs: number): string {
+	if (bucketMs === DAY_MS) return "date(f.bucket / 1000, 'unixepoch', 'localtime')";
+	return epochBucket(bucketMs);
+}
+
+/** Epoch-aligned bucket start (ms) for a fact row, at any bucket size. */
+function epochBucket(bucketMs: number): string {
 	return `(f.bucket / ${bucketMs}) * ${bucketMs}`;
+}
+
+/**
+ * Epoch ms for a {@link seriesBucket} value. A local date resolves the way the
+ * client's day axis does (an offset-less date-time parses as local time), so
+ * both agree even on a day whose midnight a DST change skips.
+ */
+function seriesTimestamp(bucket: number | string): number {
+	return typeof bucket === "string" ? Date.parse(`${bucket}T00:00:00`) : bucket;
 }
 
 // ---------------------------------------------------------------------------
@@ -623,10 +737,19 @@ export function getStatsByFolder(cutoff: number | null = null, limit = Number.MA
 	).map(row => ({ folder: row.folder, ...toAggregatedStats(row) }));
 }
 
-/** Token usage per agent type (main, subagent, advisor). */
-export function getStatsByAgentType(cutoff: number | null = null): AgentTypeStats[] {
-	return queryMessages<{
+/**
+ * Usage attributed to what spent it: conversation turns per agent type (main,
+ * subagent, advisor) and side channels per category, apart for decision models.
+ * Rows are grouped by their raw dimensions and classified here (see
+ * `side-channels.ts`), so every row lands in exactly one group.
+ */
+export function getUsageAttribution(
+	cutoff: number | null = null,
+): Pick<DashboardStats, "byAgentType" | "bySideChannel"> {
+	const rows = queryMessages<{
 		agent_type: string | null;
+		purpose: string | null;
+		api: string;
 		requests: number;
 		input_tokens: number | null;
 		output_tokens: number | null;
@@ -635,30 +758,65 @@ export function getStatsByAgentType(cutoff: number | null = null): AgentTypeStat
 		cost_total: number | null;
 	}>(
 		{ cutoff },
-		`f.agent_type AS agent_type, SUM(f.requests) AS requests, SUM(f.input_tokens) AS input_tokens,
+		`f.agent_type AS agent_type, f.purpose AS purpose, f.api AS api,
+		 SUM(f.requests) AS requests, SUM(f.input_tokens) AS input_tokens,
 		 SUM(f.output_tokens) AS output_tokens, SUM(f.cache_read_tokens) AS cache_read_tokens,
 		 SUM(f.cache_write_tokens) AS cache_write_tokens, TOTAL(f.cost_total) AS cost_total`,
-		"GROUP BY f.agent_type",
-	).map(row => ({
-		agentType: (row.agent_type as AgentType | null) ?? "main",
-		totalRequests: row.requests,
-		totalInputTokens: row.input_tokens ?? 0,
-		totalOutputTokens: row.output_tokens ?? 0,
-		totalCacheReadTokens: row.cache_read_tokens ?? 0,
-		totalCacheWriteTokens: row.cache_write_tokens ?? 0,
-		totalCost: row.cost_total ?? 0,
-	}));
+		"GROUP BY f.agent_type, f.purpose, f.api",
+	);
+	const emptyTotals = (): UsageAttributionTotals => ({
+		totalRequests: 0,
+		totalInputTokens: 0,
+		totalOutputTokens: 0,
+		totalCacheReadTokens: 0,
+		totalCacheWriteTokens: 0,
+		totalCost: 0,
+	});
+	const byAgentType = new Map<AgentType, AgentTypeStats>();
+	const bySideChannel = new Map<string, SideChannelStats>();
+	for (const row of rows) {
+		const category = sideChannelCategory(row.purpose);
+		let totals: UsageAttributionTotals;
+		if (category === null) {
+			const agentType = (row.agent_type as AgentType | null) ?? "main";
+			let stat = byAgentType.get(agentType);
+			if (!stat) {
+				stat = { agentType, ...emptyTotals() };
+				byAgentType.set(agentType, stat);
+			}
+			totals = stat;
+		} else {
+			const decision = isDecisionModelApi(row.api);
+			const key = `${decision ? "decision" : "model"}:${category}`;
+			let stat = bySideChannel.get(key);
+			if (!stat) {
+				stat = { category, decision, ...emptyTotals() };
+				bySideChannel.set(key, stat);
+			}
+			totals = stat;
+		}
+		totals.totalRequests += row.requests;
+		totals.totalInputTokens += row.input_tokens ?? 0;
+		totals.totalOutputTokens += row.output_tokens ?? 0;
+		totals.totalCacheReadTokens += row.cache_read_tokens ?? 0;
+		totals.totalCacheWriteTokens += row.cache_write_tokens ?? 0;
+		totals.totalCost += row.cost_total ?? 0;
+	}
+	return {
+		byAgentType: [...byAgentType.values()],
+		bySideChannel: [...bySideChannel.values()].sort((a, b) => b.totalRequests - a.totalRequests),
+	};
 }
 
 /** Requests, errors, tokens and cost per bucket. */
 export function getTimeSeries({ cutoff, bucketMs }: RangeWindow): TimeSeriesPoint[] {
-	return queryMessages<{ bucket: number; requests: number; errors: number; tokens: number; cost: number }>(
+	return queryMessages<{ bucket: number | string; requests: number; errors: number; tokens: number; cost: number }>(
 		{ cutoff, bucketMs },
 		`${seriesBucket(bucketMs)} AS bucket, SUM(f.requests) AS requests, SUM(f.failed) AS errors,
 		 SUM(f.total_tokens) AS tokens, TOTAL(f.cost_total) AS cost`,
 		"GROUP BY 1 ORDER BY 1",
 	).map(row => ({
-		timestamp: row.bucket,
+		timestamp: seriesTimestamp(row.bucket),
 		requests: row.requests,
 		errors: row.errors,
 		tokens: row.tokens,
@@ -668,17 +826,22 @@ export function getTimeSeries({ cutoff, bucketMs }: RangeWindow): TimeSeriesPoin
 
 /** Requests per bucket per (model, provider). */
 export function getModelTimeSeries({ cutoff, bucketMs }: RangeWindow): ModelTimeSeriesPoint[] {
-	return queryMessages<{ bucket: number; model: string; provider: string; requests: number }>(
+	return queryMessages<{ bucket: number | string; model: string; provider: string; requests: number }>(
 		{ cutoff, bucketMs },
 		`${seriesBucket(bucketMs)} AS bucket, f.model AS model, f.provider AS provider, SUM(f.requests) AS requests`,
 		"GROUP BY 1, f.model, f.provider ORDER BY 1",
-	).map(row => ({ timestamp: row.bucket, model: row.model, provider: row.provider, requests: row.requests }));
+	).map(row => ({
+		timestamp: seriesTimestamp(row.bucket),
+		model: row.model,
+		provider: row.provider,
+		requests: row.requests,
+	}));
 }
 
 /** Average TTFT and output tokens/s per bucket per (model, provider). */
 export function getModelPerformanceSeries({ cutoff, bucketMs }: RangeWindow): ModelPerformancePoint[] {
 	return queryMessages<{
-		bucket: number;
+		bucket: number | string;
 		model: string;
 		provider: string;
 		requests: number;
@@ -691,7 +854,7 @@ export function getModelPerformanceSeries({ cutoff, bucketMs }: RangeWindow): Mo
 		 TOTAL(f.tps_sum) / NULLIF(SUM(f.tps_n), 0) AS avg_tps`,
 		"GROUP BY 1, f.model, f.provider ORDER BY 1",
 	).map(row => ({
-		timestamp: row.bucket,
+		timestamp: seriesTimestamp(row.bucket),
 		model: row.model,
 		provider: row.provider,
 		requests: row.requests,
@@ -703,7 +866,7 @@ export function getModelPerformanceSeries({ cutoff, bucketMs }: RangeWindow): Mo
 /** Daily cost per (model, provider) with the per-component split. */
 export function getCostTimeSeries(cutoff: number | null = null): CostTimeSeriesPoint[] {
 	return queryMessages<{
-		bucket: number;
+		bucket: string;
 		model: string;
 		provider: string;
 		cost: number;
@@ -721,7 +884,7 @@ export function getCostTimeSeries(cutoff: number | null = null): CostTimeSeriesP
 		 SUM(f.requests) AS requests`,
 		"GROUP BY 1, f.model, f.provider ORDER BY 1",
 	).map(row => ({
-		timestamp: row.bucket,
+		timestamp: seriesTimestamp(row.bucket),
 		model: row.model,
 		provider: row.provider,
 		cost: row.cost,
@@ -804,10 +967,29 @@ export function getProviderHourlyBurn(cutoff: number | null = null): ProviderHou
 	}));
 }
 
+/**
+ * Per-local-day request/token/cost totals since `cutoff`, oldest first, read
+ * from the hourly rollup. Returns null when the local UTC offset is not a whole
+ * hour (now or at `cutoff`), since hourly buckets then straddle local midnight,
+ * or while the dirty backlog is too large for exact reads; callers then
+ * aggregate the raw rows instead.
+ */
+export function getDailyActivityFromRollup(cutoff: number): DailyActivityPoint[] | null {
+	if (new Date().getTimezoneOffset() % 60 !== 0 || new Date(cutoff).getTimezoneOffset() % 60 !== 0) return null;
+	const database = currentDb();
+	if (!database || !dirtyIsSmall(database)) return null;
+	return queryMessages<{ day: string; cost: number; requests: number; total_tokens: number | null }>(
+		{ cutoff },
+		`date(f.bucket / 1000, 'unixepoch', 'localtime') AS day, TOTAL(f.cost_total) AS cost,
+		 SUM(f.requests) AS requests, SUM(f.total_tokens) AS total_tokens`,
+		"GROUP BY day ORDER BY day",
+	).map(row => ({ day: row.day, cost: row.cost, requests: row.requests, totalTokens: row.total_tokens ?? 0 }));
+}
+
 /** Tokens/cost per bucket per provider. */
 export function getProviderTimeSeries({ cutoff, bucketMs }: RangeWindow): ProviderTimeSeriesPoint[] {
 	return queryMessages<{
-		bucket: number;
+		bucket: number | string;
 		provider: string;
 		total_tokens: number;
 		cost: number;
@@ -820,7 +1002,7 @@ export function getProviderTimeSeries({ cutoff, bucketMs }: RangeWindow): Provid
 		 TOTAL(f.cost_total) AS cost, SUM(f.unpriced) AS unpriced, SUM(f.requests) AS requests`,
 		"GROUP BY 1, f.provider ORDER BY 1",
 	).map(row => ({
-		timestamp: row.bucket,
+		timestamp: seriesTimestamp(row.bucket),
 		provider: row.provider,
 		totalTokens: row.total_tokens,
 		cost: row.cost,
@@ -855,7 +1037,7 @@ export function getSessionRollups(): SessionRollupRow[] {
 	const database = currentDb();
 	if (!database) return [];
 	const { n } = database
-		.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_dirty LIMIT ${EXACT_DIRTY_SESSIONS + 1})`)
+		.query(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_dirty LIMIT ${EXACT_DIRTY_SESSIONS + 1})`)
 		.get() as { n: number };
 	const exact = n <= EXACT_DIRTY_SESSIONS;
 	const parts = [
@@ -869,7 +1051,7 @@ export function getSessionRollups(): SessionRollupRow[] {
 		);
 	}
 	return database
-		.prepare(
+		.query(
 			`SELECT session_file AS sessionFile, requests, started_at AS startedAt, ended_at AS endedAt,
 			 total_tokens AS totalTokens, cost_total AS costTotal, unpriced AS unpricedRequests, models,
 			 tool_calls AS toolCalls
@@ -943,9 +1125,137 @@ export function getToolStatsByModel(cutoff: number | null = null): ToolModelStat
 
 /** Calls and errors per bucket per tool. */
 export function getToolTimeSeries({ cutoff, bucketMs }: RangeWindow): ToolTimeSeriesPoint[] {
-	return queryTools<{ bucket: number; tool_name: string; calls: number; errors: number }>(
+	return queryTools<{ bucket: number | string; tool_name: string; calls: number; errors: number }>(
 		{ cutoff, bucketMs },
 		`${seriesBucket(bucketMs)} AS bucket, f.tool_name AS tool_name, SUM(f.calls) AS calls, SUM(f.errors) AS errors`,
 		"GROUP BY 1, f.tool_name ORDER BY 1",
-	).map(row => ({ timestamp: row.bucket, tool: row.tool_name, calls: row.calls, errors: row.errors }));
+	).map(row => ({
+		timestamp: seriesTimestamp(row.bucket),
+		tool: row.tool_name,
+		calls: row.calls,
+		errors: row.errors,
+	}));
+}
+
+// ---------------------------------------------------------------------------
+// Context facts (Spotlight tool-output share)
+// ---------------------------------------------------------------------------
+
+/** Per-bucket context facts of every transcript of one agent type: tool-result characters and output tokens. */
+export interface ContextFactPoint {
+	bucket: number;
+	agentType: AgentType;
+	resultChars: number;
+	outputTokens: number;
+}
+
+/** Tool-result characters per hour and agent type over `[cutoff, now]`; same union shape as {@link toolSource}. */
+function toolAgentSource(database: Database, cutoff: number | null, fine: boolean): Source {
+	if (fine) {
+		return {
+			sql: `SELECT ${toolAgentFacts("(timestamp / 300000) * 300000")} FROM tool_calls WHERE timestamp >= ? GROUP BY 1, agent_type`,
+			params: [cutoff ?? 0],
+		};
+	}
+	const hi = cutoff === null ? null : Math.ceil(cutoff / HOUR_MS) * HOUR_MS;
+	const { n } = database
+		.query(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM tool_agent_dirty LIMIT ${EXACT_DIRTY_LIMIT + 1})`)
+		.get() as { n: number };
+	const exact = n <= EXACT_DIRTY_LIMIT;
+	const parts: string[] = [];
+	const params: number[] = [];
+	parts.push(
+		`SELECT bucket, agent_type, result_chars FROM tool_agent_rollup
+		 WHERE ${exact ? "bucket NOT IN (SELECT bucket FROM tool_agent_dirty)" : "1"}${hi !== null ? " AND bucket >= ?" : ""}`,
+	);
+	if (hi !== null) params.push(hi);
+	if (cutoff !== null && hi !== null && cutoff < hi) {
+		parts.push(
+			`SELECT ${toolAgentFacts(hourOf("timestamp"))} FROM tool_calls
+			 WHERE timestamp >= ? AND timestamp < ? GROUP BY 1, agent_type`,
+		);
+		params.push(cutoff, hi);
+	}
+	if (exact) {
+		parts.push(
+			`SELECT d.bucket AS bucket, t.agent_type AS agent_type, SUM(COALESCE(t.result_chars, 0)) AS result_chars
+			 FROM tool_agent_dirty d JOIN tool_calls t ON t.timestamp >= d.bucket AND t.timestamp < d.bucket + ${HOUR_MS}
+			 ${hi !== null ? "WHERE d.bucket >= ?" : ""}
+			 GROUP BY d.bucket, t.agent_type`,
+		);
+		if (hi !== null) params.push(hi);
+	}
+	return { sql: parts.join(" UNION ALL "), params };
+}
+
+/** {@link ContextFactPoint}s over a window, from the rollups (exact while few hours are dirty). */
+export function getContextFactSeries(database: Database, { cutoff, bucketMs }: RangeWindow): ContextFactPoint[] {
+	const fine = bucketMs < HOUR_MS;
+	const normalized = normalizeCutoff(cutoff);
+	const tools = toolAgentSource(database, normalized, fine);
+	const messages = messageSource(database, normalized, fine);
+	const points = new Map<string, ContextFactPoint>();
+	const point = (bucket: number, agentType: AgentType) => {
+		const key = `${bucket}:${agentType}`;
+		let p = points.get(key);
+		if (!p) {
+			p = { bucket, agentType, resultChars: 0, outputTokens: 0 };
+			points.set(key, p);
+		}
+		return p;
+	};
+	type Row = { bucket: number; agent_type: AgentType; n: number | null };
+	const toolRows = database
+		.query(
+			`SELECT ${epochBucket(bucketMs)} AS bucket, f.agent_type AS agent_type, SUM(f.result_chars) AS n
+			 FROM (${tools.sql}) f GROUP BY 1, 2`,
+		)
+		.all(...tools.params) as Row[];
+	for (const row of toolRows) point(row.bucket, row.agent_type).resultChars += row.n ?? 0;
+	const messageRows = database
+		.query(
+			`SELECT ${epochBucket(bucketMs)} AS bucket, f.agent_type AS agent_type, SUM(f.output_tokens) AS n
+			 FROM (${messages.sql}) f GROUP BY 1, 2`,
+		)
+		.all(...messages.params) as Row[];
+	for (const row of messageRows) point(row.bucket, row.agent_type).outputTokens += row.n ?? 0;
+	return [...points.values()].sort((a, b) => a.bucket - b.bucket);
+}
+
+/** A transcript's request span and its first request's prompt (input + cache read + cache write). */
+export interface SessionSpan {
+	sessionFile: string;
+	startedAt: number;
+	endedAt: number;
+	firstPrompt: number;
+}
+
+/**
+ * Spans of the transcripts with a request at or after `endedAfter` (all when null), from `session_rollup` with
+ * the same exactness rule as {@link getSessionRollups}.
+ */
+export function getSessionSpans(database: Database, endedAfter: number | null): SessionSpan[] {
+	const { n } = database
+		.query(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_dirty LIMIT ${EXACT_DIRTY_SESSIONS + 1})`)
+		.get() as { n: number };
+	const exact = n <= EXACT_DIRTY_SESSIONS;
+	const parts = [
+		`SELECT session_file, started_at, ended_at FROM session_rollup
+		 WHERE ended_at >= ?1${exact ? " AND session_file NOT IN (SELECT session_file FROM session_dirty)" : ""}`,
+	];
+	if (exact) {
+		parts.push(
+			`SELECT m.session_file, MIN(m.timestamp), MAX(m.timestamp + COALESCE(m.duration, 0))
+			 FROM session_dirty d JOIN messages m ON m.session_file = d.session_file
+			 GROUP BY m.session_file HAVING MAX(m.timestamp + COALESCE(m.duration, 0)) >= ?1`,
+		);
+	}
+	return database
+		.query(
+			`SELECT s.session_file AS sessionFile, s.started_at AS startedAt, s.ended_at AS endedAt,
+			 COALESCE((SELECT m.input_tokens + m.cache_read_tokens + m.cache_write_tokens FROM messages m
+			   WHERE m.timestamp = s.started_at AND m.session_file = s.session_file LIMIT 1), 0) AS firstPrompt
+			 FROM (${parts.join(" UNION ALL ")}) s`,
+		)
+		.all(endedAfter ?? 0) as SessionSpan[];
 }

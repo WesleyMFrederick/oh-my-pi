@@ -429,4 +429,121 @@ describe("formatSessionHistoryMarkdown", () => {
 		expect(mid).toContain(`\`\`\`diff\n${midDiff}\n\`\`\``);
 		expect(mid).not.toContain("elided");
 	});
+	it("transforms one-line tool previews before truncating them", () => {
+		const secret = `SECRET_${"x".repeat(80)}`;
+		const transform = (text: string): string => text.replace(secret, "[redacted]");
+		const output = formatSessionHistoryMarkdown(
+			[
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "c1",
+							name: "bash",
+							arguments: {
+								command: `${"p".repeat(100)}${secret}`,
+								[INTENT_FIELD]: `${"i".repeat(65)}${secret}`,
+							},
+						},
+					],
+					timestamp: 1,
+				},
+			],
+			{ includeToolIntent: true, transformExpandedToolIO: transform },
+		);
+
+		expect(output).toContain("[redacted]");
+		expect(output).not.toContain(secret.slice(0, 16));
+	});
+
+	it("transforms execution-source previews before truncating them", () => {
+		const secret = `SECRET_${"x".repeat(80)}`;
+		const output = formatSessionHistoryMarkdown(
+			[
+				{
+					role: "bashExecution",
+					command: `${"p".repeat(100)}${secret}`,
+					output: "",
+					exitCode: 0,
+					timestamp: 1,
+				},
+			],
+			{ transformExpandedToolIO: text => text.replace(secret, "[redacted]") },
+		);
+
+		expect(output).toContain("[redacted]");
+		expect(output).not.toContain(secret.slice(0, 16));
+	});
+
+	it("redacts secrets that cross the preview cut at a space or past 8 KiB", () => {
+		// Reviewer repro: a two-word secret straddling the 120-char cut, plus a
+		// single token longer than any fixed scan window.
+		const spaced = "SECRETONE SECRETTWO";
+		const long = `LONGSECRET_${"z".repeat(9 * 1024)}`;
+		const transform = (text: string): string => text.replaceAll(spaced, "[redacted]").replaceAll(long, "[redacted]");
+		const output = formatSessionHistoryMarkdown(
+			[
+				{
+					role: "bashExecution",
+					command: `${"p".repeat(105)}${spaced} suffix`,
+					output: "",
+					exitCode: 0,
+					timestamp: 1,
+				},
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "c1",
+							name: "bash",
+							arguments: { command: `${"p".repeat(105)}${spaced} suffix` },
+						},
+						{ type: "toolCall", id: "c2", name: "bash", arguments: { command: `${"q".repeat(100)}${long}` } },
+					],
+					timestamp: 2,
+				},
+			],
+			{ transformExpandedToolIO: transform },
+		);
+
+		expect(output).not.toContain("SECRETONE");
+		expect(output).not.toContain("LONGSECRET");
+		expect(output.match(/\[redacted\]/g)).toHaveLength(3);
+	});
+
+	// Current sessions record the submitted draft as `prompt`; older ones carry only `args`.
+	const args = "Now explain closures in your own words, focusing on the counter example";
+	for (const [label, extra] of [
+		["submitted draft", { prompt: `/skill:in-your-own-words ${args}` }],
+		["legacy args", {}],
+	] as const) {
+		it(`preserves a skill-prompt's user text past the 120-char body cap (${label})`, () => {
+			const body = `# in-your-own-words\n${"Instruction line filling the skill body. ".repeat(20)}`;
+			const output = formatSessionHistoryMarkdown(
+				[
+					{
+						role: "custom",
+						customType: "skill-prompt",
+						content: `[IMPORTANT: User invoked the "in-your-own-words" skill; follow its instructions. Full skill below.]\n\n${body}\n\n---\n\nUser: ${args}`,
+						display: true,
+						attribution: "user",
+						details: {
+							name: "in-your-own-words",
+							path: "/skills/in-your-own-words/SKILL.md",
+							args,
+							...extra,
+							lineCount: 21,
+						},
+						timestamp: 1,
+					},
+				],
+				{ watchedRoles: true },
+			);
+
+			expect(output).toContain("[skill:in-your-own-words]");
+			expect(output).toContain("counter example");
+		});
+	}
 });

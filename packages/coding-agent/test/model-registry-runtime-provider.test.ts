@@ -160,6 +160,45 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(afterAnthropicCount).toBe(beforeAnthropicCount);
 	});
 
+	test("extension runner models keep their kind across refresh", async () => {
+		registry.registerProvider(
+			"my-gateway",
+			{
+				baseUrl: "https://gateway.example.com/v1",
+				apiKey: "RUNTIME_KEY",
+				api: "openai-completions",
+				models: [{ ...baseModel, id: "gpt-image-2", api: "openai-images", kind: "image" }],
+			},
+			"ext://runtime",
+		);
+		const isGatewayImage = (model: Model<Api>) => model.provider === "my-gateway" && model.id === "gpt-image-2";
+
+		expect(registry.getAvailable("image").some(isGatewayImage)).toBe(true);
+		expect(registry.getAll().some(isGatewayImage)).toBe(false);
+		await registry.refresh("offline");
+		expect(registry.getAll("image").some(isGatewayImage)).toBe(true);
+	});
+
+	test("fetchDynamicModels drops a row whose api cannot serve its kind", async () => {
+		registry.registerProvider(
+			"my-gateway",
+			{
+				baseUrl: "https://gateway.example.com/v1",
+				apiKey: "RUNTIME_KEY",
+				api: "openai-completions",
+				fetchDynamicModels: async () => [
+					{ ...baseModel, id: "mismatched", api: "openai-images", kind: "chat" },
+					{ ...baseModel, id: "gpt-image-2", api: "openai-images" },
+				],
+			},
+			"ext://runtime",
+		);
+		await registry.refreshRuntimeProviders("online");
+
+		expect(registry.find("my-gateway", "mismatched")).toBeUndefined();
+		expect(registry.find("my-gateway", "gpt-image-2")).toMatchObject({ kind: "image" });
+	});
+
 	test("registerProvider rebuilds inferred computer capability after OpenAI runtime reroutes", async () => {
 		const modelId = "gpt-5.4";
 		const directModel = registry.find("openai", modelId);
@@ -346,6 +385,32 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(dynamicFetches).toBe(1);
 		expect(registry.find(providerName, "dynamic-model")).toBeDefined();
 		expect(registry.find(providerName, "fallback-model")).toBeDefined();
+	});
+
+	test("retryUnavailableDiscovery recovers models a failed discovery left out", async () => {
+		const providerName = "flaky-runtime-provider";
+		let failing = true;
+		registry.registerProvider(
+			providerName,
+			{
+				baseUrl: "https://runtime.example.com/v1",
+				apiKey: "RUNTIME_KEY",
+				api: "openai-completions",
+				models: [{ ...baseModel, id: "fallback-model" }],
+				fetchDynamicModels: async () => {
+					if (failing) throw new Error("transient discovery failure");
+					return [{ ...baseModel, id: "dynamic-model" }];
+				},
+			},
+			"ext://runtime",
+		);
+		await registry.refreshRuntimeProviders("online");
+		expect(registry.find(providerName, "dynamic-model")).toBeUndefined();
+
+		failing = false;
+		await registry.retryUnavailableDiscovery();
+
+		expect(registry.find(providerName, "dynamic-model")).toBeDefined();
 	});
 
 	test("configured discovery suppresses extension fetchDynamicModels for the same provider", async () => {
@@ -972,6 +1037,41 @@ describe("ModelRegistry runtime provider registration", () => {
 
 		registry.clearSourceRegistrations("ext://oauth");
 		expect(getProviderModels(registry, "projecting-provider")).toEqual([]);
+	});
+
+	test("a provider lookup reflects another provider's catalog modifier once its OAuth login lands", async () => {
+		const config: ProviderConfigInput = {
+			api: "custom-gated-api",
+			baseUrl: "https://example.invalid/",
+			streamSimple,
+			models: [baseModel],
+			oauth: {
+				name: "Gated OAuth",
+				login: async () => ({ access: "a", refresh: "r", expires: Date.now() + 60_000 }),
+				refreshToken: async credentials => credentials,
+				getApiKey: credentials => credentials.access,
+				modifyModels: models =>
+					models.map(model =>
+						model.provider === "anthropic" ? { ...model, name: `${model.name} (gated)` } : model,
+					),
+			},
+		};
+		registry.registerProvider("gated-provider", config, "ext://oauth");
+		const anthropicNames = () => registry.getProviderModels("anthropic").map(model => model.name);
+
+		// Without credentials the hook cannot run, so the lookup stays provider-scoped and untouched.
+		expect(anthropicNames().length).toBeGreaterThan(0);
+		expect(anthropicNames().some(name => name.endsWith(" (gated)"))).toBe(false);
+
+		await authStorage.credentials.set("gated-provider", {
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 60_000,
+		});
+		// The login flow refreshes only the authenticated provider; anthropic's lookup must still see the hook.
+		await registry.refreshProvider("gated-provider", "offline");
+		expect(anthropicNames().every(name => name.endsWith(" (gated)"))).toBe(true);
 	});
 
 	test("oauth.modifyModels output is materialized through buildModel", async () => {

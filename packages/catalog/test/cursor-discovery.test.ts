@@ -29,10 +29,10 @@ import {
 	ModelVendorId,
 } from "../src/discovery/cursor-proto";
 import { create, fromBinary, toBinary } from "../src/discovery/protobuf";
-import { collapseBuiltVariants } from "../src/compat/collapse";
+import { collapseBuiltVariants, getVariantAliasSources, resolveVariantSelector } from "../src/compat/collapse";
 import { resolveProviderModels } from "../src/model-manager";
 import { cursorModelManagerOptions } from "../src/provider-models/special";
-import { getModelPricingStatus } from "../src/models";
+import { calculateUncachedInputCost, getModelPricingStatus } from "../src/models";
 import type { ModelSpec } from "../src/types";
 
 const FIXTURE_MODEL_IDS = [
@@ -44,6 +44,9 @@ const FIXTURE_MODEL_IDS = [
 	"kimi-k3-high",
 	"kimi-k3-low",
 	"kimi-k3-max",
+	"k3",
+	"cursor/k3",
+	"CURSOR/K3",
 	"cursor-grok-4.5",
 	"cursor-grok-4.5-fast",
 	"cursor-grok-4.6",
@@ -51,11 +54,14 @@ const FIXTURE_MODEL_IDS = [
 	"composer-2.5",
 	"composer-2.5-fast",
 	// Similar but unverified ids must not inherit image routing.
+	"K3",
 	"composer-3",
 	"composer-2.50",
 	"cursor-grok-5",
 	"grok-code-fast-2",
 	"k3-256k",
+	"cursor/k3-256k",
+	"K3-256K",
 	// Versioned Cursor Grok siblings: the id marks them reasoning.
 	"cursor-grok-4.5-high",
 	"cursor-grok-4.6-xhigh",
@@ -120,6 +126,26 @@ describe("cursor discovery input modalities (issue #4726)", () => {
 		expect(byId.get("cursor-grok-5")?.input).toEqual(["text"]);
 		expect(byId.get("grok-code-fast-2")?.input).toEqual(["text"]);
 		expect(byId.get("k3-256k")?.input).toEqual(["text"]);
+	});
+
+	it("preserves verified K3 aliases without inflating unverified K3 selector capabilities", async () => {
+		const byId = await discover();
+		for (const id of ["kimi-k3-high", "kimi-k3-low", "kimi-k3-max", "k3", "cursor/k3", "CURSOR/K3"]) {
+			const spec = byId.get(id);
+			expect(spec).toBeDefined();
+			if (spec) {
+				expect(buildModel(spec).input).toEqual(["text", "image"]);
+				expect(buildModel(spec).contextWindow).toBe(1_000_000);
+			}
+		}
+		for (const id of ["K3", "k3-256k", "cursor/k3-256k", "K3-256K"]) {
+			const spec = byId.get(id);
+			expect(spec).toBeDefined();
+			if (spec) {
+				expect(buildModel(spec).input).toEqual(["text"]);
+				expect(buildModel(spec).contextWindow).toBe(200_000);
+			}
+		}
 	});
 
 	it("recognizes reference-less Kimi K3 effort variants as reasoning models", async () => {
@@ -349,7 +375,6 @@ describe("fetchCursorUsableModels", () => {
 						variant("claude-4.6-opus-low", "low", false, true, false),
 						variant("claude-4.6-opus-high", "high", false, false, true),
 						variant("claude-4.6-opus-max", "max", true),
-						variant("claude-4.6-opus-medium", "medium", false),
 						variant("claude-4.6-opus-high", "max", true),
 						variant("claude-4.6-opus-xhigh", "xhigh", false),
 						variant("claude-4.6-opus-high", "high", true, false, true, "1m"),
@@ -395,7 +420,6 @@ describe("fetchCursorUsableModels", () => {
 				cursorPrice: 2.5,
 				cursorRequiresDataRetention: false,
 				cursorSupportsSandboxing: true,
-				isProviderDefault: true,
 				// The prose sentence only: no HTML, bold title, or context line.
 				description: "Anthropic's earlier flagship model, great for difficult tasks.",
 				thinking: {
@@ -452,7 +476,6 @@ describe("fetchCursorUsableModels", () => {
 				}),
 			}),
 		);
-		expect(models?.some(model => model.id === "claude-4.6-opus-medium")).toBe(false);
 		expect(models?.some(model => model.id === "claude-4.6-opus-xhigh")).toBe(false);
 		expect(models?.some(model => model.id === "fable-retention")).toBe(false);
 
@@ -463,7 +486,92 @@ describe("fetchCursorUsableModels", () => {
 		expect(rebuiltLane?.supportsTools).toBe(true);
 		expect(rebuiltLane?.cursorModelRoutes).toEqual(lane?.cursorModelRoutes);
 		expect(rebuiltLane?.thinking?.effortRouting).toEqual(lane?.thinking?.effortRouting);
-		expect(rebuiltLane?.isProviderDefault).toBe(true);
+	});
+
+	it("lists AvailableModels models that GetUsableModels omits", async () => {
+		const usable = create(GetUsableModelsResponseSchema, {
+			models: [create(ModelDetailsSchema, { modelId: "composer-2.5" })],
+		});
+		const available = create(AvailableModelsResponseSchema, {
+			models: [
+				create(AvailableModelsResponse_ModelDetailsSchema, {
+					name: "glm-5p3-flash",
+					clientDisplayName: "GLM 5.3 Flash",
+					supportsAgent: true,
+					supportsImages: true,
+					contextTokenLimit: 1_000_000,
+					legacySlugs: ["glm-5p3-flash", "glm-5p3-flash-low", "glm-5p3-flash-high", "glm-5p3-flash-max"],
+					variants: [
+						richVariant("glm-5p3-flash-low", { reasoning: "low" }),
+						richVariant("glm-5p3-flash-high", { reasoning: "high" }, { isDefaultNonMaxConfig: true }),
+						richVariant("glm-5p3-flash-max", { reasoning: "max" }),
+					],
+				}),
+			],
+		});
+		const rpcBaseUrl = await startCursorDiscoveryRpcServer({
+			"/agent.v1.AgentService/GetUsableModels": toBinary(GetUsableModelsResponseSchema, usable),
+			"/aiserver.v1.AiService/AvailableModels": toBinary(AvailableModelsResponseSchema, available),
+		});
+		const models = await fetchCursorUsableModels({
+			apiKey: "account-token",
+			baseUrl: rpcBaseUrl,
+			timeoutMs: 1_000,
+		});
+
+		const lane = models?.find(model => model.id === "glm-5p3-flash");
+		expect(lane?.requestModelId).toBe("glm-5p3-flash-high");
+		expect(lane?.cursorModelRoutes).toEqual({
+			"glm-5p3-flash-low": {
+				modelId: "glm-5p3-flash",
+				parameters: [{ id: "reasoning", value: "low" }],
+			},
+			"glm-5p3-flash-high": {
+				modelId: "glm-5p3-flash",
+				parameters: [{ id: "reasoning", value: "high" }],
+			},
+			"glm-5p3-flash-max": {
+				modelId: "glm-5p3-flash",
+				parameters: [{ id: "reasoning", value: "max" }],
+			},
+		});
+		expect(lane?.thinking?.effortRouting).toEqual({
+			low: "glm-5p3-flash-low",
+			high: "glm-5p3-flash-high",
+			max: "glm-5p3-flash-max",
+		});
+		expect(models?.some(model => model.id === "composer-2.5")).toBe(true);
+	});
+
+	it("leaves out AvailableModels models Cursor hides or serves only to Cmd-K", async () => {
+		const usable = create(GetUsableModelsResponseSchema, {
+			models: [create(ModelDetailsSchema, { modelId: "composer-2.5" })],
+		});
+		const lane = (name: string, flags: { isHidden?: boolean; onlySupportsCmdK?: boolean }) =>
+			create(AvailableModelsResponse_ModelDetailsSchema, {
+				name,
+				clientDisplayName: name,
+				supportsAgent: true,
+				legacySlugs: [name],
+				...flags,
+			});
+		const available = create(AvailableModelsResponseSchema, {
+			models: [
+				lane("glm-5p3", {}),
+				lane("hidden-preview", { isHidden: true }),
+				lane("cmdk-fast", { onlySupportsCmdK: true }),
+			],
+		});
+		const rpcBaseUrl = await startCursorDiscoveryRpcServer({
+			"/agent.v1.AgentService/GetUsableModels": toBinary(GetUsableModelsResponseSchema, usable),
+			"/aiserver.v1.AiService/AvailableModels": toBinary(AvailableModelsResponseSchema, available),
+		});
+		const models = await fetchCursorUsableModels({ apiKey: "account-token", baseUrl: rpcBaseUrl, timeoutMs: 1_000 });
+
+		const ids = models?.map(model => model.id) ?? [];
+		expect(ids).toContain("glm-5p3");
+		expect(ids).not.toContain("hidden-preview");
+		expect(ids).not.toContain("cmdk-fast");
 	});
 
 	it("prices rich lanes from the KDL rate card and leaves uncovered lanes unpriced", async () => {
@@ -497,6 +605,8 @@ describe("fetchCursorUsableModels", () => {
 				"claude-opus-4-8-high",
 				"claude-opus-4-8-high-fast",
 				"gpt-5.1",
+				"gemini-4-argon",
+				"gemini-4-argon-fast",
 			].map(modelId => create(ModelDetailsSchema, { modelId })),
 		});
 		const available = create(AvailableModelsResponseSchema, {
@@ -521,6 +631,14 @@ describe("fetchCursorUsableModels", () => {
 					name: "gpt-5.1",
 					clientDisplayName: "GPT-5.1",
 					supportsAgent: true,
+				}),
+				create(AvailableModelsResponse_ModelDetailsSchema, {
+					name: "gemini-4-argon",
+					clientDisplayName: "Gemini 4 Argon",
+					supportsAgent: true,
+					legacySlugs: ["gemini-4-argon", "gemini-4-argon-fast"],
+					parameterDefinitions: [fastDefinition],
+					variants: [fastVariant("gemini-4-argon", false), fastVariant("gemini-4-argon-fast", true)],
 				}),
 			],
 		});
@@ -559,6 +677,18 @@ describe("fetchCursorUsableModels", () => {
 		const uncovered = built("gpt-5.1");
 		expect(uncovered.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 		expect(getModelPricingStatus(uncovered)).toBe("unknown");
+		// A lane priced from a sibling slug's card (no rule names its own id)
+		// keeps that card's dated schedule, scaled by the declared multiplier,
+		// so it changes price on the date even on a row built before it.
+		const argonSwitch = Date.parse("2026-12-01T08:00:00Z");
+		for (const [id, multiplier] of [
+			["gemini-4-argon", 1],
+			["gemini-4-argon-fast", 2],
+		] as const) {
+			const argon = built(id);
+			expect(calculateUncachedInputCost(argon.cost, 1_000_000, argonSwitch - 1)).toBeCloseTo(2 * multiplier, 10);
+			expect(calculateUncachedInputCost(argon.cost, 1_000_000, argonSwitch)).toBeCloseTo(4 * multiplier, 10);
+		}
 	});
 	it("decodes Cursor's length-delimited vendor metadata", () => {
 		const encoded = Uint8Array.from(Buffer.from("0a0766697874757265d202020801", "hex"));
@@ -642,7 +772,6 @@ describe("fetchCursorUsableModels", () => {
 					contextWindow: 123_456,
 					input: ["text", "image"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					isProviderDefault: true,
 				}),
 			]);
 		} finally {
@@ -1045,8 +1174,8 @@ describe("cursor rich discovery review regressions", () => {
 			expect(built).toEqual(spec.cost);
 			return built;
 		};
-		expect(cost("grok-4.5")).toEqual({ input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 });
-		expect(cost("grok-4.5-fast")).toEqual({ input: 4, output: 18, cacheRead: 1, cacheWrite: 0 });
+		expect(cost("cursor-grok-4.5")).toEqual({ input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 });
+		expect(cost("cursor-grok-4.5-fast")).toEqual({ input: 4, output: 18, cacheRead: 1, cacheWrite: 0 });
 		expect(cost("gpt-5.2")).toEqual({ input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 });
 		expect(cost("gpt-5.2-fast")).toEqual({ input: 3.5, output: 28, cacheRead: 0.35, cacheWrite: 0 });
 		expect(cost("gpt-5.4")).toEqual({ input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 });
@@ -1122,5 +1251,78 @@ describe("cursor rich discovery review regressions", () => {
 		for (const effort of model.thinking?.efforts ?? []) {
 			expect(model.thinking?.effortRouting?.[effort]).toBe("claude-4.5-sonnet-thinking");
 		}
+	});
+
+	it("keeps Cursor Grok logical ids stable whether or not AvailableModels answers (#14164)", async () => {
+		const efforts = ["low", "medium", "high", "xhigh"];
+		const slugs = efforts.flatMap(effort => [`cursor-grok-4.6-${effort}`, `cursor-grok-4.6-${effort}-fast`]);
+		const usable = toBinary(
+			GetUsableModelsResponseSchema,
+			create(GetUsableModelsResponseSchema, {
+				models: slugs.map(modelId => create(ModelDetailsSchema, { modelId })),
+			}),
+		);
+		// AvailableModels names the model `grok-4.6`; only its slugs carry `cursor-`.
+		const available = toBinary(
+			AvailableModelsResponseSchema,
+			create(AvailableModelsResponseSchema, {
+				models: [
+					create(AvailableModelsResponse_ModelDetailsSchema, {
+						name: "grok-4.6",
+						clientDisplayName: "Grok 4.6",
+						supportsAgent: true,
+						legacySlugs: slugs,
+						parameterDefinitions: [booleanParameter("fast", "2x more expensive")],
+						variants: efforts.flatMap(effort => [
+							richVariant(
+								`cursor-grok-4.6-${effort}`,
+								{ reasoning: effort, fast: "false" },
+								{ isDefaultNonMaxConfig: effort === "medium" },
+							),
+							richVariant(`cursor-grok-4.6-${effort}-fast`, { reasoning: effort, fast: "true" }),
+						]),
+					}),
+				],
+			}),
+		);
+		const discoverIds = async (availableStatus: number): Promise<string[]> => {
+			const server = serveCursorRpcStatuses({
+				"/agent.v1.AgentService/GetUsableModels": { status: 200, body: usable },
+				"/aiserver.v1.AiService/AvailableModels": { status: availableStatus, body: available },
+			});
+			try {
+				const result = await resolveProviderModels(
+					{
+						...cursorModelManagerOptions({ apiKey: "t", baseUrl: server.url.toString() }),
+						cacheDbPath: await createTempCachePath(),
+						staticModels: [],
+					},
+					"online",
+				);
+				return result.models.map(model => model.id).sort();
+			} finally {
+				server.stop(true);
+			}
+		};
+
+		const expected = ["cursor-grok-4.6", "cursor-grok-4.6-fast"];
+		expect(await discoverIds(200)).toEqual(expected);
+		expect(await discoverIds(503)).toEqual(expected);
+	});
+
+	it("migrates selectors and overrides keyed by the retired unprefixed rich Grok lane ids (#14164)", () => {
+		for (const [retired, stable] of [
+			["grok-4.5", "cursor-grok-4.5"],
+			["grok-4.5-fast", "cursor-grok-4.5-fast"],
+			["grok-4.6", "cursor-grok-4.6"],
+			["grok-4.6-fast", "cursor-grok-4.6-fast"],
+		] as const) {
+			expect(resolveVariantSelector("cursor", retired)).toBe(stable);
+			// models.yml `modelOverrides` re-key through the reverse index.
+			expect(getVariantAliasSources("cursor", stable)).toContain(retired);
+		}
+		// Grok 4.7 lanes were always unprefixed; they must not be re-keyed.
+		expect(resolveVariantSelector("cursor", "grok-4.7")).toBeUndefined();
+		expect(getVariantAliasSources("cursor", "cursor-grok-4.7")).not.toContain("grok-4.7");
 	});
 });

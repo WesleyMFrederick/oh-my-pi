@@ -57,7 +57,6 @@ function makeCtx(isStreaming = false, messages: AgentMessage[] = []) {
 		sessionManager,
 		session: {
 			messages,
-			maybeStartTitleGeneration: vi.fn(),
 			isStreaming,
 			isCompacting: false,
 			queuedMessageCount: 0,
@@ -173,6 +172,32 @@ describe("input controller — slash command history (#3148)", () => {
 		expect(editor.pendingImageLinks).toEqual([]);
 	});
 
+	// #13925: queue shorthand must not write to a guest's local session/history.
+	it.each([
+		{ input: "-> /new", readOnly: false, compacting: false },
+		{ input: "=>\n1. /new\n2. inspect the result", readOnly: true, compacting: false },
+		{ input: "-> inspect the result", readOnly: false, compacting: true },
+	])("refuses guest queue shorthand ($input, readOnly=$readOnly)", async ({ input, readOnly, compacting }) => {
+		const { ctx, editor, addToHistory, followUp, prompt, onInputCallback, showStatus } = makeCtx(true);
+		const sendPrompt = vi.fn();
+		Object.assign(ctx, { collabGuest: { readOnly, sendPrompt } });
+		Object.assign(ctx.session, { isCompacting: compacting });
+		controllerFor(ctx);
+		// The real editor clears its text before invoking the submit callback.
+		editor.setText("");
+
+		await editor.onSubmit?.(input);
+
+		expect(showStatus).toHaveBeenCalledWith("/queue is host-only during a collab session");
+		expect(editor.getText()).toBe(input);
+		expect(addToHistory).not.toHaveBeenCalled();
+		expect(followUp).not.toHaveBeenCalled();
+		expect(prompt).not.toHaveBeenCalled();
+		expect(onInputCallback).not.toHaveBeenCalled();
+		expect(sendPrompt).not.toHaveBeenCalled();
+		expect(ctx.compactionQueuedMessages).toEqual([]);
+	});
+
 	it("routes /queue through the yield-only follow-up queue while streaming", async () => {
 		const { ctx, editor, addToHistory, followUp, showStatus } = makeCtx(true);
 		controllerFor(ctx);
@@ -183,22 +208,6 @@ describe("input controller — slash command history (#3148)", () => {
 		expect(followUp).toHaveBeenCalledWith("inspect the final result", undefined);
 		expect(addToHistory).toHaveBeenCalledWith("/queue inspect the final result");
 		expect(showStatus).toHaveBeenCalledWith("Queued message for when the agent yields");
-	});
-
-	it("starts the first queued item immediately when the session is idle", async () => {
-		const { ctx, editor, followUp, steer, onInputCallback, showStatus } = makeCtx();
-		controllerFor(ctx);
-		const input = "=>\n1. inspect types\n2. run focused tests\n3. summarize failures";
-		editor.setText(input);
-
-		await editor.onSubmit?.(input);
-
-		expect(onInputCallback).toHaveBeenCalledWith(
-			expect.objectContaining({ text: "inspect types", streamingBehavior: "followUp" }),
-		);
-		expect(steer).not.toHaveBeenCalled();
-		expect(followUp.mock.calls.map(call => call[0])).toEqual(["run focused tests", "summarize failures"]);
-		expect(showStatus).toHaveBeenCalledWith("Sent first message; queued 2 for later yields");
 	});
 
 	it("queues an enumerated shorthand prompt as separate ordered follow-ups", async () => {

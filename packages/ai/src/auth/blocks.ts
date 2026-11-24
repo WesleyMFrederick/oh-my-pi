@@ -11,6 +11,12 @@ import type { AuthCredential, BlocksApi, StoredCredentialBlock } from "./types";
 
 /** Default block when no provider reset time is known; used by selectors and rate limits. */
 export const DEFAULT_BLOCK_MS = 60_000;
+/**
+ * Tolerance when matching a stored block deadline to a partial usage report's reset.
+ * The block comes from the 429's reset header (epoch seconds) while `/usage`
+ * reports `resets_at` as ISO, so seconds of skew between the two are expected.
+ */
+const BLOCK_RESET_MATCH_TOLERANCE_MS = 60_000;
 
 /** Composite key for round-robin tracking: "<provider>:oauth" or "<provider>:api_key". */
 export function providerTypeKey(provider: string, type: AuthCredential["type"]): string {
@@ -29,29 +35,24 @@ export const ACCOUNT_POLICY_BLOCK_SCOPE = "account-policy";
 const PROTECTED_BLOCK_SCOPES = [AUTH_BLOCK_SCOPE, ACCOUNT_POLICY_BLOCK_SCOPE] as const;
 
 const MODEL_ACCOUNT_POLICY_BLOCK_SCOPE_PREFIX = "model-policy:";
-const MODEL_ACCOUNT_POLICY_PROVIDERS: Readonly<Record<string, true>> = {
-	"openai-codex": true,
-	cursor: true,
-};
 
-/** Scope key for one model-specific account-policy block, shared by selectors and rate limits. */
-export function modelAccountPolicyBlockScope(provider: string, modelId: string | undefined): string | undefined {
-	if (!Object.hasOwn(MODEL_ACCOUNT_POLICY_PROVIDERS, provider) || typeof modelId !== "string") return undefined;
-	const separator = modelId.lastIndexOf("/");
-	const bareModelId = (separator === -1 ? modelId : modelId.slice(separator + 1)).trim().toLowerCase();
-	if (!bareModelId || bareModelId.includes("\0")) return undefined;
-	return `${MODEL_ACCOUNT_POLICY_BLOCK_SCOPE_PREFIX}${bareModelId}`;
+/**
+ * Scope key for one model-specific account-policy block, shared by selectors
+ * and rate limits. Keyed by the exact requested id: distinct ids are distinct models.
+ */
+export function modelAccountPolicyBlockScope(modelId: string | undefined): string | undefined {
+	if (!modelId || modelId.includes("\0")) return undefined;
+	return `${MODEL_ACCOUNT_POLICY_BLOCK_SCOPE_PREFIX}${modelId}`;
 }
 
 /** Scope keys that a request must check, including model-policy constraints. */
 export function credentialBlockScopesForRequest(
-	provider: string,
 	strategy: CredentialRankingStrategy | undefined,
 	rankingContext: CredentialRankingContext,
 	blockScope: string | undefined,
 ): readonly string[] {
 	const scopes = strategy?.blockScopes?.(rankingContext) ?? (blockScope ? [blockScope] : []);
-	const modelPolicyScope = modelAccountPolicyBlockScope(provider, rankingContext.modelId);
+	const modelPolicyScope = modelAccountPolicyBlockScope(rankingContext.modelId);
 	if (!modelPolicyScope || scopes.includes(modelPolicyScope)) return scopes;
 	return [...scopes, modelPolicyScope];
 }
@@ -63,6 +64,14 @@ export function credentialBlockScopesForRequest(
  * merge. `probeAfter` is the earliest time live usage reconciliation may clear it.
  */
 type CredentialBackoff = { until: number; timed: boolean; probeAfter: number; persisted?: boolean };
+
+/**
+ * One read of a credential's persisted blocks under a providerKey, keyed by
+ * scope (`""` is unscoped). `undefined`: the store has no bulk read, so use
+ * per-scope point reads. `null`: unreadable (damaged store or failed read), so
+ * it neither contributes deadlines nor retires mirrored in-memory blocks.
+ */
+type PersistedBlockScopes = ReadonlyMap<string, number> | null | undefined;
 
 /** Latch for unrecoverably corrupt persisted block stores, shared with the credential pool. */
 export class BlockStoreHealth {
@@ -134,19 +143,37 @@ export class CredentialBlocks implements BlocksApi {
 		}
 	}
 
-	/** Returns in-memory block expiry timestamp for a credential/key pair, cleaning up expired entries. */
-	#getCredentialBlockedUntilForKey(backoffKey: string, credentialId: number, nowMs: number): number | undefined {
+	/**
+	 * Returns in-memory block expiry timestamp for a credential/key pair, cleaning up expired entries.
+	 * `persistedScopes` is a bulk read for the key's providerKey; omitted, the store is point-read.
+	 */
+	#getCredentialBlockedUntilForKey(
+		backoffKey: string,
+		credentialId: number,
+		nowMs: number,
+		persistedScopes: PersistedBlockScopes = undefined,
+	): number | undefined {
 		const block = this.#credentialBackoff.get(backoffKey)?.get(credentialId);
 		if (!block) return undefined;
 		// Once mirrored successfully, the store is authoritative for cross-process
 		// deletion. A reset in a sibling must also retire this process's old map entry.
-		if (block.persisted && !this.#deps.health.damaged && this.#deps.store.getCredentialBlock) {
+		// Upserts are longest-wins, so a persisted row shorter than the deadline this
+		// process mirrored means the row was deleted and replaced: the old deadline
+		// was superseded and must not win the next longest-wins merge.
+		if (
+			block.persisted &&
+			!this.#deps.health.damaged &&
+			persistedScopes !== null &&
+			(persistedScopes !== undefined || this.#deps.store.getCredentialBlock)
+		) {
 			const separator = backoffKey.indexOf("\0");
 			const providerKey = separator < 0 ? backoffKey : backoffKey.slice(0, separator);
 			const scope = separator < 0 ? "" : backoffKey.slice(separator + 1);
 			try {
-				const persisted = this.#deps.store.getCredentialBlock(credentialId, providerKey, scope);
-				if (persisted === undefined) {
+				const persisted = persistedScopes
+					? persistedScopes.get(scope)
+					: this.#deps.store.getCredentialBlock?.(credentialId, providerKey, scope);
+				if (persisted === undefined || persisted < block.until) {
 					this.#deleteCredentialBackoff(backoffKey, credentialId);
 					return undefined;
 				}
@@ -172,7 +199,9 @@ export class CredentialBlocks implements BlocksApi {
 		credentialId: number,
 		providerKey: string,
 		blockScope: string | undefined,
+		persistedScopes: PersistedBlockScopes = undefined,
 	): number | undefined {
+		if (persistedScopes !== undefined) return persistedScopes?.get(blockScope ?? "");
 		if (this.#deps.health.damaged) return undefined;
 		const getCredentialBlock = this.#deps.store.getCredentialBlock?.bind(this.#deps.store);
 		if (!getCredentialBlock) return undefined;
@@ -187,6 +216,20 @@ export class CredentialBlocks implements BlocksApi {
 				blockScope,
 			});
 			return undefined;
+		}
+	}
+
+	/** Every persisted scope of one credential/providerKey in a single store read, when supported. */
+	#readPersistedCredentialBlockScopes(credentialId: number, providerKey: string): PersistedBlockScopes {
+		const store = this.#deps.store;
+		if (!store.getCredentialBlockScopes) return undefined;
+		if (this.#deps.health.damaged) return null;
+		try {
+			return store.getCredentialBlockScopes(credentialId, providerKey);
+		} catch (err) {
+			if (this.#deps.health.handle(err)) return null;
+			logger.debug("Failed to read credential blocks from persistent store", { err, credentialId, providerKey });
+			return null;
 		}
 	}
 
@@ -212,13 +255,19 @@ export class CredentialBlocks implements BlocksApi {
 		}
 	}
 
-	#exactBlockedUntil(credentialId: number, providerKey: string, scope: string | undefined): number | undefined {
+	#exactBlockedUntil(
+		credentialId: number,
+		providerKey: string,
+		scope: string | undefined,
+		persistedScopes: PersistedBlockScopes = this.#readPersistedCredentialBlockScopes(credentialId, providerKey),
+	): number | undefined {
 		const memory = this.#getCredentialBlockedUntilForKey(
 			scopedBackoffKey(providerKey, scope),
 			credentialId,
 			Date.now(),
+			persistedScopes,
 		);
-		const persisted = this.#readPersistedCredentialBlock(credentialId, providerKey, scope);
+		const persisted = this.#readPersistedCredentialBlock(credentialId, providerKey, scope, persistedScopes);
 		return memory === undefined ? persisted : persisted === undefined ? memory : Math.max(memory, persisted);
 	}
 
@@ -229,6 +278,22 @@ export class CredentialBlocks implements BlocksApi {
 		credentialIndex: number,
 		blockScopeOrScopes: string | readonly string[] | undefined = undefined,
 	): number | undefined {
+		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
+		if (credentialId === undefined) return undefined;
+		return this.#blockedUntilById(
+			credentialId,
+			providerKey,
+			blockScopeOrScopes,
+			this.#readPersistedCredentialBlockScopes(credentialId, providerKey),
+		);
+	}
+
+	#blockedUntilById(
+		credentialId: number,
+		providerKey: string,
+		blockScopeOrScopes: string | readonly string[] | undefined,
+		persistedScopes: PersistedBlockScopes,
+	): number | undefined {
 		const nowMs = Date.now();
 		// A request honours its own scope plus any legacy catch-all scope, so a
 		// block written before backoff was scoped still applies to everything.
@@ -236,21 +301,25 @@ export class CredentialBlocks implements BlocksApi {
 			...PROTECTED_BLOCK_SCOPES,
 			...(typeof blockScopeOrScopes === "string" ? [blockScopeOrScopes] : (blockScopeOrScopes ?? [])),
 		].filter(scope => scope.length > 0);
-		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
-		if (credentialId === undefined) return undefined;
-		let blockedUntil = this.#getCredentialBlockedUntilForKey(providerKey, credentialId, nowMs);
+		let blockedUntil = this.#getCredentialBlockedUntilForKey(providerKey, credentialId, nowMs, persistedScopes);
 		for (const blockScope of scopes) {
 			const scopedBlockedUntil = this.#getCredentialBlockedUntilForKey(
 				scopedBackoffKey(providerKey, blockScope),
 				credentialId,
 				nowMs,
+				persistedScopes,
 			);
 			if (scopedBlockedUntil !== undefined && (blockedUntil === undefined || scopedBlockedUntil > blockedUntil)) {
 				blockedUntil = scopedBlockedUntil;
 			}
 		}
 
-		const persistedGlobalBlockedUntil = this.#readPersistedCredentialBlock(credentialId, providerKey, "");
+		const persistedGlobalBlockedUntil = this.#readPersistedCredentialBlock(
+			credentialId,
+			providerKey,
+			"",
+			persistedScopes,
+		);
 		if (
 			persistedGlobalBlockedUntil !== undefined &&
 			(blockedUntil === undefined || persistedGlobalBlockedUntil > blockedUntil)
@@ -258,7 +327,12 @@ export class CredentialBlocks implements BlocksApi {
 			blockedUntil = persistedGlobalBlockedUntil;
 		}
 		for (const blockScope of scopes) {
-			const persistedScopedBlockedUntil = this.#readPersistedCredentialBlock(credentialId, providerKey, blockScope);
+			const persistedScopedBlockedUntil = this.#readPersistedCredentialBlock(
+				credentialId,
+				providerKey,
+				blockScope,
+				persistedScopes,
+			);
 			if (
 				persistedScopedBlockedUntil !== undefined &&
 				(blockedUntil === undefined || persistedScopedBlockedUntil > blockedUntil)
@@ -277,6 +351,15 @@ export class CredentialBlocks implements BlocksApi {
 		blockScope: string | readonly string[] | undefined = undefined,
 	): boolean {
 		return this.blockedUntil(provider, providerKey, credentialIndex, blockScope) !== undefined;
+	}
+
+	/**
+	 * Whether exactly `blockScope` holds a live block for a credential, without
+	 * the protected and unscoped blocks {@link CredentialBlocks.blockedUntil} merges in.
+	 */
+	isScopeBlocked(provider: string, providerKey: string, credentialIndex: number, blockScope: string): boolean {
+		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
+		return credentialId !== undefined && this.#exactBlockedUntil(credentialId, providerKey, blockScope) !== undefined;
 	}
 
 	/**
@@ -437,14 +520,20 @@ export class CredentialBlocks implements BlocksApi {
 		if (!this.supportsHealing(provider)) return false;
 		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
 		if (credentialId === undefined) return false;
-		if (PROTECTED_BLOCK_SCOPES.some(scope => this.#exactBlockedUntil(credentialId, providerKey, scope) !== undefined))
+		// One persisted read serves the protected-scope, global, and requested checks.
+		const persistedScopes = this.#readPersistedCredentialBlockScopes(credentialId, providerKey);
+		if (
+			PROTECTED_BLOCK_SCOPES.some(
+				scope => this.#exactBlockedUntil(credentialId, providerKey, scope, persistedScopes) !== undefined,
+			)
+		)
 			return false;
 		if (
 			!this.#deps.strategies(provider)?.healsGlobalBlocks &&
-			this.blockedUntil(provider, providerKey, credentialIndex) !== undefined
+			this.#blockedUntilById(credentialId, providerKey, undefined, persistedScopes) !== undefined
 		)
 			return false;
-		return this.blockedUntil(provider, providerKey, credentialIndex, blockScopeOrScopes) !== undefined;
+		return this.#blockedUntilById(credentialId, providerKey, blockScopeOrScopes, persistedScopes) !== undefined;
 	}
 
 	/**
@@ -463,9 +552,23 @@ export class CredentialBlocks implements BlocksApi {
 		// last-good report for hours after `/usage` starts failing, and those
 		// healthy limits describe the account before the 429 that blocked it.
 		if (!Number.isFinite(report.fetchedAt) || Date.now() - report.fetchedAt > USAGE_REPORT_TTL_MS) return;
-		for (const { blockScope, limits, healthy } of strategy?.healableBlockScopes?.(report) ?? []) {
+		for (const { blockScope, limits, healthy, resetMatchRequired } of strategy?.healableBlockScopes?.(report) ?? []) {
 			if (healthy === false || isUsageLimitReached(limits) || (healthy === undefined && limits.length === 0))
 				continue;
+			if (resetMatchRequired) {
+				const blockedUntilMs = this.#exactBlockedUntil(credentialId, providerKey, blockScope);
+				if (blockedUntilMs === undefined) continue;
+				const resetMatchesBlock = limits.some(resetLimit => {
+					if (resetLimit.scope.shared !== true) return false;
+					const resetsAt = resetLimit.window?.resetsAt;
+					return (
+						typeof resetsAt === "number" &&
+						Number.isFinite(resetsAt) &&
+						Math.abs(resetsAt - blockedUntilMs) <= BLOCK_RESET_MATCH_TOLERANCE_MS
+					);
+				});
+				if (!resetMatchesBlock) continue;
+			}
 			this.#clearHealedBlockScope(provider, providerKey, credentialId, blockScope, report.fetchedAt);
 		}
 	}

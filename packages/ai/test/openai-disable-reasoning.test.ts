@@ -85,11 +85,11 @@ describe("OpenAI route reasoning disablement", () => {
 		expect(forcedOff.reasoning).toEqual({ effort: "none" });
 	});
 
-	it("sends effort none for a disabled-reasoning Codex request", async () => {
-		// Given: a Codex model whose server default effort is not none
+	it("sends the lowest supported effort for a disabled-reasoning Codex request", async () => {
+		// Given: a Codex model without a `none` tier whose server default effort is medium
 		// When: the caller disables reasoning (judgment/side calls pass no effort)
 		const disabled = await capturePayload(codex, { disableReasoning: true });
-		// Then: the wire body turns reasoning off instead of omitting it
-		expect(disabled.reasoning?.effort).toBe("none");
+		// Then: the wire body pins the lowest tier instead of omitting effort
+		expect(disabled.reasoning?.effort).toBe("minimal");
 	});
 });
