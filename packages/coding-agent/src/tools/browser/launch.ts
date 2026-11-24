@@ -348,9 +348,11 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
  * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
  * platform detection fails (puppeteer default resolution takes over).
  *
- * Headless callers select the managed chrome-headless-shell build instead of
- * full Chrome, whose --headless=new can hang screenshots on macOS arm64.
- * Headed callers and interactive sign-in continue to use full Chrome.
+ * Headless callers prefer an installed managed chrome-headless-shell on every
+ * platform, then cached full Chrome, before the platform selection above.
+ * When installation is needed, they download the shell instead of full Chrome,
+ * whose --headless=new can hang screenshots on macOS arm64. Headed callers
+ * and interactive sign-in continue to use full Chrome.
  * Exported so real-browser tests can probe launchability and skip on hosts
  * missing Chrome's system libraries.
  */
@@ -358,6 +360,13 @@ const chromiumExecutablePromises = new Map<BrowsersNs.Browser, Promise<string | 
 export async function ensureChromiumExecutable(options: { headless?: boolean } = {}): Promise<string | undefined> {
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
+	if (options.headless) {
+		const browsers = await loadBrowsers();
+		const shell = await managedChromiumLocation(browsers.Browser.CHROME_HEADLESS_SHELL);
+		if (shell && fs.existsSync(shell.executablePath)) return shell.executablePath;
+		const chrome = await managedChromiumLocation(browsers.Browser.CHROME);
+		if (chrome && fs.existsSync(chrome.executablePath)) return chrome.executablePath;
+	}
 	// macOS: never route a background daemon through the user's GUI Chrome
 	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
 	const preferManagedChromium = process.platform === "darwin";
@@ -434,7 +443,8 @@ export async function ensureSignInChromiumExecutable(): Promise<string | undefin
  * Whether launching managed Chromium would first download the selected product,
  * as {@link ensureChromiumExecutable} decides: no `PUPPETEER_EXECUTABLE_PATH`,
  * no usable system Chrome where one is preferred (every platform but macOS),
- * and no selected managed build under ~/.omp/puppeteer yet. Defaults to full Chrome.
+ * and no selected managed build under ~/.omp/puppeteer yet. Headless launches
+ * can also use cached full Chrome without downloading. Defaults to full Chrome.
  */
 export async function chromiumNeedsDownload(options: { headless?: boolean } = {}): Promise<boolean> {
 	if (process.env.PUPPETEER_EXECUTABLE_PATH) return false;
@@ -442,7 +452,12 @@ export async function chromiumNeedsDownload(options: { headless?: boolean } = {}
 	const browsers = await loadBrowsers();
 	const product = options.headless ? browsers.Browser.CHROME_HEADLESS_SHELL : browsers.Browser.CHROME;
 	const managed = await managedChromiumLocation(product);
-	return managed !== undefined && !fs.existsSync(managed.executablePath);
+	if (!managed || fs.existsSync(managed.executablePath)) return false;
+	if (options.headless) {
+		const chrome = await managedChromiumLocation(browsers.Browser.CHROME);
+		if (chrome && fs.existsSync(chrome.executablePath)) return false;
+	}
+	return true;
 }
 
 /** Where this host's managed browser build lives under ~/.omp/puppeteer; undefined when platform detection fails. */

@@ -10,16 +10,20 @@ import {
 // Launch policy reads `process.platform`; Chrome-for-Testing platform detection reads `os.platform()`, which Bun does
 // not derive from the `process.platform` override. Pin both so the child resolves the emulated host's paths.
 const platform = process.env.OMP_BROWSER_PROBE_PLATFORM;
-if (platform === "darwin" || platform === "win32") {
+if (platform === "darwin" || platform === "win32" || platform === "linux") {
 	Object.defineProperty(process, "platform", { value: platform });
 	spyOn(os, "platform").mockReturnValue(platform);
 } else if (platform) {
 	throw new Error(`Unsupported OMP_BROWSER_PROBE_PLATFORM: ${platform}`);
 }
+// Chrome for Testing publishes Linux x64 builds only; match the parent fixture's seeded path.
+if (platform === "linux") spyOn(os, "arch").mockReturnValue("x64");
 
-// The parent seeds every executable the probe may select. Resolving anything else would start a
-// Chrome for Testing download, which stalls the probe on the network; fail it instead.
+// Never reach the network. Some probes allow the resolver to recover from an unavailable
+// shell download; the preview probe additionally checks that no install was attempted.
+let installAttempts = 0;
 spyOn(browsers, "install").mockImplementation(async options => {
+	installAttempts++;
 	throw new Error(`browser-executable-probe must not download a browser (cacheDir ${options.cacheDir})`);
 });
 
@@ -31,6 +35,18 @@ if (purpose === "needs-download") {
 			headless: await chromiumNeedsDownload({ headless: true }),
 			headed: await chromiumNeedsDownload({ headless: false }),
 			default: await chromiumNeedsDownload(),
+		}),
+	);
+} else if (purpose === "preview") {
+	const needsDownload = await chromiumNeedsDownload({ headless: true });
+	const executable = needsDownload ? null : await ensureChromiumExecutable({ headless: true });
+	process.stdout.write(JSON.stringify({ needsDownload, executable, installAttempts }));
+} else if (purpose === "selection") {
+	process.stdout.write(
+		JSON.stringify({
+			headless: await ensureChromiumExecutable({ headless: true }),
+			headed: await ensureChromiumExecutable({ headless: false }),
+			default: await ensureChromiumExecutable(),
 		}),
 	);
 } else if (purpose === "products") {

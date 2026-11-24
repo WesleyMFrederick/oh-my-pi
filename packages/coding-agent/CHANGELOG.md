@@ -19,6 +19,7 @@
 ### Fixed
 
 - Fixed managed headless Chromium screenshots timing out on macOS arm64 by launching Chrome headless shell, while headed and sign-in windows retain full Chrome.
+- Preserved existing managed headless browser profiles across the shell upgrade, kept cached full Chrome available without downloads for headless tabs and page previews, and preferred installed headless shell over system Chrome on every platform.
 - Fixed attaching to a browser without a page target by creating a page when no matcher is requested.
 - Fixed the stealth bootstrap recursing into its own helper iframe under Chrome headless shell.
 - Fixed the shell's `dirname` builtin on Windows ignoring `\` separators and drive prefixes (`dirname 'C:\a\b'` printed `.`), which broke scripts like VS Code's `code` launcher (`./Code.exe: No such file or directory`)

@@ -36,6 +36,7 @@ import { describeUnit, isLiveUnit, type UnitIdentity, UnitLease } from "./unit-l
 const READY_LOG_PATTERN = String.raw`DevTools listening on ws://\S+`;
 const READY_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 1_500;
+const LEGACY_HEADLESS_NAME = "omp.browser.headless";
 /** Lines of Chrome's output a failed start reports. */
 const OUTPUT_TAIL_LINES = 6;
 /**
@@ -108,15 +109,31 @@ export function isSharedBrowserUnit(unit: UnitSnapshot): boolean {
 }
 
 /**
- * Stable per-project profile: reused across launches, and never contended by
- * pre-daemon Chromiums that used throwaway temp profiles.
+ * Stable per-project profile: the headless shell reuses full Chrome's profile
+ * so upgrades preserve cookies and application storage.
  */
 function sharedBrowserProfileDir(projectDir: string, name: string): string {
-	return path.join(getDaemonRuntimeDir(projectDir), `${name}.profile`);
+	const profileName = name === sharedBrowserDaemonName(true) ? LEGACY_HEADLESS_NAME : name;
+	return path.join(getDaemonRuntimeDir(projectDir), `${profileName}.profile`);
 }
 
 function wsEndpointOf(unit: UnitSnapshot | undefined): string | undefined {
 	return unit?.readyMatch?.match(/ws:\/\/\S+/)?.[0];
+}
+
+/** The legacy browser releases its startup claim while it still owns the profile. */
+async function assertLegacyProfileAvailable(
+	client: DaemonClient,
+	identity: UnitIdentity,
+	signal?: AbortSignal,
+): Promise<void> {
+	if (identity.key !== sharedBrowserDaemonName(true)) return;
+	const legacy = await describeUnit(client, { ...identity, key: LEGACY_HEADLESS_NAME }, signal);
+	if (isLiveUnit(legacy)) {
+		throw new ToolError(
+			`Shared browser daemon unavailable: ${LEGACY_HEADLESS_NAME} is still using the shared browser profile. Close its active browser sessions and wait for it to exit before trying again. \`omp ps\` lists the ${LEGACY_HEADLESS_NAME} unit.`,
+		);
+	}
 }
 
 /** CDP liveness probe: the ws endpoint host must answer /json/version. */
@@ -185,6 +202,7 @@ export async function ensureSharedBrowser(opts: {
 	};
 	const claim = await claimProfile(userDataDir, opts.signal);
 	try {
+		await assertLegacyProfileAvailable(client, identity, opts.signal);
 		const existing = await describeUnit(client, identity, opts.signal);
 		let reason: string | undefined;
 		if (isLiveUnit(existing)) {
@@ -312,6 +330,7 @@ export async function restartSharedBrowser(unit: UnitSnapshot, signal?: AbortSig
 	const claim = await claimProfile(userDataDir, signal);
 	if (!claim) throw new Error(`${unit.key} is being started by another omp process; try again shortly`);
 	try {
+		await assertLegacyProfileAvailable(client, { kind: "proc", scope: unit.scope, key: unit.key }, signal);
 		const stopped = (await client.request({ op: "stop", unit: unit.id, timeoutMs: STOP_TIMEOUT_MS }, signal)).unit;
 		if (isLiveUnit(stopped)) {
 			throw new Error(`${unit.key} is still ${stopped.state} after the stop; it was not restarted`);
