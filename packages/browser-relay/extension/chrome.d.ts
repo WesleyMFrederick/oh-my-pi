@@ -17,6 +17,8 @@ interface ChromeTab {
 	pendingUrl?: string;
 	title?: string;
 	active: boolean;
+	/** Chrome discarded this tab; it reloads when activated. */
+	discarded: boolean;
 	windowId: number;
 	pinned: boolean;
 	/** -1 when ungrouped. */
@@ -44,7 +46,46 @@ interface ChromeDebuggerTargetInfo {
 	url?: string;
 }
 
+interface ChromeInjectionResult<T> {
+	frameId: number;
+	result?: T;
+}
+
+/** Page-side element as a function injected with `chrome.scripting` sees it; the worker's lib has no DOM. */
+interface ChromePageElement {
+	readonly tagName: string;
+	getAttribute(name: string): string | null;
+	setAttribute(name: string, value: string): void;
+	readonly style: { setProperty(name: string, value: string, priority?: string): void };
+}
+
+/** A document or shadow root, walked by an injected function. */
+interface ChromePageRoot {
+	readonly nodeType: number;
+}
+
+interface ChromeDownloadItem {
+	id: number;
+	/** The URL the file was served from, after redirects. */
+	finalUrl: string;
+	/** Absolute path of the saved file; empty until Chrome has chosen it. */
+	filename: string;
+	state: "in_progress" | "interrupted" | "complete";
+}
 declare const chrome: {
+	scripting: {
+		executeScript<Args extends unknown[], Result>(injection: {
+			target: { tabId: number; allFrames?: boolean; frameIds?: number[] };
+			func: (...args: Args) => Result;
+			args?: Args;
+			injectImmediately?: boolean;
+			world?: "ISOLATED" | "MAIN";
+		}): Promise<Array<ChromeInjectionResult<Awaited<Result>>>>;
+	};
+	/** Content-script only: reaches shadow roots another extension created closed. */
+	dom: {
+		openOrClosedShadowRoot(element: ChromePageElement): ChromePageRoot | null;
+	};
 	tabs: {
 		query(queryInfo: { url?: string; groupId?: number }): Promise<ChromeTab[]>;
 		get(tabId: number): Promise<ChromeTab>;
@@ -55,6 +96,7 @@ declare const chrome: {
 		ungroup(tabIds: number[]): Promise<void>;
 		onCreated: ChromeEvent<(tab: ChromeTab) => void>;
 		onUpdated: ChromeEvent<(tabId: number, changeInfo: ChromeTabChangeInfo, tab: ChromeTab) => void>;
+		onActivated: ChromeEvent<(info: { tabId: number; windowId: number }) => void>;
 		onRemoved: ChromeEvent<(tabId: number, removeInfo: { windowId: number }) => void>;
 	};
 	tabGroups: {
@@ -75,6 +117,11 @@ declare const chrome: {
 		getTargets(): Promise<ChromeDebuggerTargetInfo[]>;
 		onEvent: ChromeEvent<(source: ChromeDebuggerSession, method: string, params?: Record<string, unknown>) => void>;
 		onDetach: ChromeEvent<(source: ChromeDebuggerSession, reason: string) => void>;
+	};
+	downloads: {
+		search(query: { id?: number }): Promise<ChromeDownloadItem[]>;
+		onCreated: ChromeEvent<(item: ChromeDownloadItem) => void>;
+		onChanged: ChromeEvent<(delta: { id: number; state?: { current: ChromeDownloadItem["state"] } }) => void>;
 	};
 	storage: {
 		local: {
@@ -97,6 +144,8 @@ declare const chrome: {
 		onClicked: ChromeEvent<(tab: ChromeTab) => void>;
 	};
 	runtime: {
+		reload(): void;
+		readonly id: string;
 		openOptionsPage(): Promise<void>;
 		onInstalled: ChromeEvent<() => void>;
 		onStartup: ChromeEvent<() => void>;

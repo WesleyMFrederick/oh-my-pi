@@ -33,7 +33,7 @@ Within each config-directory row, directories are listed highest to lowest prior
 
 Merging is shallow per server: a higher-precedence server object overrides only its top-level fields, but object-valued fields such as `settings`, `initOptions`, `capabilities`, and `workspaceReadyTimings` replace the lower value as a whole rather than deep-merging it. Servers absent from override files remain at built-in defaults.
 
-The native user config directory follows `PI_CONFIG_DIR` and active profiles; `~/.omp/agent/lsp.json` is the default-profile spelling. This shared config lookup does not use `PI_CODING_AGENT_DIR` as an arbitrary replacement base. Claude's user directory honors `CLAUDE_CONFIG_DIR`. Foreign user sources (Claude, Codex, Gemini) are opt-in through the enabled-provider configuration; setting `CLAUDE_CONFIG_DIR` also opts Claude in unless explicitly disabled. Project and cwd sources do not walk ancestors and are not subject to that user-source opt-in.
+The native user config directory is the active agent directory: it follows `PI_CONFIG_DIR`, active profiles, and, in the default profile, `PI_CODING_AGENT_DIR`; `~/.omp/agent/lsp.json` is the default-profile spelling. Claude's user directory honors `CLAUDE_CONFIG_DIR`. Foreign user sources (Claude, Codex, Gemini) are opt-in through the enabled-provider configuration; setting `CLAUDE_CONFIG_DIR` also opts Claude in unless explicitly disabled. Project and cwd sources do not walk ancestors and are not subject to that user-source opt-in.
 
 **Recommended locations:**
 
@@ -75,20 +75,21 @@ Do not mix wrapped and flat server entries: when `servers` is an object, sibling
 
 ## ServerConfig fields
 
-| Field                   | Type       | Required for a new server | Description                                                                                              |
-| ----------------------- | ---------- | ------------------------: | -------------------------------------------------------------------------------------------------------- |
-| `command`               | `string`   |                       yes | Binary name (resolved through local bins / PATH) or absolute path                                        |
-| `args`                  | `string[]` |                        no | Arguments passed to the binary                                                                           |
-| `fileTypes`             | `string[]` |                       yes | Extensions or basenames, for example `[".ts", ".tsx", "Dockerfile"]`; case-insensitive, with or without a leading dot |
-| `languageId`            | `string`   |                        no | LSP language id sent in `textDocument/didOpen`; inferred from the file path when omitted                 |
-| `rootMarkers`           | `string[]` |                       yes | Files/directories indicating a project root; one-level wildcard patterns such as `*.cabal` are supported |
-| `initOptions`           | `object`   |                        no | Sent as `initializationOptions` during the LSP handshake                                                 |
-| `settings`              | `object`   |                        no | Pushed via `workspace/didChangeConfiguration`                                                            |
-| `disabled`              | `boolean`  |                        no | Set `true` to disable this server                                                                        |
-| `warmupTimeoutMs`       | `number`   |                        no | Warmup initialize timeout in milliseconds (default 5000; built-in marksman uses 2000) |
-| `isLinter`              | `boolean`  |                        no | Marks a dedicated linter/formatter server: excluded from type-intelligence, but preferred over type-checkers when choosing the `formatOnWrite` formatter |
-| `capabilities`          | `object`   |                        no | Opt-in server-specific features; see [Capabilities](#Capabilities)                                       |
-| `workspaceReadyTimings` | `object`   |                        no | Advanced rust-analyzer workspace-readiness timing overrides; see below                                   |
+| Field                   | Type       | Required for a new server | Description                                                                                                                                              |
+| ----------------------- | ---------- | ------------------------: | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`               | `string`   |                       yes | Binary name (resolved through local bins / PATH) or absolute path                                                                                        |
+| `args`                  | `string[]` |                        no | Arguments passed to the binary                                                                                                                           |
+| `fileTypes`             | `string[]` |                       yes | Extensions or basenames, for example `[".ts", ".tsx", "Dockerfile"]`; case-insensitive, with or without a leading dot                                    |
+| `languageId`            | `string`   |                        no | LSP language id sent in `textDocument/didOpen`; inferred from the file path when omitted                                                                 |
+| `rootMarkers`           | `string[]` |                       yes | Files/directories indicating a project root; one-level wildcard patterns such as `*.cabal` are supported                                                 |
+| `initOptions`           | `object`   |                        no | Sent as `initializationOptions` during the LSP handshake                                                                                                 |
+| `settings`              | `object`   |                        no | Pushed via `workspace/didChangeConfiguration`                                                                                                            |
+| `disabled`              | `boolean`  |                        no | Set `true` to disable this server                                                                                                                        |
+| `warmupTimeoutMs`       | `number`   |                        no | Warmup initialize timeout in milliseconds (default 5000; built-in marksman uses 2000)                                                                    |
+| `isLinter`              | `boolean`  |                        no | Dedicated linter/formatter: fallback for single-server actions; `rename_file` queries all matching LSP servers; preferred for `formatOnWrite`            |
+| `watchFiles`            | `boolean`  |                        no | Advertise `workspace/didChangeWatchedFiles` dynamic registration: omp watches the files the server registers and the server runs no watcher of its own. On by default; set `false` to keep a server's own watcher. A shared (mux) server keeps the setting of the session that started it; sessions that later reuse it get its watching either way |
+| `capabilities`          | `object`   |                        no | Opt-in server-specific features; see [Capabilities](#capabilities)                                                                                       |
+| `workspaceReadyTimings` | `object`   |                        no | Advanced rust-analyzer workspace-readiness timing overrides; see below                                                                                   |
 
 The required fields may be omitted from an override of a built-in server because they are inherited before validation. A genuinely new server normally needs all three. `resolvedCommand` and `createClient` are runtime-owned fields and must not be configured.
 
@@ -100,13 +101,13 @@ The `capabilities` object enables optional server-specific features that OMP sup
 
 ```json
 {
-  "capabilities": {
-    "flycheck": true,
-    "ssr": true,
-    "expandMacro": true,
-    "runnables": true,
-    "relatedTests": true
-  }
+	"capabilities": {
+		"flycheck": true,
+		"ssr": true,
+		"expandMacro": true,
+		"runnables": true,
+		"relatedTests": true
+	}
 }
 ```
 
@@ -118,16 +119,16 @@ All fields are boolean and optional. They are currently used by `rust-analyzer`.
 
 ```json
 {
-  "servers": {
-    "rust-analyzer": {
-      "workspaceReadyTimings": {
-        "timeoutMs": 30000,
-        "pollMs": 250,
-        "settleMs": 2000,
-        "statusRequestTimeoutMs": 2000
-      }
-    }
-  }
+	"servers": {
+		"rust-analyzer": {
+			"workspaceReadyTimings": {
+				"timeoutMs": 30000,
+				"pollMs": 250,
+				"settleMs": 2000,
+				"statusRequestTimeoutMs": 2000
+			}
+		}
+	}
 }
 ```
 
@@ -141,32 +142,32 @@ Partial overrides are merged onto the built-in defaults. You only need to specif
 
 ```json
 {
-  "servers": {
-    "typescript-language-server": {
-      "args": ["--stdio", "--log-level", "4"]
-    }
-  }
+	"servers": {
+		"typescript-language-server": {
+			"args": ["--stdio", "--log-level", "4"]
+		}
+	}
 }
 ```
 
 ```yaml
 servers:
-  gopls:
-    settings:
-      gopls:
-        gofumpt: false
-        staticcheck: false
+   gopls:
+      settings:
+         gopls:
+            gofumpt: false
+            staticcheck: false
 ```
 
 ### Disable a built-in server
 
 ```json
 {
-  "servers": {
-    "eslint": {
-      "disabled": true
-    }
-  }
+	"servers": {
+		"eslint": {
+			"disabled": true
+		}
+	}
 }
 ```
 
@@ -176,14 +177,14 @@ New native-format servers require non-empty `command`, `fileTypes`, and `rootMar
 
 ```json
 {
-  "servers": {
-    "my-lsp": {
-      "command": "my-lsp-server",
-      "args": ["--stdio"],
-      "fileTypes": [".xyz"],
-      "rootMarkers": [".xyz-project", ".git"]
-    }
-  }
+	"servers": {
+		"my-lsp": {
+			"command": "my-lsp-server",
+			"args": ["--stdio"],
+			"fileTypes": [".xyz"],
+			"rootMarkers": [".xyz-project", ".git"]
+		}
+	}
 }
 ```
 
@@ -193,15 +194,15 @@ Shut down language servers that have been inactive for more than five minutes:
 
 ```json
 {
-  "idleTimeoutMs": 300000
+	"idleTimeoutMs": 300000
 }
 ```
 
 In shared-server mode, disconnecting an idle client does not immediately stop the language server. The server remains available while another session is connected, then shuts down 30 seconds after its last session leaves. A session that reconnects during that wait reuses the server and cancels shutdown.
 
-For example, `idleTimeoutMs: 120000` gives roughly 2.5–3.5 minutes from the final request completing to shared-server shutdown, provided all connected clients become idle. Later requests start a server again if it has stopped. The separate 15-minute no-session timeout only stops the shared coordinator; it does not add to the server's 30-second wait.
+For example, `idleTimeoutMs: 120000` gives roughly 2.5–3.5 minutes from the final request completing to shared-server shutdown, provided all connected clients become idle. Later requests start a server again if it has stopped.
 
-The 30-second shared-server wait is an internal constant, not an LSP configuration field. Already-running clients cache configuration, and existing coordinator processes retain the code they loaded: reload client configuration or start a new OMP session for a changed inactivity timeout, and restart the project coordinator for a changed server wait. Do not stop a coordinator while other sessions are using it.
+The 30-second shared-server wait is an internal constant, not an LSP configuration field. Already-running clients cache configuration, and a running omp daemon keeps the code it loaded: reload client configuration or start a new OMP session for a changed inactivity timeout, and restart the omp daemon for a changed server wait.
 
 ### Disable a server for one project, keep it globally
 
@@ -209,11 +210,11 @@ Place the override in `<project>/.omp/lsp.json`:
 
 ```json
 {
-  "servers": {
-    "pylsp": {
-      "disabled": true
-    }
-  }
+	"servers": {
+		"pylsp": {
+			"disabled": true
+		}
+	}
 }
 ```
 
@@ -281,4 +282,4 @@ The following servers ship in `defaults.json` and are eligible for auto-detectio
 | `swiftlint`                   | Swift (linter)                | `swiftlint`                       |
 | `tlaplus`                     | TLA+                          | `tlapm_lsp`                       |
 
-Only one TypeScript server is kept per project: when the resolved `tsc` belongs to a TypeScript install without `lib/tsserver.js` (TypeScript 7+), `typescript-native` wins and `typescript-language-server` is dropped, since it cannot drive that install; otherwise `typescript-native` is dropped because older `tsc` rejects `--lsp`.
+Only one TypeScript server is kept per project: when the resolved `tsc` belongs to a TypeScript install without `lib/tsserver.js` (TypeScript 7+), or reports version 7+ from an install without an npm `package.json` (such as nixpkgs), `typescript-native` wins and `typescript-language-server` is dropped; otherwise `typescript-native` is dropped because older `tsc` rejects `--lsp`.

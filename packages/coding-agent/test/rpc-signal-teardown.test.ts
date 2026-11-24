@@ -74,19 +74,38 @@ function extensionSource(pidFile: string, fixtureScript: string): string {
 	return `import * as fs from "node:fs";
 import { recordLaunchedBrowser } from ${JSON.stringify(path.join(SRC, "tools/browser/launch-ledger"))};
 import { getTabsMapForTest } from ${JSON.stringify(path.join(SRC, "tools/browser/tab-supervisor"))};
+import { AgentSession } from ${JSON.stringify(path.join(SRC, "session/agent-session"))};
+
+// Tabs are owned by the agent's kernel owner id, which the extension context does not expose. Capture the
+// live session through a context call that forwards to it, then read the id the way browser.open does.
+function kernelOwnerIdOf(ctx) {
+	const original = AgentSession.prototype.getContextUsage;
+	let session;
+	AgentSession.prototype.getContextUsage = function (...args) {
+		session = this;
+		return original.apply(this, args);
+	};
+	try {
+		ctx.getContextUsage();
+	} finally {
+		AgentSession.prototype.getContextUsage = original;
+	}
+	if (!session) throw new Error("fixture could not reach the live AgentSession");
+	return session.getEvalKernelOwnerId();
+}
 export default function (pi) {
 	pi.on("session_start", async (_event, ctx) => {
 		const browser = Bun.spawn(["/bin/sh", ${JSON.stringify(fixtureScript)}], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
 		browser.unref();
-		const sessionId = ctx.sessionManager.getSessionId();
-		await recordLaunchedBrowser({ browserPid: browser.pid, exe: "fixture", cdpPort: 0, headless: true, ownerSessionId: sessionId });
+		const ownerId = kernelOwnerIdOf(ctx);
+		await recordLaunchedBrowser({ browserPid: browser.pid, exe: "fixture", cdpPort: 0, headless: true, ownerSessionId: ownerId });
 		getTabsMapForTest().set("fixture-tab", {
 			name: "fixture-tab",
 			backend: "worker",
 			state: "alive",
 			targetId: "fixture-target",
 			kindTag: "spawned",
-			ownerSessionId: sessionId,
+			ownerSessionId: ownerId,
 			pending: new Map(),
 			lastActivityAt: Date.now(),
 			frozen: false,

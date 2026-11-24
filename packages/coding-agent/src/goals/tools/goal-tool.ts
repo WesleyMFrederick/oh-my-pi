@@ -1,5 +1,11 @@
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentTool,
+	AgentToolContext,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ToolTier,
+} from "@oh-my-pi/pi-agent-core";
 
 import { prompt } from "@oh-my-pi/pi-utils";
 
@@ -13,7 +19,7 @@ import { completionBudgetReport, remainingTokens } from "../runtime";
 import type { Goal, GoalToolDetails } from "@oh-my-pi/pi-tui/tools/goal";
 
 const goalSchema = type({
-	op: type("'create' | 'get' | 'complete' | 'resume' | 'drop'").describe("goal operation"),
+	op: type("'create' | 'get' | 'complete' | 'pause' | 'resume' | 'drop'").describe("goal operation"),
 	"objective?": type("string").describe("goal objective"),
 	"token_budget?": type("number.integer").describe("token budget"),
 });
@@ -55,6 +61,9 @@ function validateCreateParams(params: GoalToolInput): { objective: string; token
 
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	readonly name = "goal";
+	/** Goal ops touch only session state: `get` reads it; the rest change the goal, so `always-ask` still prompts. */
+	readonly approval = (args: unknown): ToolTier =>
+		args !== null && typeof args === "object" && "op" in args && args.op === "get" ? "read" : "write";
 	readonly label = "Goal";
 	readonly description = prompt.render(goalDescription);
 	readonly parameters = goalSchema;
@@ -85,6 +94,9 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 		} else if (params.op === "get") {
 			const state = this.#session.getGoalModeState?.();
 			response = buildGoalToolResponse(state?.goal ?? null);
+		} else if (params.op === "pause") {
+			const paused = await runtime.pauseGoal();
+			response = buildGoalToolResponse(paused?.goal ?? null);
 		} else if (params.op === "resume") {
 			const resumed = await runtime.resumeGoal();
 			response = buildGoalToolResponse(resumed.goal);

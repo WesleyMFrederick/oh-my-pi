@@ -15,10 +15,12 @@
  * URL forms:
  * - history:// - Index of all registry + on-disk agents (id, status, kind, last activity)
  * - history://<agentId> - Concise markdown transcript of that agent
- * - history://current/full - Full, caller-bound current branch history (experimental)
+ * - history://current/full - Full, caller-bound current branch history (experimental);
+ *   bare history://current reads the same unless an agent is named `current`
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { AgentRef } from "../registry/agent-registry";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
@@ -37,7 +39,7 @@ import {
 import { loadSessionMessagesReadOnly } from "../session/session-loader";
 import type { SessionEntry } from "../session/session-entries";
 import historyPromptDoc from "../prompts/internal-urls/history.md" with { type: "text" };
-import { sessionFilesFromDisk } from "./registry-helpers";
+import { artifactsDirsFromRegistry, sessionFilesFromDisk } from "./registry-helpers";
 import type {
 	InternalResource,
 	InternalUrl,
@@ -46,6 +48,23 @@ import type {
 	SchemeSpec,
 	UrlCompletion,
 } from "./types";
+
+/**
+ * On-disk transcript ids for `complete()`, keyed by the scanned dir set.
+ * Completion runs per keystroke and the scan is recursive, so a short reuse
+ * window replaces a full rescan on every key.
+ */
+const completionDiskIds = new LRUCache<string, Promise<string[]>>({ max: 8, ttl: 2000 });
+
+function diskIdsForCompletion(): Promise<string[]> {
+	const key = artifactsDirsFromRegistry().join("\0");
+	const cached = completionDiskIds.get(key);
+	if (cached) return cached;
+	const ids = sessionFilesFromDisk().then(files => [...files.keys()]);
+	completionDiskIds.set(key, ids);
+	ids.catch(() => completionDiskIds.delete(key));
+	return ids;
+}
 
 /** Registry lookup for a `history://<id>` URL, bound to the caller's root. */
 interface RefLookup {
@@ -56,14 +75,19 @@ interface RefLookup {
 	preferredArtifactDir?: string;
 }
 
-/** True for `history://current/<path>`; throws unless the route is exactly `current/full`. */
-function isCurrentFullRoute(url: InternalUrl): boolean {
+/**
+ * `full` for `history://current/full`, `bare` for `history://current` (which
+ * means the same unless an agent is named `current`), undefined for any other
+ * id; throws for any other `current/<path>`.
+ */
+function currentRoute(url: InternalUrl): "full" | "bare" | undefined {
 	const agentId = url.rawHost || url.hostname;
-	if (agentId.toLowerCase() !== "current" || !url.pathname || url.pathname === "/") return false;
+	if (agentId.toLowerCase() !== "current") return undefined;
+	if (!url.pathname || url.pathname === "/") return "bare";
 	if (url.pathname !== "/full" || url.search || url.hash) {
 		throw new Error("Invalid history://current route; use exactly history://current/full (selectors may follow it)");
 	}
-	return true;
+	return "full";
 }
 
 /** Humanize a last-activity timestamp as `Ns/Nm/Nh/Nd ago`. */
@@ -301,20 +325,23 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 	 * do live agents without a session file and unknown ids.
 	 */
 	async locate(url: InternalUrl, context?: ResolveContext): Promise<string | null> {
-		if (isCurrentFullRoute(url)) return null;
+		const current = currentRoute(url);
+		if (current === "full") return null;
 		const agentId = url.rawHost || url.hostname;
 		if (!agentId) return null;
 		const { ref, preferredArtifactDir } = await this.#lookup(agentId, context);
+		if (!ref && current === "bare") return null;
 		if (ref?.sessionFile) return ref.sessionFile;
 		if (ref?.session) return null;
 		return (await this.#findOnDisk(ref?.id ?? agentId, preferredArtifactDir))?.file ?? null;
 	}
 
 	/**
-	 * Find the registry ref for `agentId` (exact, then case-insensitive),
-	 * skipping advisor transcripts.
+	 * The registry roster as the caller sees it: the caller root's persisted
+	 * roster is refreshed first, and its artifact dir leads every on-disk scan.
+	 * Both the bare index and `history://<id>` lookups read this one source.
 	 */
-	async #lookup(agentId: string, context: ResolveContext | undefined): Promise<RefLookup> {
+	async #roster(context: ResolveContext | undefined): Promise<Omit<RefLookup, "ref">> {
 		const registry = AgentRegistry.global();
 		// A caller resolving a possibly-parked id refreshes its own root's
 		// persisted roster first: a same-named parked ref restored by another
@@ -330,7 +357,16 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		// Advisor transcripts are observability-only — surfaced in the Agent Hub, never
 		// in the agent-facing roster. Hide them from the index, lookup, and completions.
 		const visible = registry.list().filter(ref => ref.kind !== "advisor");
-		let ref = registry.get(agentId);
+		return { visible, preferredArtifactDir };
+	}
+
+	/**
+	 * Find the registry ref for `agentId` (exact, then case-insensitive),
+	 * skipping advisor transcripts.
+	 */
+	async #lookup(agentId: string, context: ResolveContext | undefined): Promise<RefLookup> {
+		const { visible, preferredArtifactDir } = await this.#roster(context);
+		let ref = AgentRegistry.global().get(agentId);
 		if (ref?.kind === "advisor") ref = undefined;
 		if (!ref) {
 			// Case-insensitive fallback: agent ids are human-typed (e.g. AuthLoader).
@@ -343,7 +379,8 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 	#resolveCurrentFull(url: InternalUrl, context: ResolveContext | undefined): InternalResource {
 		if (!context?.experimentalContextManagement) {
 			throw new Error(
-				"history://current/full is available only when compaction.experimentalContextManagement is enabled",
+				"history://current/full is available only when compaction.experimentalContextManagement is enabled; " +
+					"list agent transcripts with history://",
 			);
 		}
 		const branch = context.getSessionBranch?.();
@@ -360,13 +397,12 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		};
 	}
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
-		if (isCurrentFullRoute(url)) return this.#resolveCurrentFull(url, context);
+		const current = currentRoute(url);
+		if (current === "full") return this.#resolveCurrentFull(url, context);
 		const agentId = url.rawHost || url.hostname;
 		if (!agentId) {
-			const visible = AgentRegistry.global()
-				.list()
-				.filter(ref => ref.kind !== "advisor");
-			const content = await this.#renderIndex(visible);
+			const { visible, preferredArtifactDir } = await this.#roster(context);
+			const content = await this.#renderIndex(visible, preferredArtifactDir);
 			return {
 				url: url.href,
 				content,
@@ -376,6 +412,8 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		}
 
 		const { ref, visible, preferredArtifactDir } = await this.#lookup(agentId, context);
+		// No agent is named `current`: the caller means its own session's history.
+		if (!ref && current === "bare") return this.#resolveCurrentFull(url, context);
 		if (!ref) {
 			// Registry miss — the agent may have been unregistered or lost on resume.
 			// Serve its transcript straight from disk if the session file persists.
@@ -400,6 +438,24 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			// giving up, in case the transcript lingers under an artifacts dir.
 			const disk = await this.#resolveFromDisk(ref.id, preferredArtifactDir);
 			if (disk) return { ...disk, url: url.href };
+			if (ref.status === "running") {
+				// Registered before its session or JSONL exists: the worker is alive,
+				// its transcript just has not been written yet.
+				const content = [
+					`# ${ref.id} (${ref.status})`,
+					"",
+					"No transcript has been written yet.",
+					`Started ${formatAgo(ref.createdAt)}.`,
+					"",
+				].join("\n");
+				return {
+					url: url.href,
+					content,
+					contentType: "text/markdown",
+					size: Buffer.byteLength(content, "utf-8"),
+					notes: ["Source: agent registry (no transcript yet)"],
+				};
+			}
 			throw new Error(`Agent ${ref.id} has no transcript: session is gone and no session file was retained`);
 		}
 
@@ -453,7 +509,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		return match;
 	}
 
-	async #renderIndex(refs: AgentRef[]): Promise<string> {
+	async #renderIndex(refs: AgentRef[], preferredArtifactDir: string | undefined): Promise<string> {
 		const entries: IndexEntry[] = refs.map(ref => ({
 			id: ref.id,
 			status: ref.status,
@@ -463,7 +519,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		}));
 		// Merge on-disk transcripts for agents absent from the registry.
 		const registered = new Set(refs.map(ref => ref.id));
-		const disk = await sessionFilesFromDisk();
+		const disk = await sessionFilesFromDisk(preferredArtifactDir);
 		for (const id of disk.keys()) {
 			if (registered.has(id)) continue;
 			entries.push({ id, status: "on disk", kind: "—", parent: "—", lastActivity: "—" });
@@ -493,8 +549,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 				description: `${ref.status} · ${ref.kind}${ref.parentId ? ` · parent ${ref.parentId}` : ""}`,
 			});
 		}
-		const disk = await sessionFilesFromDisk();
-		for (const id of disk.keys()) {
+		for (const id of await diskIdsForCompletion()) {
 			if (seen.has(id)) continue;
 			seen.add(id);
 			completions.push({ value: id, description: "on disk" });

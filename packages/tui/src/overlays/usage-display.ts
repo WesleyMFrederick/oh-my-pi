@@ -1,4 +1,4 @@
-import type { UsageLimit, UsageReport, UsageResetCredits } from "@oh-my-pi/pi-ai";
+import type { UsageLimit, UsageReport, UsageResetCreditDetail, UsageResetCredits } from "@oh-my-pi/pi-ai";
 
 /** Include the usage tier in a limit title unless its label already names it. */
 export function formatLimitTitle(limit: UsageLimit): string {
@@ -38,6 +38,8 @@ export function formatUsageResetWindow(windowId: string): string {
 			return "Claude Opus weekly";
 		case "anthropic:7d:sonnet":
 			return "Claude Sonnet weekly";
+		case "anthropic:7d:fable":
+			return "Claude Fable weekly";
 		default:
 			return windowId;
 	}
@@ -49,6 +51,13 @@ export interface UsageResetSummary {
 	redeemableCount: number;
 	soonestExpiry?: string;
 	unavailableReason?: string;
+}
+
+/** Expiry (epoch ms) of a credit that still banks a reset, whether or not it can be spent now. */
+export function bankedResetCreditExpiryMs(credit: UsageResetCreditDetail): number | undefined {
+	if (!credit.expiresAt || credit.remainingCount === 0 || credit.status === "redeemed") return undefined;
+	const expiryMs = Date.parse(credit.expiresAt);
+	return Number.isFinite(expiryMs) ? expiryMs : undefined;
 }
 
 /**
@@ -68,9 +77,8 @@ export function summarizeUsageResetCredits(
 	let latestExpired: string | undefined;
 	let latestExpiredMs = Number.NEGATIVE_INFINITY;
 	for (const credit of reset.credits ?? []) {
-		if (!credit.expiresAt || credit.remainingCount === 0 || credit.status === "redeemed") continue;
-		const expiryMs = Date.parse(credit.expiresAt);
-		if (!Number.isFinite(expiryMs)) continue;
+		const expiryMs = bankedResetCreditExpiryMs(credit);
+		if (expiryMs === undefined) continue;
 		if (expiryMs > nowMs && expiryMs < soonestExpiryMs) {
 			soonestExpiryMs = expiryMs;
 			soonestExpiry = credit.expiresAt;

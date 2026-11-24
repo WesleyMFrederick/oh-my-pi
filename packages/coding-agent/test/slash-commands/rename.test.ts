@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
@@ -13,6 +15,7 @@ import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-comm
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import { DEFAULT_TINY_TITLE_LOCAL_MODEL_KEY } from "@oh-my-pi/pi-coding-agent/tiny/models";
 import { tinyTitleClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
+import { cfgTitleIcons } from "@oh-my-pi/pi-coding-agent/utils/title-settings";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
 
@@ -25,14 +28,27 @@ function createRuntime(
 	sessionManager = SessionManager.inMemory(),
 ) {
 	authStorage = createInMemoryAuthStorage();
+	authStorage.keys.setRuntime("anthropic", "test-key");
+	// Plain titles keep the rename lifecycle tests to one title request; the card tests opt in.
 	const settings = Settings.isolated({
 		"compaction.enabled": false,
+		"title.icons": "boring",
 		modelRoles: { tiny: `local/${DEFAULT_TINY_TITLE_LOCAL_MODEL_KEY}` },
 	});
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
-	const agent = new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } });
-	session = new AgentSession({ agent, sessionManager, settings, modelRegistry: new ModelRegistry(authStorage) });
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		streamFn: createMockModel({ handler: { content: ["Looking at the cache."] } }).stream,
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager,
+		settings,
+		modelRegistry: new ModelRegistry(authStorage),
+		autoTitle: true,
+	});
 	if (topic !== null) {
 		const message = { role: "user" as const, content: topic, timestamp: 1 };
 		agent.appendMessage(message);
@@ -75,6 +91,22 @@ function deferTitle() {
 		return response.promise;
 	});
 	return { started, response, generate };
+}
+
+/**
+ * A discarded title still ran on the local title model, so the request is journaled as its
+ * session's `model_usage`; nothing else is written, so the stale title never renames the session.
+ */
+function expectOnlyTitleUsageJournaled(sessionManager: SessionManager, before: SessionEntry[], reply: string) {
+	const after = sessionManager.getEntries();
+	expect(after.slice(0, before.length)).toEqual(before);
+	expect(after.slice(before.length)).toEqual([
+		expect.objectContaining({
+			type: "model_usage",
+			purpose: "title",
+			completion: expect.objectContaining({ reply }),
+		}),
+	]);
 }
 
 afterEach(async () => {
@@ -125,6 +157,56 @@ for (const mode of ["TUI", "headless"] as const) {
 			expect(context).toContain("Repair cache invalidation after writes");
 			await sessionManager.setSessionName("Later automatic title", "auto");
 			expect(session.sessionName).toBe("Cache invalidation repair");
+		});
+
+		it("keeps the current title's card on a generated title without asking for a new one", async () => {
+			const { session, sessionManager, runtime, execute } = createRuntime(mode);
+			cfgTitleIcons.override(runtime.settings, "emoji");
+			await sessionManager.setSessionName("🧪 CACHE: Fix cache writes", "auto");
+			const generate = vi.spyOn(tinyTitleClient, "generate").mockResolvedValue("Cache invalidation repair");
+
+			await execute("/rename");
+
+			expect(session.sessionName).toBe("🧪 CACHE: Cache invalidation repair");
+			expect(generate).toHaveBeenCalledTimes(1);
+		});
+
+		it("heads a typed or generated title without a card with one the title model names", async () => {
+			const { session, runtime, execute } = createRuntime(mode);
+			cfgTitleIcons.override(runtime.settings, "emoji");
+			const generate = vi
+				.spyOn(tinyTitleClient, "generate")
+				.mockImplementation(async (_model, _message, options) =>
+					options && "systemPrompt" in options ? "🗄 CACHE" : "Cache invalidation repair",
+				);
+
+			await execute("/rename");
+			expect(session.sessionName).toBe("🗄️ CACHE: Cache invalidation repair");
+
+			await execute("/rename Cache ownership");
+			expect(session.sessionName).toBe("🗄️ CACHE: Cache ownership");
+			expect(generate.mock.calls.at(-1)?.[1]).toBe("Cache ownership");
+
+			await execute("/rename 🐳 DOCKER: Docker builds");
+			expect(session.sessionName).toBe("🐳 DOCKER: Docker builds");
+			expect(generate).toHaveBeenCalledTimes(3);
+		});
+
+		it("applies a typed title without its card when an interrupt cancels the card", async () => {
+			const { session, runtime, execute } = createRuntime(mode);
+			cfgTitleIcons.override(runtime.settings, "emoji");
+			const { started, response } = deferTitle();
+			const pending = execute("/rename Cache ownership");
+			try {
+				await Promise.race([started.promise, pending]);
+				await session.abort();
+				response.resolve("🗄 CACHE");
+				await pending;
+				expect(session.sessionName).toBe("Cache ownership");
+			} finally {
+				response.resolve(null);
+				await pending;
+			}
 		});
 
 		it("persists an explicit title without asking the model", async () => {
@@ -279,7 +361,7 @@ for (const mode of ["TUI", "headless"] as const) {
 				response.resolve("Stale title from before switching");
 				await pending;
 				expect(session.sessionName).toBeUndefined();
-				expect(sessionManager.getEntries()).toEqual(entries);
+				expectOnlyTitleUsageJournaled(sessionManager, entries, "Stale title from before switching");
 				expect(output).not.toHaveBeenCalled();
 			} finally {
 				response.resolve(null);
@@ -302,7 +384,7 @@ for (const mode of ["TUI", "headless"] as const) {
 				await pending;
 
 				expect(session.sessionName).toBe("My chosen title");
-				expect(sessionManager.getEntries()).toEqual(entries);
+				expectOnlyTitleUsageJournaled(sessionManager, entries, "Stale generated title");
 			} finally {
 				response.resolve(null);
 				await pending;
@@ -356,7 +438,7 @@ it("releases the RPC command while title inference runs in the background and pr
 		await backgroundTask;
 
 		expect(session.sessionName).toBe("My newer RPC title");
-		expect(sessionManager.getEntries()).toEqual(entries);
+		expectOnlyTitleUsageJournaled(sessionManager, entries, "Stale generated title");
 	} finally {
 		response.resolve(null);
 		await dispatched;
@@ -438,7 +520,10 @@ it.each(["TUI", "headless"] as const)(
 			.mockImplementationOnce(() => manual.promise);
 		let pending: Promise<unknown> | undefined;
 		try {
-			session.maybeStartTitleGeneration("Repair cache invalidation after writes");
+			// A TITLE_SYSTEM.md override keeps the automatic title on the title model
+			// (no reply fork), so both titles race through `generate`.
+			session.setTitleSystemPrompt("Name the session in 3-6 words.");
+			await session.prompt("Repair cache invalidation after writes");
 			pending = execute("/rename");
 			expect(generate).toHaveBeenCalledTimes(2);
 			automatic.resolve("Initial automatic title");

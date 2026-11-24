@@ -70,7 +70,7 @@ describe("ModelRegistry default custom models config", () => {
 			modelId: "us.anthropic.claude-opus-4-8",
 		});
 
-		expect(model?.compat).toEqual({
+		const expectedCompat = {
 			promptCacheMode: "explicit",
 			supportsLongPromptCacheRetention: false,
 			promptCacheMinimumTokens: 1024,
@@ -80,7 +80,14 @@ describe("ModelRegistry default custom models config", () => {
 			// overrides too (model compat generation).
 			streamIdleTimeoutMs: 900000,
 			streamRevision: "possible",
-		});
+			// Opus 4.7+ rejects temperature/top_p on every host (class rule).
+			supportsSamplingParams: false,
+			// Bedrock Converse keeps thinking-binding controls on unless an override opts out.
+			supportsThinkingBindingControls: true,
+			// Converse on an AWS host supports native Claude server compaction (provider rule).
+			supportsServerCompaction: true,
+		} as const;
+		expect(model?.compat).toEqual(expectedCompat);
 	});
 
 	test("prefers default models.yml over models.yaml when both exist", () => {
@@ -338,6 +345,29 @@ describe("ModelRegistry default custom models config", () => {
 			expect(getPromptCacheTtlMs(catalogDefaultModel, options)).toBe(300_000);
 		});
 
+		test("runtime API replacement drops a prior catalog lifetime when the new route has no cache policy", () => {
+			const registry = createPromptCacheRegistry("prompt-cache-runtime-route-replacement.yml", "providers: {}\n");
+			const options: SimpleStreamOptions = { cacheRetention: "short" };
+			const catalogModel = requireRegistryModel(registry, "amazon-bedrock", BEDROCK_OPUS_MODEL);
+			expect(getPromptCacheTtlMs(catalogModel, options)).toBe(300_000);
+
+			registry.registerProvider(
+				"amazon-bedrock",
+				runtimeBedrockProvider(undefined, "openai-completions", "https://openai-compatible.example.com/v1"),
+				"ext://runtime-cache-route-replacement",
+			);
+			const replacedModel = requireRegistryModel(registry, "amazon-bedrock", BEDROCK_OPUS_MODEL);
+			expect(replacedModel.api).toBe("openai-completions");
+			expect(getPromptCacheTtlMs(replacedModel, options)).toBeUndefined();
+
+			const armed = armRegistryModel(replacedModel, options);
+			try {
+				expect(armed.warmer.status.state).toBe("inactive");
+			} finally {
+				armed.warmer.cancel();
+			}
+		});
+
 		test("model override lifetime remains highest priority over runtime and YAML definitions", () => {
 			const registry = createPromptCacheRegistry(
 				"prompt-cache-override-precedence.yml",
@@ -408,6 +438,8 @@ interface ModelSnapshot {
 		supportsForcedToolChoice?: boolean;
 		streamIdleTimeoutMs?: number;
 		streamRevision?: "possible";
+		supportsSamplingParams?: boolean;
+		supportsThinkingBindingControls?: boolean;
 	};
 }
 
@@ -541,11 +573,15 @@ function bedrockModelDefinition(promptCache: { short: number; long?: number }): 
 	].join("\n");
 }
 
-function runtimeBedrockProvider(promptCache?: Model["promptCache"]): ProviderConfigInput {
+function runtimeBedrockProvider(
+	promptCache?: Model["promptCache"],
+	api: NonNullable<ProviderConfigInput["api"]> = "bedrock-converse-stream",
+	baseUrl = "https://bedrock-runtime.us-east-1.amazonaws.com",
+): ProviderConfigInput {
 	return {
-		baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+		baseUrl,
 		apiKey: "TEST_KEY",
-		api: "bedrock-converse-stream",
+		api,
 		models: [
 			{
 				id: BEDROCK_OPUS_MODEL,
@@ -556,12 +592,16 @@ function runtimeBedrockProvider(promptCache?: Model["promptCache"]): ProviderCon
 				contextWindow: 200000,
 				maxTokens: 8000,
 				...(promptCache !== undefined ? { promptCache } : {}),
-				compat: {
-					promptCacheMode: "explicit",
-					supportsLongPromptCacheRetention: true,
-					promptCacheMinimumTokens: 0,
-					promptCacheMaximumCheckpoints: 2,
-				},
+				...(api === "bedrock-converse-stream"
+					? {
+							compat: {
+								promptCacheMode: "explicit",
+								supportsLongPromptCacheRetention: true,
+								promptCacheMinimumTokens: 0,
+								promptCacheMaximumCheckpoints: 2,
+							},
+						}
+					: {}),
 			},
 		],
 	};
@@ -583,6 +623,6 @@ function armRegistryModel(
 		getPromptTokens: () => 100_000,
 		getMode: () => "streaming",
 	});
-	warmer.start({ model, context: { messages: [] }, options }, () => true);
+	warmer.start({ model, context: { messages: [] }, options }, () => undefined);
 	return { warmer, streamCalls: () => streamCalls };
 }

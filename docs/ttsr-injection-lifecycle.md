@@ -12,6 +12,7 @@ This document covers the current Time Traveling Stream Rules (TTSR) runtime path
 - [`packages/coding-agent/src/export/ttsr-settings.ts`](../packages/coding-agent/src/export/ttsr-settings.ts)
 - [`packages/coding-agent/src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts)
 - [`packages/coding-agent/src/prompts/system/ttsr-interrupt.md`](../packages/coding-agent/src/prompts/system/ttsr-interrupt.md)
+- [`packages/coding-agent/src/prompts/system/ttsr-prose-notice.md`](../packages/coding-agent/src/prompts/system/ttsr-prose-notice.md)
 - [`packages/coding-agent/src/prompts/system/ttsr-warning.md`](../packages/coding-agent/src/prompts/system/ttsr-warning.md)
 - [`packages/coding-agent/src/prompts/system/ttsr-tool-reminder.md`](../packages/coding-agent/src/prompts/system/ttsr-tool-reminder.md)
 - [`packages/coding-agent/src/capability/index.ts`](../packages/coding-agent/src/capability/index.ts)
@@ -29,18 +30,14 @@ const ttsrSettings = cfgTtsr.get(settings);
 // Live source: enable/repeat/interrupt/context changes apply on the next check.
 const ttsrManager = new TtsrManager(() => cfgTtsr.get(settings));
 const rulesResult =
-  options.rules !== undefined
-    ? { items: options.rules, warnings: undefined }
-    : await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir });
-const { rulebookRules, alwaysApplyRules } = bucketRules(
-  rulesResult.items,
-  ttsrManager,
-  {
-    builtinRules: ttsrSettings.builtinRules,
-    disabledRules: ttsrSettings.disabledRules,
-    agentName: resolvedAgentName,
-  },
-);
+	options.rules !== undefined
+		? { items: options.rules, warnings: undefined }
+		: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir });
+const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
+	builtinRules: ttsrSettings.builtinRules,
+	disabledRules: ttsrSettings.disabledRules,
+	agentName: resolvedAgentName,
+});
 ```
 
 `bucketRules(...)` drops names listed in `ttsr.disabledRules`, drops embedded builtin-defaults rules when `ttsr.builtinRules === false`, drops rules whose `agents` globs do not match this session's agent, registers accepted TTSR rules, and then routes the remaining rules to always-apply/rulebook buckets.
@@ -109,6 +106,8 @@ When assistant updates arrive and rules exist:
 - for tools exposing `matcherEntries(args)`, the streamed payload is projected per touched file into `{ path, digest }` entries (added lines only, same-path sections/hunks merged); each entry is checked in isolation via `checkSnapshot(entry.digest, perFileContext)` under its own file path and stream key (`<toolcall>#<path>`), so a path-scoped rule like `tool:edit(*.ts)` never fires on text belonging to a sibling Markdown hunk in a multi-file payload
 - otherwise, for tools exposing a combined `matcherDigest` (edit/write), replace the scoped buffer with the reconstructed source snapshot and call `checkSnapshot(snapshot, matchContext)`; otherwise append the delta into the scoped manager buffer and call `checkDelta(delta, matchContext)` (synchronous regex matching either way)
 - `checkDelta` skips buffering entirely for text/thinking sources when no registered rule allows that source (`canMatchText`/`canMatchThinking`), so unmatched prose/thinking deltas pay no buffering cost
+- matching is incremental: a condition that cannot cross a newline (no `s` flag, nothing in it matches `\n`) is re-tested only from the start of the line holding the previous buffer end, so it gives the full-scan result on every delta; a condition that can span lines is re-scanned over the whole buffer only while it is ≤4 KB or once it has grown 25% since the last full scan
+- `text_end`, `thinking_end`, and `toolcall_end` run a final whole-buffer check (`TtsrCheckOptions.final`), so a cross-line match deferred by the growth throttle is still caught before the block closes; `checkDelta` defaults to `final: false`, `checkSnapshot` to `final: true` (one-shot callers such as the CLI stay exact)
 - text and thinking contexts carry the run's **working set** as `filePaths`: the normalized candidate paths of every tool call that reached `beforeToolCall` or `beforeBridgedToolCall` since the USER prompt that started the run. An empty set adds no paths, so `globs` text rules stay silent until the run touches a matching path. Tool calls in the message being streamed join only once they execute, so its own text is gated by earlier calls
 
 AST matching does not run in the streaming listener. The awaited `beforeToolCall` hook checks the finalized, validated execution arguments using the same per-file or combined source snapshot. An interrupt blocks the tool before its side effects, marks the assistant turn aborted, and follows the existing TTSR injection/retry path; `never` mode allows execution and attaches its reminder to the result. Streaming regex matching remains synchronous.
@@ -150,9 +149,9 @@ After the 50ms timeout, the scheduled task first verifies that its retry token, 
 1. clears the abort-pending flag and per-tool reminder buckets
 2. reads `ttsrManager.getSettings().contextMode`
 3. if `contextMode === "discard"`, drops the targeted partial assistant output with `agent.replaceMessages(...slice(0, targetAssistantIndex))`
-4. builds injection content from pending rules using `ttsr-interrupt.md`
+4. builds injection content from pending rules using `ttsr-interrupt.md` — this is the abort/retry path, where the rule did interrupt the output, so the interrupting template is the truthful one
 5. appends a hidden runtime custom message and persists a matching `custom_message` entry with `customType: "ttsr-injection"` and `details.rules`
-6. marks/persists those rule names through a `ttsr_injection` entry and calls `agent.continue()` to retry generation
+6. marks/persists those rule names through a `ttsr_injection` entry and schedules a continuation with the session's agent-continue scheduler. If the interrupted run is still busy, the scheduler waits for it to settle and retries; skipped or failed continuations release the resume gate.
 
 Template payload is:
 
@@ -176,16 +175,25 @@ Non-interrupting matches split by `matchContext.source`:
 
 - **`source === "tool"` (tool-source match).** The rule is bucketed into `TtsrCoordinator.#perToolInjections`, keyed by the matched tool call's `id`, and marked injected in memory immediately. There is **no** deferred follow-up turn and the stream is not aborted. When the tool actually produces a result, the `afterToolCall` hook returns a rendered `ttsr-tool-reminder.md` block as passive `additionalContext`; agent-core emits it in a separate developer message after the tool result, never as part of tool output (calls dispatched outside the agent loop are covered by the next bullet). It also persists a `ttsr_injection` entry with the consumed rule names. The template payload is:
 
+   ```xml
+   <system-reminder reason="rule_violation" rule="{{name}}" path="{{path}}">
+   ...
+   {{content}}
+   </system-reminder>
+   ```
+
+   The opening line depends on where the rule comes from: a bundled `builtin-defaults` rule says a built-in style rule matched and asks the model to check what it wrote against the rule, exceptions included, and fix only a real violation; every other rule says a user-defined rule matched and must be complied with.
+
+- **Bridged AgentTool calls (Cursor exec handlers, eval).** These dispatches bypass the agent loop, so `afterToolCall` never runs for them. Finalized inner calls are checked at the `ExtensionToolWrapper` boundary, which passes the call's tool context to `TtsrCoordinator.afterBridgedToolCall`. When that context carries an `addAdditionalContext` sink, the reminder is delivered through it as passive context (the Cursor exec bridge installs a sink whenever the session supplies a tool context, and delivers after its buffered results on the next provider request) and the bridged result stays untouched. A bridged call with no sink has no trusted channel, so the reminder is prepended to its result as a leading text block instead; eval-bridged calls take this fallback today. Prelude host calls (`browser.*`, `computer.*`, `tab.run`) are not AgentTool dispatches and stay outside this path.
+
+- **`source === "text"` / `"thinking"` (prose-source match).** The rule is queued in the pending injections. After a successful non-error, non-aborted assistant message, `TtsrCoordinator` queues the hidden `ttsr-injection` custom message with `agent.followUp()` and schedules continuation after 1ms. These deferred non-interrupting prose matches do not emit `ttsr_triggered`; that event is emitted for actual interrupt paths and for non-interrupting per-tool reminders. The deferred message is rendered with `ttsr-prose-notice.md`: the rule matched output it did not interrupt, so the notice states that the output was not interrupted by the rule. It deliberately claims nothing else about the output — a `length` stop truncates it and a `toolUse` stop continues into tool calls.
+
   ```xml
   <system-reminder reason="rule_violation" rule="{{name}}" path="{{path}}">
   ...
   {{content}}
   </system-reminder>
   ```
-
-- **Bridged AgentTool calls (Cursor exec handlers, eval).** These dispatches bypass the agent loop, so `afterToolCall` never runs for them. Finalized inner calls are checked at the `ExtensionToolWrapper` boundary, which passes the call's tool context to `TtsrCoordinator.afterBridgedToolCall`. When that context carries an `addAdditionalContext` sink, the reminder is delivered through it as passive context (the Cursor exec bridge installs a sink whenever the session supplies a tool context, and delivers after its buffered results on the next provider request) and the bridged result stays untouched. A bridged call with no sink has no trusted channel, so the reminder is prepended to its result as a leading text block instead; eval-bridged calls take this fallback today. Prelude host calls (`browser.*`, `computer.*`, `tab.run`) are not AgentTool dispatches and stay outside this path.
-
-- **`source === "text"` / `"thinking"` (prose-source match).** The rule is queued in the pending injections. After a successful non-error, non-aborted assistant message, `TtsrCoordinator` queues the hidden `ttsr-injection` custom message with `agent.followUp()` and schedules continuation after 1ms. These deferred non-interrupting prose matches do not emit `ttsr_triggered`; that event is emitted for actual interrupt paths and for non-interrupting per-tool reminders.
 
 Within a matching batch, each rule is attached to exactly one sibling tool call: if multiple sibling calls would satisfy the same rule, the first claimed bucket wins. Multiple distinct rules can still share one tool call's passive context.
 
@@ -211,6 +219,18 @@ A rule can re-trigger only when:
 - `messageCount - lastInjectedAt >= repeatGap`
 
 `messageCount` increments on `turn_end`, so gap is measured in completed turns, not stream chunks.
+
+### Per-rule override and `repeatMode: "always"`
+
+A rule's own `repeatMode` frontmatter key (`once`, `after-gap`, or `always`) overrides the global setting for that rule; the gap is still the global `repeatGap`.
+
+`always` is rule-level only and is the gap check with `repeatGap = 1`: the rule fires at most once per turn and is eligible again once the turn its reminder landed in has ended. The record is the turn the reminder lands in, never earlier than the current turn:
+
+- Tool reminders (`afterToolCall`) and bridged blocks land in the triggering turn, so the next turn can fire the rule again.
+- An interrupt's reminder lands in the `ttsr-interrupt` retry. The coordinator captures that turn (current turn + 1) when it aborts, so the retry stays exempt even if the timer-driven retry task records it before the aborted turn's `turn_end` is processed.
+- Deferred reminders and judged warnings are recorded again when their message is delivered, which is after the triggering turn ends; the `ttsr-injection` continuation or aside turn they start is that turn.
+
+A turn spawned by a reminder therefore cannot re-fire the same rule: each firing starts at most one extra turn, and a model that repeats the match while answering the reminder is not interrupted or prompted again.
 
 ## 6. Event emission and extension/hook surfaces
 
@@ -257,7 +277,7 @@ Current runtime wiring:
 - non-interrupting tool-source matches are marked in memory when bucketed, then persisted from `afterToolCall` (or the bridged-call postflight) only when the matched tool's result is produced
 - `createAgentSession()` restores `existingSession.injectedTtsrRules` into the manager
 
-Injected-rule suppression is therefore restored from the current branch path. Persistence stores names, not the original turn age: `restoreInjected()` records each restored rule at message count zero. In `repeatMode: "after-gap"`, a resumed rule becomes eligible after `repeatGap` newly completed turns, regardless of how many turns elapsed before reload.
+Injected-rule suppression is therefore restored from the current branch path. Persistence stores names, not the original turn age: `restoreInjected()` records each restored rule at message count zero. In `repeatMode: "after-gap"`, a resumed rule becomes eligible after `repeatGap` newly completed turns, regardless of how many turns elapsed before reload; a resumed `repeatMode: "always"` rule likewise sits out the first turn after resume and is eligible from the second.
 
 ## 8. Race boundaries and ordering guarantees
 
@@ -307,7 +327,7 @@ A rule with `question` is judged: its natural-language question goes to the `jud
 
 - A yes-probability ≥ 0.7 flags the rule. Flagged rules pass through `TtsrManager.claim()`, which drops rules another verdict already claimed or that the repeat policy blocks, and marks the rest injected in memory; one rule flagged by several outputs is therefore delivered once.
 - Verdicts arriving after a session replacement (`/new`, session switch) are dropped.
-- Survivors emit `ttsr_triggered` and are rendered with `ttsr-warning.md` into a hidden `ttsr-injection` custom message (`details.rules`), sent with `deliverAs: "aside"`: mid-run it joins the next step without interrupting; on an idle session it starts a turn. Its `message_end` persists the `ttsr_injection` entry.
+- Survivors emit `ttsr_triggered` and are rendered with `ttsr-warning.md` into a hidden `ttsr-injection` custom message (`details.rules`), sent with `deliverAs: "aside"`: mid-run it joins the next step without interrupting (a running interruptible `wait` ends); on an idle session it starts a turn. Its `message_end` persists the `ttsr_injection` entry.
 - The session's `onBeforeYield` hook awaits in-flight judgments (up to 5s) before the agent loop drains asides and stops, so a warning about the final reply or last tool call lands in the same run. Later verdicts still arrive as asides.
 - Judge failures (no credentials, timeouts, parse errors) are logged and deliver nothing; with per-rule judges, a failing judge drops only its own rules' verdicts.
 

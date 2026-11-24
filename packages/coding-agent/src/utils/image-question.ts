@@ -10,6 +10,7 @@ import {
 	resolveModelFromString,
 } from "../config/model-resolver";
 import imageQuestionSystemPromptTemplate from "../prompts/tools/image-question-system.md" with { type: "text" };
+import { journalCompletion } from "../session/model-usage-journal";
 import { concreteThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -123,12 +124,19 @@ export async function askImageQuestion(
 
 	const configuredThinking = concreteThinkingLevel(
 		extractExplicitThinkingSelector(selectedPattern, session.settings, {
-			isLiteralModelId: (provider, id) =>
-				availableModels.some(candidate => candidate.provider === provider && candidate.id === id),
+			isLiteralModelId: (provider, id) => {
+				if (provider !== undefined) {
+					return availableModels.some(candidate => candidate.provider === provider && candidate.id === id);
+				}
+				const lowerId = id.toLowerCase();
+				return availableModels.some(candidate => candidate.id.toLowerCase() === lowerId);
+			},
 		}),
 	);
 	const reasoning = toReasoningEffort(resolveThinkingLevelForModel(model, configuredThinking));
 
+	session.costGate?.admit();
+	const journal = journalCompletion(session.sessionManager, { purpose: "image-question" });
 	let response: AssistantMessage;
 	try {
 		response = await instrumentedCompleteSimple(
@@ -153,6 +161,8 @@ export async function askImageQuestion(
 			},
 			{ telemetry, oneshotKind: "image_question", completeImpl },
 		);
+		session.costGate?.record(response.usage.cost.total);
+		journal?.(response, question);
 	} catch (error) {
 		if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
 			if (timedOut()) throw new ToolError(formatTimeoutMessage());

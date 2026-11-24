@@ -8,6 +8,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "../types";
+import type { SessionEntry } from "./entries";
 import branchSummaryContextPrompt from "./prompts/branch-summary-context.md" with { type: "text" };
 import compactionSummaryContextPrompt from "./prompts/compaction-summary-context.md" with { type: "text" };
 import handoffSummaryContextPrompt from "./prompts/handoff-summary-context.md" with { type: "text" };
@@ -24,6 +25,8 @@ export interface CustomMessage<T = unknown> {
 	details?: T;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
+	/** Rendered and saved, never sent to the model (like `!!` bash rows). */
+	excludeFromContext?: boolean;
 	timestamp: number;
 }
 
@@ -179,6 +182,7 @@ export function createCustomMessage(
 	details: unknown | undefined,
 	timestamp: string,
 	attribution?: MessageAttribution,
+	excludeFromContext?: boolean,
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -187,6 +191,7 @@ export function createCustomMessage(
 		display,
 		details,
 		attribution,
+		...(excludeFromContext ? { excludeFromContext: true } : {}),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -215,6 +220,7 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 		switch (message.role) {
 			case "custom":
 			case "hookMessage": {
+				if (message.role === "custom" && message.excludeFromContext) return undefined;
 				const content =
 					typeof message.content === "string"
 						? [{ type: "text" as const, text: message.content }]
@@ -290,4 +296,29 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
  */
 export function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.map(convertMessageToLlm).filter(message => message !== undefined);
+}
+
+/**
+ * The context message a session entry contributes, or `undefined` for entries
+ * that don't reach the LLM (compaction markers, labels, model changes, rows
+ * kept out of context, ...).
+ */
+export function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
+	if (entry.type === "message") {
+		return entry.message;
+	}
+	if (entry.type === "custom_message" && !entry.excludeFromContext) {
+		return createCustomMessage(
+			entry.customType,
+			entry.content,
+			entry.display,
+			entry.details,
+			entry.timestamp,
+			entry.attribution,
+		);
+	}
+	if (entry.type === "branch_summary") {
+		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
+	}
+	return undefined;
 }

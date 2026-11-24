@@ -157,6 +157,32 @@ describe("subagent warning injection", () => {
 		expect(result.rawOutput.includes("SYSTEM WARNING")).toBe(false);
 	});
 
+	it("delivers normalized strict-mode optionals from assembled yields, but keeps permissive nulls invalid", () => {
+		const args = {
+			rawOutput: "",
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success" as const, data: { status: "done", detail: { blocker: null } } }],
+			outputSchema: {
+				properties: {
+					status: { type: "string" },
+					detail: { optionalProperties: { blocker: { type: "string" } } },
+				},
+			},
+			outputSchemaSource: "caller" as const,
+		};
+		const strict = finalizeSubprocessOutput({ ...args, outputSchemaMode: "strict" });
+		expect(strict.exitCode).toBe(0);
+		expect(strict.structuredOutput?.status).toBe("valid");
+		expect(strict.structuredOutput?.data).toEqual({ status: "done", detail: {} });
+
+		const permissive = finalizeSubprocessOutput({ ...args, outputSchemaMode: "permissive" });
+		expect(permissive.exitCode).toBe(1);
+		expect(permissive.structuredOutput?.status).toBe("invalid");
+	});
+
 	it("does not inject missing-submit warning when no schema and raw text exists", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "plain text notes",
@@ -427,26 +453,7 @@ describe("subagent warning injection", () => {
 		});
 	});
 
-	it("uses last assistant text as the raw result for terminal string-typed yields without data", () => {
-		const result = finalizeSubprocessOutput({
-			rawOutput: "",
-			exitCode: 0,
-			stderr: "",
-			doneAborted: false,
-			signalAborted: false,
-			yieldItems: [{ status: "success", type: "final" }],
-			outputSchema: undefined,
-			lastAssistantText: "final answer from the assistant",
-		});
-
-		expect(result.exitCode).toBe(0);
-		expect(result.rawOutput).toBe("final answer from the assistant");
-	});
-
 	it("keeps accumulated sections when a data-less terminal yield finalizes", () => {
-		// Previously a data-less `type: "final"` collapsed to the last assistant
-		// turn and dropped earlier incremental sections; the sections are the work
-		// product, so they must survive the finalize.
 		const result = finalizeSubprocessOutput({
 			rawOutput: "",
 			exitCode: 0,
@@ -458,7 +465,6 @@ describe("subagent warning injection", () => {
 				{ status: "success", type: "final" },
 			],
 			outputSchema: undefined,
-			lastAssistantText: "plain final answer",
 		});
 
 		expect(result.exitCode).toBe(0);
@@ -489,7 +495,6 @@ describe("subagent warning injection", () => {
 					notes: { elements: { type: "string" } },
 				},
 			},
-			lastAssistantText: "some prose that must not become the result",
 		});
 
 		expect(result.stderr).not.toContain("schema_violation");
@@ -499,22 +504,6 @@ describe("subagent warning injection", () => {
 			filesChanged: ["a.ts"],
 			notes: ["ok"],
 		});
-	});
-
-	it("serializes untyped useLastTurn yield as raw text", () => {
-		const result = finalizeSubprocessOutput({
-			rawOutput: "",
-			exitCode: 0,
-			stderr: "",
-			doneAborted: false,
-			signalAborted: false,
-			yieldItems: [{ status: "success", useLastTurn: true }],
-			outputSchema: undefined,
-			lastAssistantText: "plain final answer",
-		});
-
-		expect(result.exitCode).toBe(0);
-		expect(result.rawOutput).toBe("plain final answer");
 	});
 
 	it("rejects exhausted schema retries in strict mode and retains parsed validation metadata", () => {

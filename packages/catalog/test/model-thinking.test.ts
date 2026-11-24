@@ -347,6 +347,40 @@ describe("model thinking derivation", () => {
 		expect(getSupportedEfforts(pro)).toEqual([Effort.Low, Effort.High, Effort.Max]);
 	});
 
+	it("keeps Go LongCat reasoning without inventing an effort selector", () => {
+		const longcat = createModel({
+			id: "longcat-2.5-preview-free",
+			api: "openai-completions",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		});
+
+		expect(longcat.reasoning).toBe(true);
+		expect(getSupportedEfforts(longcat)).toEqual([]);
+		expect(clampThinkingLevelForModel(longcat, Effort.High)).toBeUndefined();
+	});
+
+	it("offers Go Space Bunny only its published effort tiers through max", () => {
+		const spaceBunny = createModel({
+			id: "space-bunny-free",
+			api: "openai-completions",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+		});
+
+		expect(getSupportedEfforts(spaceBunny)).toEqual([
+			Effort.Low,
+			Effort.Medium,
+			Effort.High,
+			Effort.XHigh,
+			Effort.Max,
+		]);
+		expect(requireSupportedEffort(spaceBunny, Effort.Max)).toBe(Effort.Max);
+		expect(() => requireSupportedEffort(spaceBunny, Effort.Minimal)).toThrow(
+			/Supported efforts: low, medium, high, xhigh, max/,
+		);
+	});
+
 	it("grants the low/high/max ladder to OpenRouter deepseek-v4-pro-0813 but not the undated route (issue #8517)", () => {
 		// OpenRouter's /models advertises reasoning.supported_efforts
 		// [low, high, max] for the dated SKU; the discovered ladder is baked
@@ -497,7 +531,8 @@ describe("model thinking derivation", () => {
 		});
 		expect(mapEffortToGoogleThinkingLevel(Effort.Low)).toBe("LOW");
 		expect(mapEffortToGoogleThinkingLevel(Effort.High)).toBe("HIGH");
-		expect(mapEffortToGoogleThinkingLevel(Effort.XHigh)).toBe("HIGH");
+		// The ladder, not the wire mapper, keeps `xhigh` off models that reject it.
+		expect(() => requireSupportedEffort(model, Effort.XHigh)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(model, Effort.Medium)).toThrow(/not supported/);
 	});
 
@@ -562,6 +597,50 @@ describe("model thinking derivation", () => {
 			baseUrl: "https://api.deepinfra.com/v1/openai",
 		});
 		expect(getSupportedEfforts(resellerFlash37)).toContain(Effort.Minimal);
+	});
+
+	it("drives Gemini 4 with its thinkingLevel ladder on the direct Google transports", () => {
+		// Google documents LOW/MEDIUM/HIGH for Gemini 4:
+		// `thinkingBudget` and THINKING_LEVEL_MINIMAL both return 400.
+		// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/start/get-started-with-gemini-4
+		for (const id of ["gemini-4-argon", "gemini-4-argon-cyber-permissive", "gemini-4-carbon", "gemini-4-hydrogen"]) {
+			for (const [provider, api] of [
+				["google-vertex", "google-vertex"],
+				["google", "google-generative-ai"],
+			] as const) {
+				// `reasoning: false` mirrors Gemini API discovery, which has no bundled
+				// Gemini 4 reference and infers non-reasoning from the id.
+				for (const reasoning of [true, false]) {
+					const gemini4 = createModel({ id, api, provider, reasoning });
+					expect(gemini4.reasoning).toBe(true);
+					expect(gemini4.thinking?.mode).toBe("google-level");
+					const efforts = [Effort.Low, Effort.Medium, Effort.High];
+					if (id === "gemini-4-hydrogen") efforts.push(Effort.XHigh);
+					expect(getSupportedEfforts(gemini4)).toEqual(efforts);
+					expect(mapEffortToGoogleThinkingLevel(Effort.Medium, gemini4)).toBe("MEDIUM");
+				}
+			}
+		}
+
+		// Command Code's model list carries no reasoning metadata and skips
+		// cross-provider backfill, so Gemini 4 relies on its KDL effort list.
+		for (const id of ["google/gemini-4-argon", "google/gemini-4-carbon"]) {
+			const commandCode = createModel({
+				id,
+				api: "openai-completions",
+				provider: "commandcode",
+				baseUrl: "https://api.commandcode.ai/provider/v1",
+				reasoning: false,
+			});
+			expect(commandCode.reasoning).toBe(true);
+			expect(getSupportedEfforts(commandCode)).toEqual([Effort.Low, Effort.Medium, Effort.High]);
+		}
+
+		// The Argon ladder must not leak onto other Gemini 4 lines. No Gemini 4 Pro
+		// ships yet; a future one must keep the Pro low/high ladder (and must not tie with it).
+		const vertexPro4 = createModel({ id: "gemini-4-pro", api: "google-vertex", provider: "google-vertex" });
+		expect(vertexPro4.thinking?.mode).toBe("google-level");
+		expect(getSupportedEfforts(vertexPro4)).toEqual([Effort.Low, Effort.High]);
 	});
 
 	it("bakes requiresEffort for Gemini 3.x on any provider and backfills explicit metadata", () => {
@@ -801,12 +880,13 @@ describe("model thinking derivation", () => {
 		expect(vertex.thinking?.prefixBinding).toBe(true);
 		expect(bedrock.thinking?.prefixBinding).toBe(true);
 		expect(direct.compat.supportsThinkingBindingControls).toBe(true);
+		expect(bedrock.compat.supportsThinkingBindingControls).toBe(true);
 		expect(direct.compat.supportsMidConversationToolChanges).toBe(true);
 		expect(direct.compat.supportsPerMessageEffort).toBe(true);
 		expect(direct.compat.supportsTurnScopedSystem).toBe(true);
 	});
 
-	it("keeps Sonnet 5.5 binding controls off Vertex, which rejects thinking.block_binding", () => {
+	it("keeps Sonnet 5.5 binding controls and per-message effort off Vertex, which rejects both", () => {
 		const direct = createModel({ id: "claude-sonnet-5-5", api: "anthropic-messages", provider: "anthropic" });
 		const vertex = createModel({
 			id: "claude-sonnet-5-5@default",
@@ -815,8 +895,58 @@ describe("model thinking derivation", () => {
 		});
 
 		expect(direct.compat.supportsThinkingBindingControls).toBe(true);
+		expect(direct.compat.supportsPerMessageEffort).toBe(true);
 		expect(vertex.compat.supportsThinkingBindingControls).toBe(false);
-		expect(vertex.compat.supportsPerMessageEffort).toBe(true);
+		expect(vertex.compat.supportsPerMessageEffort).toBe(false);
+	});
+
+	it("materializes a bare /v1/models Haiku 5.5 row as adaptive and priced, unlike Haiku 4.5", () => {
+		// Anthropic's /v1/models carries no capability metadata for a new id.
+		const discovered = (id: string) =>
+			buildModel({
+				id,
+				name: id,
+				api: "anthropic-messages",
+				provider: "anthropic",
+				baseUrl: "https://api.anthropic.com/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: null,
+				maxTokens: null,
+			});
+		const haiku55 = discovered("claude-haiku-5-5");
+
+		expect(haiku55.reasoning).toBe(true);
+		expect(haiku55.thinking?.mode).toBe("anthropic-adaptive");
+		expect(getSupportedEfforts(haiku55)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Max)).toBe("max");
+		expect(haiku55.thinking?.prefixBinding).toBe(true);
+		expect(haiku55.compat.supportsSamplingParams).toBe(false);
+		expect(haiku55.compat.supportsForcedToolChoice).toBe(true);
+		expect(haiku55.compat.supportsBetweenToolsThinking).toBe(false);
+		expect(haiku55.input).toEqual(["text", "image"]);
+		expect(haiku55.contextWindow).toBe(1_000_000);
+		expect(haiku55.maxTokens).toBe(128_000);
+		expect(haiku55.cost).toMatchObject({
+			input: 0.1,
+			output: 0.5,
+			longContext: { inputThreshold: 100_000, input: 0.5, output: 2.5 },
+		});
+
+		const haiku45 = createModel({ id: "claude-haiku-4-5", api: "anthropic-messages", provider: "anthropic" });
+		expect(haiku45.thinking?.mode).toBe("budget");
+		expect(haiku45.compat.supportsSamplingParams).toBe(true);
+	});
+
+	it("keeps per-message effort off every Vertex Claude line that takes it on the Claude API", () => {
+		for (const id of ["claude-fable-5-1", "claude-opus-5"]) {
+			const direct = createModel({ id, api: "anthropic-messages", provider: "anthropic" });
+			const vertex = createModel({ id: `${id}@default`, api: "anthropic-messages", provider: "google-vertex" });
+
+			expect(direct.compat.supportsPerMessageEffort).toBe(true);
+			expect(vertex.compat.supportsPerMessageEffort).toBe(false);
+		}
 	});
 
 	it("uses Bedrock Fable 5.1's five supported effort levels", () => {
@@ -896,6 +1026,66 @@ describe("model thinking derivation", () => {
 			createModel({ id: "claude-sonnet-4-6", api: "anthropic-messages", provider: "opencode-zen" }).compat
 				.supportsServerCompaction,
 		).toBe(false);
+		// The shared Messages policy remains enabled for those Bedrock model
+		// families on that adapter; its Haiku 4.5 case must not leak to Messages.
+		for (const id of ["claude-fable-5", "claude-mythos-5", "claude-mythos-preview"]) {
+			expect(
+				createModel({ id, api: "anthropic-messages", provider: "amazon-bedrock" }).compat.supportsServerCompaction,
+			).toBe(true);
+		}
+		expect(
+			createModel({
+				id: "claude-haiku-4-5",
+				api: "anthropic-messages",
+				provider: "amazon-bedrock",
+			}).compat.supportsServerCompaction,
+		).toBe(false);
+	});
+
+	it("enables Bedrock Runtime compaction only for model-card-supported Claude revisions", () => {
+		const supported = [
+			"global.anthropic.claude-haiku-4-5-20251001-v1:0",
+			"global.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-sonnet-5",
+			"global.anthropic.claude-sonnet-5-5",
+			"global.anthropic.claude-opus-4-7",
+			"global.anthropic.claude-opus-4-8",
+			"global.anthropic.claude-opus-5",
+			"global.anthropic.claude-opus-5-5",
+		];
+		for (const id of supported) {
+			const model = createModel({ id, api: "bedrock-converse-stream", provider: "amazon-bedrock" });
+			expect(model.api).toBe("bedrock-converse-stream");
+			expect(model.compat.supportsServerCompaction).toBe(true);
+		}
+
+		const explicitlyDisabled = createModel({
+			id: "global.anthropic.claude-opus-5-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+			compat: { supportsServerCompaction: false },
+		});
+		expect(explicitlyDisabled.compat.supportsServerCompaction).toBe(false);
+
+		for (const id of [
+			"global.anthropic.claude-opus-4-6-v1",
+			"global.anthropic.claude-haiku-4-6",
+			"global.anthropic.claude-sonnet-4-6",
+			"global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+			"global.anthropic.claude-opus-5-1",
+			"global.anthropic.claude-sonnet-5-1",
+			"global.anthropic.claude-fable-5",
+			"global.anthropic.claude-fable-5-1",
+			"global.anthropic.claude-mythos-5",
+			"global.anthropic.claude-mythos-5-1",
+			"global.anthropic.claude-mythos-preview",
+			"global.amazon.nova-pro-v1:0",
+		]) {
+			expect(
+				createModel({ id, api: "bedrock-converse-stream", provider: "amazon-bedrock" }).compat
+					.supportsServerCompaction,
+			).toBe(false);
+		}
 	});
 
 	it("classifies OpenAI-schema Bedrock models as effort, leaving gpt-oss on budget", () => {
@@ -1550,5 +1740,31 @@ describe("Qwen 3.8 local template effort ladder", () => {
 		});
 		expect(ollama.compat.qwenTemplateReasoningEffort).toBe(false);
 		expect(ollama.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.Max]);
+	});
+});
+
+describe("effortMap aliases in clampThinkingLevelForModel", () => {
+	const gateway = (efforts: Effort[], effortMap: Record<string, string>) =>
+		createModel({
+			id: "example-route",
+			api: "openai-completions",
+			provider: "example-gateway",
+			thinking: { mode: "effort", efforts, effortMap },
+		});
+
+	it("follows an alias to a served tier instead of climbing down", () => {
+		const model = gateway([Effort.Low, Effort.High, Effort.Max], { medium: "high" });
+		expect(clampThinkingLevelForModel(model, Effort.Medium)).toBe(Effort.High);
+	});
+
+	it("climbs down when the alias names an unserved tier", () => {
+		const model = gateway([Effort.Low, Effort.High], { medium: "max" });
+		expect(clampThinkingLevelForModel(model, Effort.Medium)).toBe(Effort.Low);
+	});
+
+	it("climbs down when the map remaps the alias target again", () => {
+		// Honouring `medium → high` would serialize `max` because the map sends `high` on.
+		const model = gateway([Effort.Low, Effort.High, Effort.Max], { medium: "high", high: "max" });
+		expect(clampThinkingLevelForModel(model, Effort.Medium)).toBe(Effort.Low);
 	});
 });

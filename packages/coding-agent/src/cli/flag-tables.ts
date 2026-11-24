@@ -31,6 +31,9 @@
  */
 
 import { isServiceTierOpenAISettingValue, SERVICE_TIER_OPENAI_VALUES } from "../config/service-tier";
+import { parseMaxFps } from "@oh-my-pi/pi-tui/frame-rate";
+import { parseMotionMode } from "../config/motion-presets";
+import { parseSpinnerInterval } from "@oh-my-pi/pi-tui/spinner-clock";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { Args } from "./args";
 import { CliUsageError } from "./usage-error";
@@ -85,6 +88,16 @@ const setResume: OptionalSetter = (result, value) => {
 	result.resume = value !== undefined ? value : true;
 };
 
+/**
+ * `--restore` selects its session exactly as `--resume` does, then goes on with it. A bare
+ * `--restore` keeps a session `--session` or `--resume` already named, so `--session <id> --restore`
+ * restores that session, as `--restore --session <id>` does, instead of opening the picker.
+ */
+const setRestore: OptionalSetter = (result, value) => {
+	if (value !== undefined || typeof result.resume !== "string") setResume(result, value);
+	result.restore = true;
+};
+
 const MAX_TIME_DURATION_RE = /^(\d+(?:\.\d+)?)([smh])$/;
 
 function maxTimeMultiplier(unit: string | undefined): number {
@@ -100,6 +113,14 @@ function parseMaxTimeSeconds(value: string): number {
 	if (Number.isFinite(seconds) && seconds > 0) return seconds;
 	throw new CliUsageError(
 		`Invalid --max-time value: ${JSON.stringify(value)}. Expected a positive number of seconds or duration like "5s", "10m", "1h".`,
+	);
+}
+
+function parseCostUsd(flag: string, value: string): number {
+	const usd = Number(value.trim());
+	if (Number.isFinite(usd) && usd > 0) return usd;
+	throw new CliUsageError(
+		`Invalid ${flag} value: ${JSON.stringify(value)}. Expected a positive USD amount, e.g. 0.50.`,
 	);
 }
 
@@ -146,6 +167,10 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--slow": (result, value) => {
 		result.slow = value;
 	},
+	"--goal": (result, value) => {
+		if (!value.trim()) throw new CliUsageError("--goal requires a non-empty objective.");
+		result.goal = value.trim();
+	},
 	"--plan": (result, value) => {
 		result.plan = value;
 	},
@@ -158,6 +183,12 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--max-time": (result, value) => {
 		result.maxTime = parseMaxTimeSeconds(value);
 	},
+	"--warn-cost": (result, value) => {
+		result.warnCost = parseCostUsd("--warn-cost", value);
+	},
+	"--max-cost": (result, value) => {
+		result.maxCost = parseCostUsd("--max-cost", value);
+	},
 	"--service-tier": (result, value) => {
 		if (!isServiceTierOpenAISettingValue(value)) {
 			throw new CliUsageError(
@@ -165,6 +196,27 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 			);
 		}
 		result.serviceTier = value;
+	},
+	"--spinner-interval": (result, value) => {
+		try {
+			result.spinnerInterval = parseSpinnerInterval(value);
+		} catch (error) {
+			throw new CliUsageError(`--spinner-interval: ${(error as Error).message}`);
+		}
+	},
+	"--max-fps": (result, value) => {
+		try {
+			result.maxFps = parseMaxFps(value);
+		} catch (error) {
+			throw new CliUsageError(`--max-fps: ${(error as Error).message}`);
+		}
+	},
+	"--motion": (result, value) => {
+		try {
+			result.motion = parseMotionMode(value);
+		} catch (error) {
+			throw new CliUsageError(`--motion: ${(error as Error).message}`);
+		}
 	},
 	"--api-key": (result, value) => {
 		result.apiKey = value;
@@ -232,13 +284,15 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		result.skills = value.split(",").map(s => s.trim());
 	},
 	"--approval-mode": (result, value) => {
-		if (value !== "always-ask" && value !== "write" && value !== "yolo") {
+		// The values mirror `ApprovalMode` in ../tools/approval, which this module
+		// may only import as a type: that module reaches pi-utils at runtime.
+		if (value === "always-ask" || value === "always-ask-cached" || value === "write" || value === "yolo") {
+			result.approvalMode = value;
+		} else {
 			result.invalidFlagValues.push(
-				`Invalid --approval-mode value: ${JSON.stringify(value)}. Expected one of: always-ask, write, yolo.`,
+				`Invalid --approval-mode value: ${JSON.stringify(value)}. Expected one of: always-ask, always-ask-cached, write, yolo.`,
 			);
-			return;
 		}
-		result.approvalMode = value;
 	},
 };
 
@@ -252,6 +306,7 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 export const OPTIONAL_FLAGS: Record<string, OptionalFlagConfig> = {
 	"--resume": { set: setResume, rejectEmpty: true },
 	"-r": { set: setResume, rejectEmpty: true },
+	"--restore": { set: setRestore, rejectEmpty: true },
 	"--session": { set: setResume, rejectEmpty: true },
 };
 
@@ -306,10 +361,14 @@ export const VALUELESS_FLAGS: ReadonlySet<string> = new Set([
 	"--from-codex",
 	"--no-session",
 	"--no-tools",
+	"--no-judge",
+	"--no-spotlight",
+	"--offline",
 	"--no-lsp",
 	"--no-pty",
 	"--hide-thinking",
 	"--advisor",
+	"--wait-async",
 	"--external-thinking",
 	"--prewalk",
 	"--no-prewalk",
@@ -319,6 +378,7 @@ export const VALUELESS_FLAGS: ReadonlySet<string> = new Set([
 	"--no-extensions",
 	"--no-skills",
 	"--no-rules",
+	"--no-context-files",
 	"--no-title",
 	"--no-ui",
 	"--auto-approve",
@@ -368,37 +428,49 @@ export function flagConsumesValue(flag: string, next: string | undefined): boole
 }
 
 /**
- * Session-source launch flags dropped when relaunching into an existing
- * session: the restart supplies its own `--resume`, and replaying a stale
- * continue/fork/import selector would re-run its one-shot session choice.
+ * One-shot launch selectors dropped when relaunching into an existing
+ * session: the relaunch supplies its own session source, and replaying a
+ * stale continue/fork/import selector would re-run its one-shot session
+ * choice. `--goal` belongs here too: it seeds a fresh session only, and
+ * `validateGoalLaunch` rejects it beside any resume/fork selector.
  */
-const SESSION_SOURCE_FLAGS: ReadonlySet<string> = new Set([
-	"--resume",
-	"-r",
-	"--session",
-	"--continue",
-	"-c",
-	"--fork",
-	"--from-claude",
-	"--from-codex",
-]);
+const ONE_SHOT_LAUNCH_FLAGS: Readonly<Record<string, true>> = {
+	"--resume": true,
+	"-r": true,
+	"--restore": true,
+	"--session": true,
+	"--continue": true,
+	"-c": true,
+	"--fork": true,
+	"--from-claude": true,
+	"--from-codex": true,
+	"--goal": true,
+};
 
 /**
- * Rewrite the launch argv for an in-place self-restart (`/restart`).
+ * Rewrite the launch argv for a relaunch of this session (`/restart`, and
+ * `/fork pane|window` with `restoreSessionSource` undefined).
  *
  * Keeps every configuration flag as launched, but drops:
- * - session-source flags ({@link SESSION_SOURCE_FLAGS}, including inline
- *   `--resume=<id>` forms) — the relaunch resumes `resumeSessionId` instead;
+ * - one-shot selectors ({@link ONE_SHOT_LAUNCH_FLAGS}, including inline
+ *   `--resume=<source>` forms) - the relaunch restores `restoreSessionSource` instead;
+ * - flags in `drop`, which the caller re-supplies with current values;
  * - positionals (prompt messages, `@file` args, subcommand tokens) — their
  *   effect is already in the resumed transcript, so replaying them would
  *   duplicate the initial prompt.
  *
  * Value consumption mirrors {@link flagConsumesValue}, so a dropped flag takes
  * its value token with it and an unknown extension flag keeps its value.
- * `resumeSessionId` is omitted for a session that never materialized on disk;
- * the relaunch then starts fresh with the same configuration.
+ * `restoreSessionSource` is a session ID or file path, omitted for a session that
+ * never materialized on disk; the relaunch then starts fresh with the same configuration.
+ * The session is reopened with `--restore`, so the subagent turns the relaunch cut
+ * off go on (see `task/restore.ts`).
  */
-export function restartArgv(argv: string[], resumeSessionId: string | undefined): string[] {
+export function restartArgv(
+	argv: string[],
+	restoreSessionSource: string | undefined,
+	drop?: Readonly<Record<string, true>>,
+): string[] {
 	const kept: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
@@ -406,13 +478,13 @@ export function restartArgv(argv: string[], resumeSessionId: string | undefined)
 		if (!arg.startsWith("-")) continue; // positional: prompt message, @file, or subcommand
 		const consumesNext = flagConsumesValue(arg, argv[i + 1]);
 		const flag = arg.startsWith("--") ? arg.split("=", 1)[0] : arg;
-		if (SESSION_SOURCE_FLAGS.has(flag)) {
+		if (Object.hasOwn(ONE_SHOT_LAUNCH_FLAGS, flag) || (drop !== undefined && Object.hasOwn(drop, flag))) {
 			if (consumesNext) i++;
 			continue;
 		}
 		kept.push(arg);
 		if (consumesNext) kept.push(argv[++i]);
 	}
-	if (resumeSessionId !== undefined) kept.push("--resume", resumeSessionId);
+	if (restoreSessionSource !== undefined) kept.push("--restore", restoreSessionSource);
 	return kept;
 }

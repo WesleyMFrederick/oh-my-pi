@@ -1,5 +1,5 @@
 /**
- * Durable ownership registry for targets in the project-shared broker-owned
+ * Durable ownership registry for targets in the project-shared daemon-owned
  * Chromium (`omp.browser.headless-shell`/`omp.browser.headed`).
  *
  * The shared browser outlives any single omp process, but tab ownership is
@@ -8,7 +8,7 @@
  * in-process map dies with it and the pages it opened stay open in the shared
  * Chromium forever, accumulating into multi-GB orphan targets (issue #10022).
  *
- * This module records, on disk under the broker runtime dir, which OS process
+ * This module records, on disk under the daemon runtime dir, which OS process
  * created each shared-browser page target. Any live omp process can then reap
  * targets whose owning process is gone. It only ever touches OMP-owned
  * shared-browser targets — user-owned connected/relay/spawned browsers have no
@@ -24,16 +24,16 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
-import type { Browser } from "puppeteer-core";
-import { daemonRuntimeDir } from "../../launch/paths";
+import { getDaemonRuntimeDir, isEnoent, isPidAlive, logger, untilAborted } from "@oh-my-pi/pi-utils";
+import type { Browser, CDPSession, Connection } from "puppeteer-core";
+import { browserConnection } from "./launch";
 import { processStartTime } from "./launch-ledger";
 
 /** Identifies one shared-browser daemon's target registry. */
 export interface SharedTargetScope {
-	/** Canonical project directory owning the broker (as stamped on the handle). */
+	/** Canonical project directory whose scope holds the browser unit (as stamped on the handle). */
 	projectDir: string;
-	/** Broker daemon name, e.g. `omp.browser.headless`. */
+	/** Key of the browser's `proc` unit, e.g. `omp.browser.headless-shell`. */
 	daemonName: string;
 }
 
@@ -54,13 +54,23 @@ interface OwnershipFile {
  */
 const DEFAULT_GRACE_MS = 15_000;
 
+/** Re-send cadence and overall budget of {@link closeSharedTargetUntilGone}. */
+const RECLOSE_INTERVAL_MS = 2_000;
+const RECLOSE_BUDGET_MS = 30_000;
+/** Per-target budget of {@link retryUnclosedSharedTargets}, so a sweep over many targets stays bounded. */
+const RETRY_CLOSE_BUDGET_MS = 5_000;
+
 /** In-process set of shared-browser targets this process created, keyed by registry dir. */
 const ownedByDir = new Map<string, Set<string>>();
+/** Owned targets whose close this process could not confirm, keyed by registry dir. */
+const unclosedByDir = new Map<string, Set<string>>();
+/** In-flight {@link retryUnclosedSharedTargets} run per registry dir. */
+const unclosedRetries = new Map<string, Promise<number>>();
 /** Per-registry-dir write serialization so concurrent record/forget can't tear the file. */
 const writeChains = new Map<string, Promise<void>>();
 
 function registryDir(scope: SharedTargetScope): string {
-	return path.join(daemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
+	return path.join(getDaemonRuntimeDir(scope.projectDir), `${scope.daemonName}.targets`);
 }
 
 /** Serialize a write against others for the same registry dir. */
@@ -140,6 +150,7 @@ export async function recordSharedTarget(scope: SharedTargetScope, targetId: str
 /** Drop `targetId` from this process's ownership file (closed the normal way). */
 export async function forgetSharedTarget(scope: SharedTargetScope, targetId: string): Promise<void> {
 	const dir = registryDir(scope);
+	unclosedByDir.get(dir)?.delete(targetId);
 	const owned = ownedByDir.get(dir);
 	if (!owned?.delete(targetId)) return;
 	await chain(dir, () => flush(dir)).catch(err =>
@@ -149,14 +160,26 @@ export async function forgetSharedTarget(scope: SharedTargetScope, targetId: str
 	);
 }
 
-/** True when `pid` names a live process; non-`ESRCH` probe failures are treated as alive (safe direction). */
-function isPidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
-	}
+/**
+ * Drop every target this process still claims in `scope`. For when the whole
+ * shared browser is confirmed gone — the daemon reported its browser unit in a
+ * terminal state after a stop — which takes the targets that could not be
+ * closed with it; the records are dead weight that would otherwise be
+ * rewritten on every later write until this process exits. Only call this on
+ * that confirmation: while the browser lives, the records are the only handle
+ * a later reap has on its orphaned targets.
+ */
+export async function forgetSharedTargets(scope: SharedTargetScope): Promise<void> {
+	const dir = registryDir(scope);
+	unclosedByDir.delete(dir);
+	const owned = ownedByDir.get(dir);
+	if (!owned || owned.size === 0) return;
+	owned.clear();
+	await chain(dir, () => flush(dir)).catch(err =>
+		logger.debug("Failed to clear shared-browser target ownership", {
+			error: err instanceof Error ? err.message : String(err),
+		}),
+	);
 }
 
 /**
@@ -249,57 +272,188 @@ export async function collectOrphanTargets(
 	return { owners };
 }
 
-/** Outcome of {@link closeCdpTarget}: confirmed closed, or why it could not be confirmed. */
-export type CdpCloseResult = { closed: true } | { closed: false; reason: string };
-
 /**
- * The browser-level CDP connection Puppeteer keeps on a connected `Browser`. It is internal API
- * (`Browser._connection`, stripped from the public typings); `send` without a session id talks to the
- * browser endpoint itself.
+ * How long {@link closeCdpTarget} waits by default for Chromium to destroy a target whose close it accepted.
+ * Past it the close counts as unconfirmed, as a failed one does.
  */
-interface RootCdpConnection {
-	send(method: "Target.closeTarget", params: { targetId: string }): Promise<{ success: boolean }>;
-	send(method: "Target.getTargets"): Promise<{ targetInfos: Array<{ targetId: string }> }>;
-}
-
-function errorMessage(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
-}
+const CLOSE_CONFIRM_TIMEOUT_MS = 5_000;
 
 /**
- * Close a page target by id over the browser-level CDP connection. Resolves `closed: true`
- * only when CDP confirms the close or confirms the target no longer exists; a
- * dropped connection or transient protocol failure resolves `closed: false` with
- * the failing step and its error message, so durable ownership remains available
- * for a later retry and the cause is visible in the log.
+ * Close a page target by id on the browser's root connection. Returns true only
+ * when CDP reports the target destroyed or confirms it no longer exists; a
+ * dropped connection or transient protocol failure returns false so durable
+ * ownership remains available for a later retry. Never throws.
  *
- * Do not attach a new session to `browser.target()` for this: Puppeteer picks that target from its
- * own bookkeeping of the browser's target list, and on a shared browser that id can be one Chrome no
- * longer knows, so `Target.attachToTarget` fails ("No target with given id found") and the close
- * never runs. `Target.closeTarget` and `Target.getTargets` are browser-domain commands that need no
- * attached session, so they go straight over the root connection.
+ * A browser-target session per call would race: overlapping ones make puppeteer
+ * lose the browser target (puppeteer#15750). Puppeteer enables target discovery
+ * on the root connection when it connects, so `Target.targetDestroyed` arrives there.
+ *
+ * `Target.closeTarget` answers `success` once Chromium has started closing the
+ * page, not once it is gone: the target stays listed until its renderer has
+ * unloaded it. Its `Target.targetDestroyed` confirms the close instead, as it
+ * does for Puppeteer's own `page.close()`.
+ *
+ * A caller that bounds the whole close MUST pass a `confirmTimeoutMs` well below
+ * its budget, so a missed `targetDestroyed` still leaves time for the
+ * `Target.getTargets` absence check to decide the result.
  */
-export async function closeCdpTarget(browser: Browser, targetId: string): Promise<CdpCloseResult> {
-	const connection = (browser as unknown as { _connection?: RootCdpConnection })._connection;
-	if (!connection || typeof connection.send !== "function") {
-		return { closed: false, reason: "browser has no root CDP connection" };
-	}
-	let closeFailure = "Target.closeTarget reported success=false";
+export async function closeCdpTarget(
+	browser: Browser,
+	targetId: string,
+	confirmTimeoutMs = CLOSE_CONFIRM_TIMEOUT_MS,
+): Promise<boolean> {
+	let connection: Connection;
 	try {
-		const result = await connection.send("Target.closeTarget", { targetId });
-		if (result.success) return { closed: true };
-	} catch (err) {
-		// A concurrent reaper or the page itself may already have closed the
-		// target. Confirm absence before treating the cleanup as complete.
-		closeFailure = `Target.closeTarget failed: ${errorMessage(err)}`;
+		connection = browserConnection(browser);
+	} catch {
+		return false;
+	}
+	const destroyed = Promise.withResolvers<boolean>();
+	const onDestroyed = (event: { targetId: string }): void => {
+		if (event.targetId === targetId) destroyed.resolve(true);
+	};
+	connection.on("Target.targetDestroyed", onDestroyed);
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		try {
+			const result = await connection.send("Target.closeTarget", { targetId });
+			if (result.success) {
+				timer = setTimeout(() => destroyed.resolve(false), confirmTimeoutMs);
+				if (await destroyed.promise) return true;
+			}
+		} catch {
+			// A concurrent reaper or the page itself may already have closed the
+			// target. Confirm absence before treating the cleanup as complete.
+		}
+		try {
+			const { targetInfos } = await connection.send("Target.getTargets");
+			return !targetInfos.some(info => info.targetId === targetId);
+		} catch {
+			return false;
+		}
+	} finally {
+		clearTimeout(timer);
+		connection.off("Target.targetDestroyed", onDestroyed);
+	}
+}
+
+/**
+ * {@link closeCdpTarget} for the omp relay, over a channel that answers browser-level `Target.*`
+ * commands. The relay's `Target.getTargets` lists only tabs it can drive right now, not those of a
+ * disconnected browser or with a dismissed debugger, so absence is read from `Target.getTargetInfo`:
+ * it looks the id up among every tab the extensions reported, and answers an unknown id with the
+ * browser target.
+ */
+export async function closeRelayTarget(channel: Pick<CDPSession, "send">, targetId: string): Promise<boolean> {
+	try {
+		const result = await channel.send("Target.closeTarget", { targetId });
+		if (result.success) return true;
+	} catch {
+		// Closed already (the worker's own close), or the extension cannot answer.
 	}
 	try {
-		const { targetInfos } = await connection.send("Target.getTargets");
-		if (!targetInfos.some(info => info.targetId === targetId)) return { closed: true };
-		return { closed: false, reason: `${closeFailure}; target still present after close` };
-	} catch (err) {
-		return { closed: false, reason: `${closeFailure}; Target.getTargets failed: ${errorMessage(err)}` };
+		const { targetInfo } = await channel.send("Target.getTargetInfo", { targetId });
+		return targetInfo.targetId !== targetId;
+	} catch {
+		return false;
 	}
+}
+
+/** Bounds of {@link closeSharedTargetUntilGone}. */
+interface CloseUntilGoneOptions {
+	/** Give up (returning false) after this long; default 30 s. */
+	budgetMs?: number;
+	/** Re-send interval while the target is still listed; default 2 s. */
+	intervalMs?: number;
+}
+
+/**
+ * Confirms a web search page's close like {@link closeCdpTarget} (#16680). Chromium can answer
+ * `success: true` and keep the page, so the close is re-sent every `intervalMs` while the target
+ * is listed. Returns false once `budgetMs` elapses or the connection drops; never throws.
+ */
+export async function closeSharedTargetUntilGone(
+	browser: Browser,
+	targetId: string,
+	opts: CloseUntilGoneOptions = {},
+): Promise<boolean> {
+	const intervalMs = opts.intervalMs ?? RECLOSE_INTERVAL_MS;
+	const stop = AbortSignal.timeout(opts.budgetMs ?? RECLOSE_BUDGET_MS);
+	let connection: Connection;
+	try {
+		connection = browserConnection(browser);
+	} catch {
+		return false;
+	}
+	const destroyed = Promise.withResolvers<true>();
+	const onDestroyed = (event: { targetId: string }): void => {
+		if (event.targetId === targetId) destroyed.resolve(true);
+	};
+	connection.on("Target.targetDestroyed", onDestroyed);
+	try {
+		// A closed connection rejects every send at once; stop rather than spin to the budget.
+		while (!stop.aborted && browser.connected) {
+			const round = AbortSignal.any([stop, AbortSignal.timeout(intervalMs)]);
+			// Sent outright, not under `round`: a stalled Chromium outlasts rounds, and a skipped send never closes.
+			// The reply proves nothing: success can leave the page open; an error may mean it went.
+			void connection.send("Target.closeTarget", { targetId }).catch(() => {});
+			// Answered after the close, so it also settles a target already gone, or one whose event was missed.
+			const unlisted = connection.send("Target.getTargets").then(
+				reply => (reply.targetInfos.some(info => info.targetId === targetId) ? destroyed.promise : true),
+				() => (browser.connected ? destroyed.promise : false),
+			);
+			if (await untilAborted(round, Promise.race([destroyed.promise, unlisted])).catch(() => false)) return true;
+		}
+		return false;
+	} finally {
+		connection.off("Target.targetDestroyed", onDestroyed);
+	}
+}
+
+/** Mark a target whose close went unconfirmed for retry while this process lives; the reaper skips live owners. */
+export function markSharedTargetUnclosed(scope: SharedTargetScope, targetId: string): void {
+	const dir = registryDir(scope);
+	let unclosed = unclosedByDir.get(dir);
+	if (!unclosed) {
+		unclosed = new Set();
+		unclosedByDir.set(dir, unclosed);
+	}
+	unclosed.add(targetId);
+}
+
+/**
+ * Retry the closes marked for `scope`, forgetting confirmed ones.
+ * Returns the count closed; never throws. Concurrent calls for a scope share one run.
+ */
+export function retryUnclosedSharedTargets(browser: Browser, scope: SharedTargetScope): Promise<number> {
+	const dir = registryDir(scope);
+	const inFlight = unclosedRetries.get(dir);
+	if (inFlight) return inFlight;
+	const run = retryUnclosed(browser, scope, dir);
+	unclosedRetries.set(dir, run);
+	void run.finally(() => {
+		if (unclosedRetries.get(dir) === run) unclosedRetries.delete(dir);
+	});
+	return run;
+}
+
+async function retryUnclosed(browser: Browser, scope: SharedTargetScope, dir: string): Promise<number> {
+	const pending = unclosedByDir.get(dir);
+	if (!pending || pending.size === 0) return 0;
+	let closed = 0;
+	// Iterate live, not a snapshot: overlapping searches share this run, so ids they mark mid-sweep
+	// must be tried too. Set iteration reaches entries added during it and skips forgotten ones.
+	for (const targetId of pending) {
+		const gone = await closeSharedTargetUntilGone(browser, targetId, { budgetMs: RETRY_CLOSE_BUDGET_MS });
+		if (!gone) {
+			logger.debug("Shared-browser target still open after retried close", { targetId });
+			continue;
+		}
+		closed++;
+		await forgetSharedTarget(scope, targetId);
+	}
+	if (closed > 0) logger.debug("Closed lingering shared-browser targets", { count: closed, daemon: scope.daemonName });
+	return closed;
 }
 
 /** Atomically retain unresolved targets, or remove an ownership file once all are resolved. */
@@ -331,16 +485,6 @@ async function updateOwnershipFile(owner: OrphanOwner, targetIds: string[]): Pro
  * Failures are logged, never thrown, so cleanup cannot block browser open.
  */
 export async function reapOrphanSharedTargets(browser: Browser, scope: SharedTargetScope): Promise<number> {
-	return (await reapOrphans(browser, scope)).closed;
-}
-
-/** Reap result: targets confirmed closed, and targets kept for retry. */
-interface ReapOutcome {
-	closed: number;
-	retained: number;
-}
-
-async function reapOrphans(browser: Browser, scope: SharedTargetScope): Promise<ReapOutcome> {
 	let scan: OrphanScan;
 	try {
 		scan = await collectOrphanTargets(scope);
@@ -348,29 +492,22 @@ async function reapOrphans(browser: Browser, scope: SharedTargetScope): Promise<
 		logger.debug("Failed to scan shared-browser target registry", {
 			error: err instanceof Error ? err.message : String(err),
 		});
-		return { closed: 0, retained: 0 };
+		return 0;
 	}
 	let closed = 0;
-	let retained = 0;
 	for (const owner of scan.owners) {
-		const kept: string[] = [];
+		const retained: string[] = [];
 		for (const targetId of owner.targetIds) {
-			const result = await closeCdpTarget(browser, targetId);
-			if (result.closed) {
+			if (await closeCdpTarget(browser, targetId)) {
 				closed++;
 			} else {
-				kept.push(targetId);
-				logger.warn("Retaining orphaned shared-browser target for retry", {
-					targetId,
-					ownerPid: owner.pid,
-					reason: result.reason,
-				});
+				retained.push(targetId);
+				logger.debug("Retaining orphaned shared-browser target for retry", { targetId, ownerPid: owner.pid });
 			}
 		}
-		retained += kept.length;
-		if (kept.length === owner.targetIds.length) continue;
+		if (retained.length === owner.targetIds.length) continue;
 		try {
-			await updateOwnershipFile(owner, kept);
+			await updateOwnershipFile(owner, retained);
 		} catch (err) {
 			logger.debug("Failed to update shared-browser ownership after reap", {
 				ownerPid: owner.pid,
@@ -379,64 +516,13 @@ async function reapOrphans(browser: Browser, scope: SharedTargetScope): Promise<
 		}
 	}
 	if (closed > 0) logger.debug("Reaped orphaned shared-browser targets", { count: closed, daemon: scope.daemonName });
-	return { closed, retained };
+	return closed;
 }
 
 /** Minimum gap between survivor-driven sweeps of one registry dir; attach-time sweeps are unthrottled. */
 const SWEEP_MIN_INTERVAL_MS = 10_000;
 const lastSweepAt = new Map<string, number>();
 const sweepsInFlight = new Map<string, Promise<number>>();
-
-/** In-process retries after a sweep retained targets: how many per streak, and how long to wait. */
-const SWEEP_RETRY_MAX_ATTEMPTS = 3;
-let sweepRetryDelayMs = SWEEP_MIN_INTERVAL_MS;
-const sweepRetries = new Map<string, { attempts: number; timer: ReturnType<typeof setTimeout> }>();
-
-/**
- * Retry a sweep that retained targets without waiting for the next open or release: one unref'd timer
- * per registry dir, {@link SWEEP_MIN_INTERVAL_MS} after the sweep, at most {@link SWEEP_RETRY_MAX_ATTEMPTS}
- * attempts in a row. A sweep that retains nothing ends the streak. Each attempt reaps every dead owner's
- * targets (so a target is tried at most that many extra times) and logs its outcome at warn level.
- */
-function scheduleSweepRetry(browser: Browser, scope: SharedTargetScope, dir: string, attempts: number): void {
-	if (attempts >= SWEEP_RETRY_MAX_ATTEMPTS) {
-		sweepRetries.delete(dir);
-		return;
-	}
-	const timer = setTimeout(() => {
-		void runSweepRetry(browser, scope, dir, attempts + 1);
-	}, sweepRetryDelayMs);
-	timer.unref();
-	sweepRetries.set(dir, { attempts, timer });
-}
-
-async function runSweepRetry(browser: Browser, scope: SharedTargetScope, dir: string, attempt: number): Promise<void> {
-	if (!browser.connected) {
-		sweepRetries.delete(dir);
-		return;
-	}
-	if (sweepsInFlight.has(dir)) {
-		// A regular sweep is running and will schedule its own retry if it retains targets.
-		sweepRetries.delete(dir);
-		return;
-	}
-	const outcome = reapOrphans(browser, scope).catch(() => ({ closed: 0, retained: 0 }));
-	const sweep = outcome.then(result => result.closed).finally(() => sweepsInFlight.delete(dir));
-	sweepsInFlight.set(dir, sweep);
-	const { closed, retained } = await outcome;
-	logger.warn("Retried retained shared-browser targets", { attempt, closed, retained, daemon: scope.daemonName });
-	if (retained > 0) scheduleSweepRetry(browser, scope, dir, attempt);
-	else sweepRetries.delete(dir);
-}
-
-/** Cancel a pending sweep retry for this scope, e.g. when this process releases its last hold on the browser. */
-export function cancelSweepRetries(scope: SharedTargetScope): void {
-	const dir = registryDir(scope);
-	const pending = sweepRetries.get(dir);
-	if (!pending) return;
-	clearTimeout(pending.timer);
-	sweepRetries.delete(dir);
-}
 
 /**
  * Sweep dead owners' targets from a live shared browser on tab open/release, so orphans of clients
@@ -455,13 +541,8 @@ export function sweepOrphanSharedTargets(
 	const last = lastSweepAt.get(dir);
 	if (last !== undefined && at - last < SWEEP_MIN_INTERVAL_MS) return Promise.resolve(0);
 	lastSweepAt.set(dir, at);
-	cancelSweepRetries(scope);
-	const outcome = reapOrphans(browser, scope).catch(() => ({ closed: 0, retained: 0 }));
-	const sweep = outcome
-		.then(result => {
-			if (result.retained > 0) scheduleSweepRetry(browser, scope, dir, 0);
-			return result.closed;
-		})
+	const sweep = reapOrphanSharedTargets(browser, scope)
+		.catch(() => 0)
 		.finally(() => sweepsInFlight.delete(dir));
 	sweepsInFlight.set(dir, sweep);
 	return sweep;
@@ -469,17 +550,11 @@ export function sweepOrphanSharedTargets(
 
 /** Test-only reset of the in-process ownership state. */
 export function resetOrphanRegistryForTest(): void {
-	for (const { timer } of sweepRetries.values()) clearTimeout(timer);
-	sweepRetries.clear();
-	sweepRetryDelayMs = SWEEP_MIN_INTERVAL_MS;
 	selfStartTime = undefined;
 	lastSweepAt.clear();
 	sweepsInFlight.clear();
 	ownedByDir.clear();
+	unclosedByDir.clear();
+	unclosedRetries.clear();
 	writeChains.clear();
-}
-
-/** Test-only: shorten the wait before an in-process sweep retry. */
-export function setSweepRetryDelayForTest(ms: number): void {
-	sweepRetryDelayMs = ms;
 }

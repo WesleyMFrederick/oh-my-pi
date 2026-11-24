@@ -47,6 +47,15 @@ describe("Editor component", () => {
 			expect(editor.getText()).toBe("alfa beta ");
 		});
 
+		it("deletes the next word on ctrl+delete as xterm sends it", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("foo bar baz");
+			editor.handleInput("\x01"); // Ctrl+A
+			for (let i = 0; i < 3; i++) editor.handleInput("\x1b[C"); // After "foo"
+			editor.handleInput("\x1b[3;5~"); // xterm/Tern Ctrl+Delete
+			expect(editor.getText()).toBe("foo baz");
+		});
+
 		it("deletes the next word for Ghostty's physical Option+Forward-Delete wire", () => {
 			setKittyProtocolActive(true);
 			try {
@@ -163,6 +172,29 @@ describe("Editor component", () => {
 			editor.handleInput("\x1b[A"); // Up arrow
 
 			expect(editor.getText()).toBe("");
+		});
+
+		it("hands Up on the first line to the host when it takes it (an ask above), else recalls history", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.addToHistory("earlier prompt");
+			let askWaits = true;
+			const taken: string[] = [];
+			editor.onUpFromTop = () => {
+				if (askWaits) taken.push(editor.getText());
+				return askWaits;
+			};
+
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("");
+			editor.setText("draft\nsecond line");
+			editor.handleInput("\x1b[A"); // second line → first line: the cursor moves
+			editor.handleInput("\x1b[A"); // on the first line: out to the ask
+			expect(taken).toEqual(["", "draft\nsecond line"]);
+
+			askWaits = false;
+			editor.setText("");
+			editor.handleInput("\x1b[A");
+			expect(editor.getText()).toBe("earlier prompt");
 		});
 
 		it("cycles through history entries on repeated Up arrow", () => {

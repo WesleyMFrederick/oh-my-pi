@@ -49,9 +49,8 @@ function createLoopContext(options: {
 			customCommands: [],
 			promptTemplates: [],
 			prompt,
-			maybeStartTitleGeneration: vi.fn(),
 		},
-		sessionManager: { putBlob: vi.fn() },
+		sessionManager: { putBlob: vi.fn(), appendCustomEntry: vi.fn() },
 		loopModeEnabled: true,
 		get loopPrompt() {
 			return loopPrompt;

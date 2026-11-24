@@ -45,6 +45,14 @@ const googleVertexModelsDevPayload = {
 				limit: { context: 200_000, output: 64_000 },
 				provider: { npm: "@ai-sdk/google-vertex/anthropic" },
 			},
+			"mistral-small-2503": {
+				name: "Mistral Small 2503",
+				tool_call: true,
+				reasoning: false,
+				modalities: { input: ["text"] },
+				limit: { context: 131_072, output: 8_192 },
+				provider: { npm: "@ai-sdk/mistral" },
+			},
 			"gemini-embedding-001": {
 				name: "Gemini Embedding 001",
 				tool_call: false,
@@ -82,6 +90,7 @@ describe("google-vertex model catalog", () => {
 			"gemini-3.5-flash",
 			"deepseek-ai/deepseek-v3.2-maas",
 			"claude-sonnet-4@20250514",
+			"mistral-small-2503",
 		]);
 
 		const gemini = models.find(model => model.id === "gemini-3.5-flash");
@@ -102,6 +111,14 @@ describe("google-vertex model catalog", () => {
 			"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict",
 		);
 		expect(claude?.reasoning).toBe(true);
+
+		// Partner Mistral models ride the mistralai publisher raw-predict
+		// endpoint with the OpenAI wire shape, not publishers/google (#19010).
+		const mistral = models.find(model => model.id === "mistral-small-2503");
+		expect(mistral?.api).toBe("openai-completions");
+		expect(mistral?.baseUrl).toBe(
+			"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/mistralai/models/mistral-small-2503:streamRawPredict",
+		);
 	});
 
 	it("uses the bundled Vertex catalog without ADC project discovery", async () => {
@@ -167,7 +184,7 @@ describe("google-vertex model catalog", () => {
 		// Flash/Pro siblings accept 65536 on the same endpoint. The clamp is
 		// owned by the google-vertex limits-patch rule, so the contract is
 		// proven on representative specs through buildModel instead of the
-		// bundled snapshot.
+		// bundled snapshot, which drops the line once upstream retires it.
 		const vertexLite = buildModel(geminiSpec("google-vertex", "google-vertex", "gemini-2.5-flash-lite"));
 		expect(vertexLite.maxTokens).toBe(65_535);
 		expect(buildModel(geminiSpec("google-vertex", "google-vertex", "gemini-2.5-flash")).maxTokens).toBe(65_536);
@@ -178,15 +195,12 @@ describe("google-vertex model catalog", () => {
 		// Rows cached before the clamp must not resurrect the rejected 65536.
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-google-lite25-cap-"));
 		try {
-			const bundled = getBundledModels("google-vertex");
-			const lite = bundled.find(model => model.id === "gemini-2.5-flash-lite");
-			if (!lite) throw new Error("google-vertex Gemini 2.5 Flash Lite missing from bundled catalog");
-			const stale = { ...lite, maxTokens: 65_536 };
+			const stale = { ...vertexLite, maxTokens: 65_536 };
 			const cacheDbPath = path.join(tempDir, "google-vertex.db");
 			writeModelCache("google-vertex", Date.now(), [stale], true, "merge-v3:pre-lite25-cap", cacheDbPath);
 
 			const result = await resolveProviderModels(
-				{ ...googleVertexModelManagerOptions(), staticModels: bundled, cacheDbPath },
+				{ ...googleVertexModelManagerOptions(), staticModels: [vertexLite], cacheDbPath },
 				"offline",
 			);
 			expect(result.models.find(model => model.id === "gemini-2.5-flash-lite")?.maxTokens).toBe(65_535);

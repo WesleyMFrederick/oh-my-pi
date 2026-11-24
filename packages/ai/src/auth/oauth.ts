@@ -1,7 +1,7 @@
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getProviderDefinition, PASTE_CODE_LOGIN_PROVIDERS } from "../registry";
-import { getOAuthProvider } from "../registry/oauth";
+import { assertProviderEnabled, getOAuthProvider, loginRiskWarning } from "../registry/oauth";
 import type { OAuthProviderId } from "../registry/oauth/types";
 import { providerTypeKey } from "./blocks";
 import type { SessionAffinity } from "./affinity";
@@ -78,6 +78,19 @@ export class OAuthAccounts implements OAuthApi {
 		if (!def?.login) {
 			throw new AIError.ConfigurationError(`Unknown OAuth provider: ${provider}`);
 		}
+		assertProviderEnabled(provider);
+		const warning = loginRiskWarning(provider);
+		if (warning !== undefined) {
+			// No answer but an explicit "yes" starts a login the provider's own terms put at risk.
+			const answer = await untilAborted(ctrl.signal, () =>
+				ctrl.onPrompt({
+					message: `⚠ ${def.name}: use at your own risk\n\n${warning}\n\nType "yes" to accept the risk and continue`,
+					placeholder: "yes",
+					riskAcknowledgement: true,
+				}),
+			);
+			if (answer.trim().toLowerCase() !== "yes") throw new AIError.LoginCancelledError();
+		}
 		const result = await def.login({
 			onAuth: ctrl.onAuth,
 			onProgress: ctrl.onProgress,
@@ -92,7 +105,8 @@ export class OAuthAccounts implements OAuthApi {
 			if (!result) {
 				return undefined;
 			}
-			await this.#deps.pool.storeLoginApiKey(provider, result);
+			// `store-as` routes API-key logins too, not only OAuth credentials.
+			await this.#deps.pool.storeLoginApiKey(def.storeCredentialsAs ?? provider, result);
 			return { type: "api_key" };
 		}
 		// Stamp the interactive-login instant: providers with an absolute grant
@@ -127,15 +141,18 @@ export class OAuthAccounts implements OAuthApi {
 	 * `enterpriseUrl`). For pure "give me the bytes for `Authorization`"
 	 * scenarios, prefer API-key resolution.
 	 *
-	 * Returns `undefined` when no OAuth credential is available, the
-	 * credential fails to refresh, or runtime/config overrides have replaced
-	 * OAuth with an explicit API key.
+	 * Returns `undefined` when no usable OAuth credential is available
+	 * (none stored, or every one definitively failed to refresh) or
+	 * runtime/config overrides have replaced OAuth with an explicit API key.
+	 * Rejects with {@link AIError.OAuthRefreshUnavailableError} (transient,
+	 * retryable) when a retryable refresh failure left no usable credential.
 	 */
 	async access(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<OAuthAccess | undefined> {
 		// Runtime / config overrides intentionally short-circuit OAuth: when the
 		// user has pinned an API key, they expect the OAuth identity to be
-		// suppressed (same contract as account identity lookup).
-		if (this.#deps.overrides.has(provider)) {
+		// suppressed (same contract as account identity lookup). A session
+		// restricted to an account pool never uses a runtime key.
+		if (this.#deps.overrides.suppressesOAuth(provider, this.#deps.affinity.isRestricted(provider, sessionId))) {
 			return undefined;
 		}
 		const resolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
@@ -176,9 +193,21 @@ export class OAuthAccounts implements OAuthApi {
 		options: AuthApiKeyOptions | undefined,
 	): Promise<OAuthAccessResolution> {
 		try {
+			// tryOAuth refreshes only expired tokens; it resyncs this row from the store after a forced re-mint.
+			let index = selection.index;
+			if (options?.forceRefresh) {
+				await this.refresh(selection.credentialId, options.signal, {
+					reuseRecentMint: options.refreshReason === "auth-recovery",
+					reason: options.refreshReason,
+					rejectedAccess: options.rejectedAccessToken,
+				});
+				// The refresh re-lists rows, so a concurrently removed row can shift this one's position.
+				index = this.#deps.pool.entries(provider).findIndex(entry => entry.id === selection.credentialId);
+				if (index === -1) throw new Error(`OAuth credential ${selection.credentialId} was removed during refresh`);
+			}
 			const resolved = await this.#deps.selector.tryOAuth(
 				provider,
-				{ credential: selection.credential, index: selection.index },
+				{ credential: selection.credential, index },
 				providerKey,
 				undefined,
 				options,
@@ -197,11 +226,12 @@ export class OAuthAccounts implements OAuthApi {
 					error: "OAuth access unavailable",
 				};
 			}
-			const { credential } = resolved;
+			const { credential, apiKey } = resolved;
 			return {
 				ok: true,
 				credentialId: selection.credentialId,
 				accessToken: credential.access,
+				apiKey,
 				accountId: credential.accountId,
 				email: credential.email,
 				projectId: credential.projectId,
@@ -236,7 +266,7 @@ export class OAuthAccounts implements OAuthApi {
 	 * credential.
 	 */
 	accounts(provider: string, sessionId?: string): OAuthAccountSummary[] {
-		if (this.#deps.overrides.has(provider)) {
+		if (this.#deps.overrides.suppressesOAuth(provider, this.#deps.affinity.isRestricted(provider, sessionId))) {
 			return [];
 		}
 		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
@@ -286,9 +316,10 @@ export class OAuthAccounts implements OAuthApi {
 	 * Resolve one stored OAuth credential by its durable storage row id.
 	 *
 	 * Unlike the normal session resolver, this method never ranks, rotates, or
-	 * falls back to sibling credentials. A forced refresh re-mints only the
-	 * requested row, preserving exact-account affinity for operations whose
-	 * provenance and policy boundary are tied to one workspace.
+	 * falls back to sibling credentials. A generic forced refresh re-mints only the
+	 * requested row; with `refreshReason: "auth-recovery"` it may instead reuse a
+	 * still-usable recent mint of that row. Either way exact-account affinity holds
+	 * for operations whose provenance and policy boundary are tied to one workspace.
 	 *
 	 * Returns `undefined` when the row does not exist for `provider` or an
 	 * explicit runtime/config API-key override suppresses OAuth.

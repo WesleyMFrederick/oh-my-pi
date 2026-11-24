@@ -1,5 +1,6 @@
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { allowsModelMentions, allowsSkillTokens, SKILL_TOKEN_RE } from "./skill-tokens";
-import { MODEL_MENTION_RE, modelMentionToken } from "./model-mention-syntax";
+import { MODEL_MENTION_RE, modelMentionToken, resolveModelMentionToken } from "./model-mention-syntax";
 import { SYMBOL_PRESETS } from "../theme/symbols";
 import { type ThemeColor, theme } from "../theme/theme";
 
@@ -82,20 +83,21 @@ export function collapseSkillTokens(
 
 /**
  * Replaces mentionable model selectors with their display chips and registers
- * each chip's canonical selector as its atomic editor expansion.
+ * each chip's canonical `^selector` as its atomic editor expansion.
  */
 export function collapseModelMentions(
 	text: string,
-	labelFor: (selector: string) => string | undefined,
+	chipFor: (selector: string) => { label: string; selector: string } | undefined,
 	register: (label: string, expansion: string) => void,
+	isKnown?: (selector: string) => boolean,
 ): string {
 	if (!text.includes("^") || !allowsModelMentions(text)) return text;
 	MODEL_MENTION_RE.lastIndex = 0;
 	return text.replace(MODEL_MENTION_RE, (match, delimiter: string, selector: string) => {
-		const label = labelFor(selector);
-		if (label === undefined) return match;
-		register(label, modelMentionToken(selector));
-		return `${delimiter}${label}`;
+		const mention = resolveModelMentionToken(selector, chipFor, isKnown);
+		if (!mention) return match;
+		register(mention.value.label, modelMentionToken(mention.value.selector));
+		return `${delimiter}${mention.value.label}${mention.suffix}`;
 	});
 }
 
@@ -165,6 +167,9 @@ export const COMPOSER_TOKEN_REGEX = new RegExp(
 	"gu",
 );
 
+/** Last compiled {@link referencedAttachments} scanner, keyed by its source (labels and glyphs rarely change). */
+let cachedScanner: { source: string; scanner: RegExp } | undefined;
+
 /**
  * Attachment indices referenced by a composer buffer, per kind. Image/video count compact chips
  * and expanded markers; paste counts compact chips only, since `[Paste #N]` markers number the
@@ -182,10 +187,9 @@ export function referencedAttachments(
 	const icons = [...kindByIcon.keys()].sort((a, b) => b.length - a.length).map(glyphSource);
 	const labels = [...recorded.keys()].sort((a, b) => b.length - a.length).map(label => RegExp.escape(label));
 	const recordedSource = labels.length > 0 ? labels.join("|") : "(?!)";
-	const scanner = new RegExp(
-		`${PLACEHOLDER_REGEX.source}|(${recordedSource})(?!\\d)|(${icons.join("|")}) #([1-9]\\d*)`,
-		"gu",
-	);
+	const source = `${PLACEHOLDER_REGEX.source}|(${recordedSource})(?!\\d)|(${icons.join("|")}) #([1-9]\\d*)`;
+	if (cachedScanner?.source !== source) cachedScanner = { source, scanner: new RegExp(source, "gu") };
+	const { scanner } = cachedScanner;
 
 	const refs: Record<ChipKind, Set<number>> = { image: new Set(), video: new Set(), paste: new Set() };
 	for (const match of text.matchAll(scanner)) {
@@ -295,6 +299,16 @@ export function compactImageMarkers(
 		},
 	);
 	return { text: rewritten, keep: keep.map(n => n - 1) };
+}
+
+/** Drops images whose markers were deleted and renumbers the rest by appearance (path pastes attach out of order). */
+export function compactImageAttachments(
+	text: string,
+	images: ImageContent[],
+): { text: string; images: ImageContent[] } {
+	const compacted = compactImageMarkers(text, images.length, { byAppearance: true });
+	if (!compacted) return { text, images };
+	return { text: compacted.text, images: compacted.keep.map(index => images[index]!) };
 }
 
 /** Attachment kinds understood by placeholder renderers. */
