@@ -1166,7 +1166,11 @@ export class SessionTools {
 	#currentInlineDescriptors(): boolean | undefined {
 		const activeModel = this.#host.model();
 		if (!activeModel) return undefined;
-		return shouldInlineToolDescriptors(cfgInlineToolDescriptors.get(this.#host.settings), activeModel.id);
+		return shouldInlineToolDescriptors(
+			cfgInlineToolDescriptors.get(this.#host.settings),
+			activeModel.id,
+			activeModel.provider,
+		);
 	}
 
 	/** `systemPromptTemplates` path the active model selects; a change replaces the whole instruction block. */

@@ -5,15 +5,13 @@ import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
  * prompt (and stripped from provider tool schemas) for a given model and
  * setting.
  *
- * `auto` enforces a per-model policy: inline for Gemini models, off otherwise.
- * Gemini benefits from descriptors in-prompt; other providers keep them in the
- * tool schemas. `on`/`off` are explicit user overrides.
- *
- * @param modelId Model id (e.g. `gemini-3-pro`) used to classify `auto`.
+ * `auto` inlines for Gemini except on Antigravity CLI, where the inline
+ * inventory can trigger HTTP 429s. `on` and `off` explicitly override this.
  */
 export function shouldInlineToolDescriptors(
 	setting: "auto" | "on" | "off" | undefined,
 	modelId: string | undefined,
+	provider: string | undefined,
 ): boolean {
 	switch (setting ?? "auto") {
 		case "on":
@@ -21,6 +19,10 @@ export function shouldInlineToolDescriptors(
 		case "off":
 			return false;
 		default:
-			return modelId !== undefined && classifyModel("", modelId, { lenient: true }).class === "gemini";
+			return (
+				provider !== "antigravity-cli" &&
+				modelId !== undefined &&
+				classifyModel("", modelId, { lenient: true }).class === "gemini"
+			);
 	}
 }
